@@ -104,7 +104,37 @@ def parse_hello(p):
                  run_id=struct.unpack_from('<I', p, 120)[0], flags=struct.unpack_from('<I', p, 124)[0])
     else:
         h.update(proto=1, role=1, net='modem', stub_bytes=0, loader_sha8='', run_id=0, flags=0)
+    # additive v2 fields (protocol stays 2): the adapter MAC and GDEMU slot (ql-core2, 136 bytes), then the stub's
+    # record of the last way back and GDEMU's version (ql-data, 148 bytes); absent fields read as None / no record
+    mac = p[128:134] if len(p) >= 136 else b''
+    h['mac'] = ':'.join('%02x' % b for b in mac) if mac and any(mac) else None
+    h['gdemu_slot'] = struct.unpack_from('<H', p, 134)[0] if len(p) >= 136 else None
+    if len(p) >= 148:
+        step, entries, gd, err, ver = struct.unpack_from('<BBHII', p, 136)
+        h['stub'] = {'step': step, 'step_name': STUB_STEPS.get(step, str(step)), 'err': err, 'gdemu': gd,
+                     'entries': entries} if step else None
+        h['gdemu_ver'] = '%d.%d.%d' % (ver >> 16, (ver >> 8) & 255, ver & 255) if ver else None
+    else:
+        h['stub'] = None
+        h['gdemu_ver'] = None
     return h
+
+
+# the stub's steps (include/dcql_loop.h CL_STUB_STEP_*), and the screen colour each shows on the TV
+STUB_STEPS = {1: 'entered (blue)', 2: 'quiet (cyan)', 3: 'GD init (yellow)', 4: 'read (orange)', 5: 'SHA ok (green)',
+              6: 'jump (white)', 7: 'reboot (red)', 8: 'GDEMU select (magenta)'}
+
+
+def stub_text(s):
+    """One line for the stub's record: where the last way back stopped."""
+    if not s:
+        return 'no stub record'
+    t = 'stub step %d %s err %x' % (s['step'], s['step_name'], s['err'])
+    if s['err'] & 0x8000:
+        t += ' (GDEMU select refused, code %d)' % ((s['err'] >> 16) & 255)
+    if s['gdemu']:
+        t += ' gdemu %x' % s['gdemu']
+    return t + ' entries %d' % s['entries']
 
 
 # ------------------------------------------------------------------------------------------------ program images
@@ -777,7 +807,9 @@ def describe(h):
             (h['build'], h['proto'], h['net'], h['boot_count'], h['uptime_ms'] / 1000.0, h['console_ip'],
              STATES.get(h['state'], h['state']), h['session'], h['have'], h['nchunks'], h['stub_bytes'],
              ' (pushed loader)' if h['flags'] & HF_PUSHED else '', h['report_run'],
-             RUN_STATES.get(h['report_state'], '?'), h['report_len']))
+             RUN_STATES.get(h['report_state'], '?'), h['report_len'])) + \
+        ('; mac %s slot %s gdemu %s; %s' % (h.get('mac') or 'none', h.get('gdemu_slot') or 'none',
+                                            h.get('gdemu_ver') or 'none', stub_text(h.get('stub'))))
 
 
 def power_cycle(stamp):

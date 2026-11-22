@@ -75,10 +75,25 @@ class BridgeUdp:
 
     @staticmethod
     def ident(h):
-        """The loader's identity. HELLO carries no adapter MAC today (that needs a field in the loader's HELLO: a protocol
-        change, asked of the loader's lane); until then the loader's build and the first bytes of its SHA-256."""
+        """The console's identity: the adapter MAC from HELLO (offset 128, loaders from 456ac57 on), one console across
+        address changes and loader updates; a loader without it (or the modem: all zero) by its build and the first
+        bytes of its SHA-256."""
         mac = h.get('mac')
-        return 'mac:%s' % mac if mac else 'loader:%s:%s' % (h.get('loader_sha8', ''), h.get('build', ''))
+        return 'mac:%s' % mac if mac else BridgeUdp.loader_key(h)
+
+    @staticmethod
+    def loader_key(h):
+        return 'loader:%s:%s' % (h.get('loader_sha8', ''), h.get('build', ''))
+
+    def is_remembered(self, h):
+        """Remembered by its MAC, or by its loader's identity (a console remembered before its loader sent the MAC)."""
+        return self.ident(h) in self.remembered or self.loader_key(h) in self.remembered
+
+    @staticmethod
+    def card(h):
+        """What HELLO says about the console beyond its address: MAC, GDEMU slot and version, the stub's last record."""
+        return {'mac': h.get('mac'), 'gdemu_slot': h.get('gdemu_slot'), 'gdemu_version': h.get('gdemu_ver'),
+                'stub': h.get('stub'), 'stub_text': cl.stub_text(h.get('stub')) if h.get('stub') else None}
 
     def is_local(self, ip):
         return ip.startswith('127.') or ip in self.locals
@@ -96,7 +111,10 @@ class BridgeUdp:
             if h:
                 self.chosen_ident = self.ident(h)
                 self.remembered[self.chosen_ident] = {'last_ip': h['console_ip'], 'source': ip, 'build': h['build'],
+                                                      'mac': h.get('mac'), 'gdemu_slot': h.get('gdemu_slot'),
                                                       'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+                if self.chosen_ident.startswith('mac:'):   # now known by its MAC: drop the loader-identity entry
+                    self.remembered.pop(self.loader_key(h), None)
                 if self.remember_path:
                     try:
                         json.dump(self.remembered, open(self.remember_path, 'w', encoding='utf-8'), indent=1)
@@ -119,11 +137,11 @@ class BridgeUdp:
             loaders = [r for r in self.seen.values() if r.get('hello') and now - r['last'] < self.STALE_S]
             # a console linked before; else, when none is remembered, the only loader heard. Two unknown loaders, or an
             # unknown one beside remembered ones: wait for a click (then it is remembered).
-            if idt in self.remembered or (not self.remembered and len(loaders) == 1):
+            if self.is_remembered(h) or (not self.remembered and len(loaders) == 1):
                 self.choose(ip, 'autoconnected')
             return
         cur = self.seen.get(self.chosen_ip)
-        if (cur is None or now - cur['last'] > self.STALE_S) and (idt == self.chosen_ident or idt in self.remembered):
+        if (cur is None or now - cur['last'] > self.STALE_S) and (idt == self.chosen_ident or self.is_remembered(h)):
             self.choose(ip, 'relinked at a new address')
 
     def send(self, d):
@@ -181,8 +199,8 @@ class BridgeUdp:
                             'transport': h.get('net', '-'), 'loader': h.get('build', ''), 'protocol': r.get('proto'),
                             'beacons': r['beacons'], 'first_s_ago': round(time.time() - r['first'], 1),
                             'last_s_ago': round(time.time() - r['last'], 1), 'chosen': ip == self.chosen_ip,
-                            'ident': self.ident(h) if h else None, 'remembered': bool(h) and self.ident(h) in self.remembered,
-                            'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['last']))})
+                            'ident': self.ident(h) if h else None, 'remembered': bool(h) and self.is_remembered(h),
+                            'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['last'])), **self.card(h)})
             return out
 
     def close(self):
@@ -451,6 +469,7 @@ class Bridge:
              'loader': {'build': h['build'], 'sha8': h['loader_sha8'], 'protocol': h['proto'],
                         'stub_bytes': h['stub_bytes'], 'boot_count': h['boot_count'],
                         'pushed': bool(h['flags'] & cl.HF_PUSHED)} if h else None,
+             'ident': self.t.ident(h) if h else None, **self.t.card(h or {}),
              'program': {'run': '%08x' % self.client_run, 'linked': self.client is not None} if self.client_run else None}
         if self.active:
             d['state'] = 'running' if self.active.state == 'running' else self.active.state
