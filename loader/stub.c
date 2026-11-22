@@ -13,10 +13,21 @@
  *   3. it checks the SHA-256 of what it read against the header's; a mismatch is a BIOS reboot (the last rungs);
  *   4. it turns the caches off and invalidates them (as KallistiOS's exec trampoline) and starts the loader.
  * Progress is written to the header's scratch words (tramp[], not covered by the header CRC), so a loader that comes
- * back by another way can say where the stub stopped.
- * Runs in P2 (uncached) with SR.BL set: an exception inside it resets the CPU (the BIOS boots the mounted disc). */
+ * back by another way can say where the stub stopped, and shown as the colour of the whole screen (CL_STUB_COLOURS;
+ * held about a second a step when the client's args had diag=1).
+ * Runs in P2 (uncached) with SR.BL set: an exception inside it resets the CPU (the BIOS boots the mounted disc).
+ *
+ * Console fixes (lane ql-core2, 2026-11-22; Flycast has no operand cache and answers the BIOS's disc calls itself, so
+ * neither showed there):
+ *   - the operand cache is written back and invalidated first: a dirty line of the program's, evicted while the stub
+ *     reads LOADER.BIN to 0x8C010000 through P2, would be written back over the bytes just read (the SHA-256 check then
+ *     fails and the stub reboots);
+ *   - VBR is the BIOS's while the BIOS's disc code runs (the program's handlers are dead by then);
+ *   - with a GDEMU image known (hand-off reserved[CL_RSV_GDEMU_SLOT]) the image is selected before the disc is read,
+ *     and again before a reboot, so a reboot boots the loader's image like openMenu's disc switch, not openMenu. */
 #include <stdint.h>
 #include "dcql_loop.h"
+#include "dcql_hw.h"
 
 typedef volatile uint32_t vu32;
 typedef volatile uint16_t vu16;
@@ -35,10 +46,22 @@ static void serial_put(char c) {
     *fsr &= (uint16_t)~0x60u;
 }
 static void step(uint32_t s) {
+    static const uint32_t colours[] = CL_STUB_COLOURS;
     HD->tramp[CL_STUBW_STEP] = s;
+    dcql_screen_colour(colours[s < sizeof(colours) / sizeof(colours[0]) ? s : 0]);
     serial_put('S');
     serial_put((char)('0' + s));
     serial_put(s == CL_STUB_STEP_JUMP || s == CL_STUB_STEP_REBOOT ? '\n' : ' ');
+    if (HD->flags & CL_F_DIAG) dcql_wait_vbl(s == CL_STUB_STEP_REBOOT ? 180 : 60);   /* about 1 s (3 s for a reboot) */
+}
+/* the GDEMU image the loader came from, selected (0 = done or none known); the result kept for the next loader */
+static int gdemu_select(void) {
+    const uint32_t slot = HD->reserved[CL_RSV_GDEMU_SLOT];
+    if (!slot || slot > 999) return 0;
+    step(CL_STUB_STEP_GDEMU);
+    const int r = dcql_gdemu_select((uint16_t)slot);
+    HD->tramp[CL_STUBW_GDEMU] = 0x100u | (uint32_t)(-r);
+    return r;
 }
 static void serial_hex(uint32_t v) {
     for (int i = 28; i >= 0; i -= 4) serial_put("0123456789abcdef"[(v >> i) & 15]);
@@ -150,9 +173,15 @@ void stub_main(void) {
     h->tramp[CL_STUBW_MAGIC] = CL_STUB_MAGIC;
     h->tramp[CL_STUBW_ENTRIES]++;
     h->tramp[CL_STUBW_ERR] = 0;
+    h->tramp[CL_STUBW_GDEMU] = 0;
+    dcql_ocache_purge_all();   /* first: no line of the program's may be written back over what the stub reads */
+    if (h->reserved[CL_RSV_BIOS_VBR]) __asm__ __volatile__("ldc %0, vbr" : : "r"(h->reserved[CL_RSV_BIOS_VBR]));
     step(CL_STUB_STEP_ENTERED);
     quiet();
     step(CL_STUB_STEP_QUIET);
+    /* the disc switch: the loader's image served again (a no-op when it still is; nothing without GDEMU) */
+    const int sel = gdemu_select();
+    if (sel) h->tramp[CL_STUBW_ERR] = 0x8000u | ((uint32_t)(-sel) << 16);
     gd(G_RESET, 0, 0);
     gd(G_INIT, 0, 0);
     int r = 0;
@@ -164,9 +193,9 @@ void stub_main(void) {
     uint32_t mode[4] = {0 /* set */, drive[1] == 0x20 /* CD-ROM XA */ ? 2048u : 1024u, 0x1000 /* data area */, 2048};
     gd(G_MODE, (uint32_t)mode, 0);
     step(CL_STUB_STEP_GDINIT);
-    if (r) { h->tramp[CL_STUBW_ERR] = 0x100u | (uint32_t)(-r); goto reboot; }
+    if (r) { h->tramp[CL_STUBW_ERR] |= 0x100u | (uint32_t)(-r); goto reboot; }
     const uint32_t bytes = h->loader_len, lba = h->ret_lba;
-    if (!bytes || !lba || bytes > 4u * 1024u * 1024u) { h->tramp[CL_STUBW_ERR] = 0x200; goto reboot; }
+    if (!bytes || !lba || bytes > 4u * 1024u * 1024u) { h->tramp[CL_STUBW_ERR] |= 0x200; goto reboot; }
     uint8_t *dst = (uint8_t *)P2(CL_LOAD_ADDR);
     const uint32_t secs = (bytes + 2047) / 2048;
     for (uint32_t s = 0; s < secs;) {
@@ -174,11 +203,11 @@ void stub_main(void) {
         uint32_t params[4] = {lba + s, n, (uint32_t)(dst + s * 2048), 0};
         int e = -1;
         for (int tries = 0; tries < 4 && e; ++tries) e = gd_cmd(CMD_PIOREAD, params);
-        if (e) { h->tramp[CL_STUBW_ERR] = 0x300u | (uint32_t)(-e); goto reboot; }
+        if (e) { h->tramp[CL_STUBW_ERR] |= 0x300u | (uint32_t)(-e); goto reboot; }
         s += n;
     }
     step(CL_STUB_STEP_READ);
-    if (!sha_matches(dst, bytes, h->ret_sha)) { h->tramp[CL_STUBW_ERR] = 0x400; goto reboot; }
+    if (!sha_matches(dst, bytes, h->ret_sha)) { h->tramp[CL_STUBW_ERR] |= 0x400; goto reboot; }
     step(CL_STUB_STEP_SHA);
     /* the run's state and the start-up registers the loader gets, on the serial line (8 hex digits each) */
     serial_hex(h->state);
@@ -187,9 +216,15 @@ void stub_main(void) {
     serial_hex(h->tramp[CL_STUBW_ENTRIES]);
     /* the KallistiOS exec contract: the words after the image are what the jump copies; nothing else to set up */
     step(CL_STUB_STEP_JUMP);
+    dcql_ocache_purge_all();
+    dcql_screen_picture();
     stub_go(h->reserved[CL_RSV_BIOS_SR], h->reserved[CL_RSV_BIOS_VBR], h->reserved[CL_RSV_BIOS_FPSCR]);
 reboot:
+    serial_hex(h->tramp[CL_STUBW_ERR]);
     step(CL_STUB_STEP_REBOOT);
+    /* the BIOS then boots the loader's image, not openMenu's (the step word stays REBOOT for the next loader) */
+    if (h->reserved[CL_RSV_GDEMU_SLOT] && h->reserved[CL_RSV_GDEMU_SLOT] <= 999)
+        h->tramp[CL_STUBW_GDEMU] |= (0x200u | (uint32_t)(-dcql_gdemu_select((uint16_t)h->reserved[CL_RSV_GDEMU_SLOT]))) << 12;
     ((void (*)(void))0xa0000000u)();
     for (;;) {}
 }

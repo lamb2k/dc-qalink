@@ -120,7 +120,20 @@ static void ring_clear(ring_t *r) { r->tail = r->head; }
 
 /* a received datagram: the peer's port, and its address once known (learnt from the first one) */
 static volatile unsigned g_rx_refused;
+/* dcql_net_relearn(): the next PC to send to our port becomes the peer (autoconnect: a PC that went away, or one at a
+   new address); until then every datagram also goes to the whole network */
+static volatile int g_learn;
 static int accept_from(const struct sockaddr_in *from, socklen_t fl, int n) {
+    if (g_learn && n <= DCQL_NET_DGRAM && fl >= sizeof(*from) && from->sin_family == AF_INET &&
+        from->sin_port == htons(g_port) && from->sin_addr.s_addr && from->sin_addr.s_addr != 0xFFFFFFFFu) {
+        g_learn = 0;
+        if (from->sin_addr.s_addr != g_host) {
+            g_host = from->sin_addr.s_addr;
+            memcpy(g_peer, &g_host, 4);
+            logf_("dcql: peer %u.%u.%u.%u (learnt again)", g_peer[0], g_peer[1], g_peer[2], g_peer[3]);
+        }
+        return 1;
+    }
     if (n > DCQL_NET_DGRAM || fl < sizeof(*from) || from->sin_family != AF_INET || from->sin_port != htons(g_port) ||
         (g_host != 0xFFFFFFFFu && g_host != 0 && from->sin_addr.s_addr != g_host)) {
         if (g_rx_refused++ < 4) {
@@ -146,6 +159,10 @@ static void send_to_peer(const unsigned char *p, int n) {
     const int sent = sendto(g_sock, p, n, 0, (struct sockaddr *)&to, sizeof(to));
     if (sent == n) g_tx_bytes += n;
     else ++g_tx_drops;
+    if (g_learn && g_host != 0xFFFFFFFFu && g_kind == DCQL_NET_BBA) {   /* relearning: the whole network hears it too */
+        to.sin_addr.s_addr = 0xFFFFFFFFu;
+        sendto(g_sock, p, n, 0, (struct sockaddr *)&to, sizeof(to));
+    }
 }
 
 /* =============================================================================================== modem transport */
@@ -682,6 +699,15 @@ int dcql_net_recv_wait(void *p, unsigned max, int timeout_ms) {
     }
 }
 unsigned dcql_net_tx_queued(void) { return ring_used(&g_tx); }
+void dcql_net_relearn(void) { g_learn = 1; }
+int dcql_net_learning(void) { return g_learn; }
+int dcql_net_mac(unsigned char out[6]) {
+    memset(out, 0, 6);
+#if DCQL_NET_HAVE_BBA
+    if (g_kind == DCQL_NET_BBA && net_default_dev) { memcpy(out, net_default_dev->mac_addr, 6); return 0; }
+#endif
+    return -1;
+}
 unsigned dcql_net_ip(void) { unsigned v; memcpy(&v, g_ip, 4); return v; }
 unsigned dcql_net_mask(void) { unsigned v; memcpy(&v, g_mask, 4); return v; }
 unsigned dcql_net_gw(void) { unsigned v; memcpy(&v, g_gw, 4); return v; }

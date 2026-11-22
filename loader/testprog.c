@@ -2,6 +2,12 @@
    eng-loop, 2026-11-19). MIT licence. Sent by the PC tool to the loader; each word of the PC's --args picks a path:
 
      report     (default) a few lines and DONE through cl_exit
+     ret        back to the loader at once, the link never started (exec and the way back alone; ql-core2)
+     gdreboot   hand in DONE, then the disc switch alone: the loader's GDEMU image selected, a BIOS reboot (console:
+                does GDEMU boot the loader's image, or openMenu under reset_goto = 1?)
+     stubfail   control: the stub's copy of LOADER.BIN's SHA-256 spoilt, so its check refuses and its fallback (GDEMU
+                image, reboot) must bring the loader back; the loader then shows "STUB: STEP 7 ERR 400"
+     diag=1     every step of the client and of the stub held on screen about a second (large text / screen colour)
      return     return from main (the atexit hand-in: DONE, exit 0)
      big:<n>    n more bytes of report (the report path under load)
      lines:<n>  n numbered lines on the serial line (forwarded live to the PC on the adapter)
@@ -31,6 +37,7 @@
 #include "cl_client.h"
 #include "dcql_loop.h"
 
+void dcql_bios_reboot(void) __attribute__((noreturn));   /* lib/dcql_return.c: the GDEMU image, then a reboot */
 int __real_cdrom_read_toc(cd_toc_t *toc, bool hd);
 int __wrap_cdrom_read_toc(cd_toc_t *toc, bool hd) {
     int rc = __real_cdrom_read_toc(toc, true);
@@ -42,6 +49,13 @@ static void say(int row, const char *s) {
 }
 
 static int has(const char *args, const char *w) { return strstr(args, w) != NULL; }
+/* a whole word of the args ("ret" is not "return") */
+static int word(const char *a, const char *w) {
+    const size_t n = strlen(w);
+    for (const char *p = strstr(a, w); p; p = strstr(p + 1, w))
+        if ((p == a || p[-1] == ' ') && (p[n] == 0 || p[n] == ' ')) return 1;
+    return 0;
+}
 
 static void read_pc_file(const char *path, int cd) {
     char p[160];
@@ -74,7 +88,7 @@ int main(int argc, char **argv) {
     /* cl_args reads the hand-off area; preload0 must be known before cl_init */
     const cl_handoff_t *h = (const cl_handoff_t *)CL_HANDOFF_ADDR;
     if (h->h.magic == CL_HANDOFF_MAGIC) args0 = h->h.args;
-    const int active = cl_init(has(args0, "preload0") ? CL_NO_PRELOAD : 0);
+    const int active = cl_init((has(args0, "preload0") ? CL_NO_PRELOAD : 0) | (word(args0, "ret") ? CL_NO_LINK : 0));
     const char *args = cl_args();
     char line[64];
     say(0, "CONTROL LOOP TEST PROGRAM");
@@ -91,9 +105,19 @@ int main(int argc, char **argv) {
               (unsigned)h->h.deadline_s, (unsigned)h->h.stub_bytes,
               cl_stub_armed((const cl_handoff_t *)h) ? "stub" : "preload", (unsigned)h->h.net_kind);
     cl_report("timer %u ms since boot\n", (unsigned)timer_ms_gettime64());
+    if (word(args, "ret")) {
+        say(4, "RET: STRAIGHT BACK, NO LINK");
+        cl_report("ret: back at once\n");
+        thd_sleep(1000);
+        cl_exit(0);
+    }
     if (h->h.net_kind == CL_NET_BBA && !has(args, "hangoff")) {   /* hangoff: interrupts off before any RESET can come */
         const uint64_t t0 = timer_ms_gettime64();
-        const int up = cl_link_wait(10000);
+        say(3, "LINK: WAITING (UP TO 60 S)");
+        /* 60 s: on the console the adapter's link negotiation (KallistiOS waits up to 10 s) and DHCP (it repeats every
+           4 s) come first; the old 10 s could run out first (a likely cause of the owner's console run, 2026-11-22) */
+        const int up = cl_link_wait(60000);
+        say(3, up ? "LINK: UP                  " : "LINK: NOT UP              ");
         cl_report("link %s after %u ms\n", up ? "up" : "not up", (unsigned)(timer_ms_gettime64() - t0));
     }
     const char *big = strstr(args, "big:");
@@ -198,6 +222,26 @@ int main(int argc, char **argv) {
         say(4, "BIOS REBOOT, NO HAND-IN");
         thd_sleep(1500);
         arch_reboot();
+    }
+    if (word(args, "gdreboot")) {   /* the disc switch alone: the loader's GDEMU image selected, then a BIOS reboot */
+        say(4, "DISC SWITCH: IMAGE, THEN REBOOT");
+        cl_report("gdreboot: GDEMU image %u, then a BIOS reboot\n", (unsigned)h->h.reserved[CL_RSV_GDEMU_SLOT]);
+        thd_sleep(1500);
+        cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
+        w->h.state = CL_RUN_DONE;   /* handed in first: a loader that comes back reads this run as DONE */
+        w->h.report_crc = cl_crc32(0, w->report, w->h.report_len);
+        cl_handoff_seal(w);
+        dcache_flush_range(CL_HANDOFF_ADDR, CL_HANDOFF_SIZE);
+        dcql_bios_reboot();
+    }
+    if (word(args, "stubfail")) {   /* control: the stub's SHA-256 check must refuse, and its fallback take over */
+        say(4, "STUB FAIL: WRONG SHA, FALLBACK");
+        cl_report("stubfail: the stub's LOADER.BIN hash spoilt; its reboot fallback must bring the loader\n");
+        thd_sleep(1500);
+        cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
+        w->h.ret_sha[0] ^= 0xff;
+        cl_handoff_seal(w);
+        cl_exit(0);
     }
     if (has(args, "return")) {
         say(4, "RETURN FROM MAIN");

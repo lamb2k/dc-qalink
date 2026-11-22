@@ -7,12 +7,17 @@ network. Nothing here touches a firewall: Windows may ask once whether Python ma
 
   python tools/first_console.py --program testprog.elf [--console 192.168.1.23] [--out first-run] [--beacon-wait 300]
 
-Steps, each a row of the table:
+Steps, each a row of the table (ql-core2: the "ret" row first, every program run with diag=1 so each step is on the
+TV for about a second; the screen colour while the return stub runs: blue entered, cyan quiet, magenta GDEMU image,
+yellow disc init, orange read, green checked, white jump, red reboot):
   1 beacon     wait for the loader's HELLO (its address is learnt from it unless --console names it)
-  2 push+run   send the client test program, verify it, run it, read its report back (5 lines over the link)
-  3 screen x3  the same program grabs the console's screen 3 times; the PNGs land in --out
-  4 reset      the program waits; the PC sends RESET; the console must come back to the loader by the return stub
-  5 back       the loader's beacon after all of it (the console never left the GDEMU slot)
+  2 ret        the test program returns at once without its link: exec and the way back alone
+  3 push+run   send the client test program, verify it, run it, read its report back (5 lines over the link)
+  4 screen x3  the same program grabs the console's screen 3 times; the PNGs land in --out
+  5 reset      the program waits; the PC sends RESET; the console must come back to the loader by the return stub
+  6 back       the loader's beacon after all of it (the console never left the GDEMU slot)
+  --switch adds 7 disc switch: the program hands in DONE, selects the loader's GDEMU image and reboots through the
+  BIOS (the fallback of every way back); the loader must come back with that run's report.
 Exit code 0 when every row passes. Numbers are console numbers only when run on a console.
 """
 import argparse, glob, json, os, subprocess, sys, time
@@ -28,6 +33,8 @@ def main():
     ap.add_argument('--bind', type=int, default=52060, help='this PC\'s UDP port (the LINK.TXT port; default 52060)')
     ap.add_argument('--out', default='first-run')
     ap.add_argument('--beacon-wait', type=float, default=300.0, help='seconds to wait for the first beacon')
+    ap.add_argument('--switch', action='store_true', help='also row 7: the disc switch (GDEMU image, BIOS reboot)')
+    ap.add_argument('--no-diag', action='store_true', help='run the program without diag=1 (no 1 s holds)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rows = []
@@ -63,25 +70,30 @@ def main():
               'TV (same network as this PC?), the PC line (this PC\'s address?), Windows\' private-network prompt.'
               % a.beacon_wait)
     else:
-        ok2, _ = step('2 push+run', ['run', a.program, '--args', 'report lines:5', '--deadline', '60', '--wait', '90'],
-                      150, out='run')
-        ok3, _ = step('3 screen x3', ['run', a.program, '--args', 'report screen:3', '--deadline', '120', '--wait',
+        dg = '' if a.no_diag else ' diag=1'
+        step('2 ret', ['run', a.program, '--args', 'ret' + dg, '--deadline', '60', '--wait', '120'], 180, out='ret')
+        ok2, _ = step('3 push+run', ['run', a.program, '--args', 'report lines:5' + dg, '--deadline', '120', '--wait',
+                                     '180'], 240, out='run')
+        ok3, _ = step('4 screen x3', ['run', a.program, '--args', 'report screen:3', '--deadline', '120', '--wait',
                                       '150'], 210, out='screen')
         pngs = sorted(glob.glob(os.path.join(a.out, 'screen', 'still-*.png')))
         if ok3 and len(pngs) != 3:
             rows[-1]['pass'] = False
             rows[-1]['detail'] = '%d screen grabs arrived, 3 expected' % len(pngs)
-        ok4, t4 = step('4 reset', ['run', a.program, '--args', 'waitreset', '--deadline', '120', '--reset-after', '5',
-                                   '--reset-wait', '20'], 150, out='reset')
+        ok4, t4 = step('5 reset', ['run', a.program, '--args', 'waitreset', '--deadline', '120', '--reset-after', '15',
+                                   '--reset-wait', '30'], 180, out='reset')
         if ok4 and 'back to the loader' not in t4:
             rows[-1]['pass'] = False
             rows[-1]['detail'] = 'no "back to the loader" after RESET'
-        step('5 back', ['status'], 90)
+        step('6 back', ['status'], 90)
+        if a.switch:
+            step('7 disc switch', ['run', a.program, '--args', 'gdreboot' + dg, '--deadline', '60', '--wait', '120'],
+                 180, out='switch')
     print('\n%-12s %-5s %8s  %s' % ('step', 'result', 'seconds', 'detail'))
     for r in rows:
         print('%-12s %-5s %8.1f  %s' % (r['step'], 'PASS' if r['pass'] else 'FAIL', r['seconds'],
                                         r.get('detail', 'rc %s' % r['rc'])))
-    allok = rows and all(r['pass'] for r in rows) and len(rows) == 5
+    allok = rows and all(r['pass'] for r in rows) and len(rows) == (7 if a.switch else 6)
     print('\n%s' % ('ALL PASS: push, run, report, screen grabs and RESET work on this console' if allok else
                     'NOT ALL PASS: the logs are in %s' % os.path.abspath(a.out)))
     with open(os.path.join(a.out, 'first-run.json'), 'w') as f:

@@ -16,6 +16,12 @@
                              static address when no DHCP server answers; default DHCP alone)   dhcp no (ip without DHCP)
      host a.b.c.d|peer       (peer: beacons to the whole network, the first PC to answer is kept)
      port 52060   lport 52060   number 1111111 (modem)
+     slot 158                (the GDEMU image this loader boots from: every way back selects it, so a reboot lands here,
+                             not in openMenu; GDEMU cannot be asked which image it serves)
+
+   Autoconnect: once picked in openMenu it needs nobody. It beacons once a second until a PC answers and shows LINKED;
+   when no PC has answered for 10 s (none yet, or the PC went away or changed address) it beacons to the whole network
+   as well and takes the first PC that answers. After every way back (stub, disc switch, reboot) it starts the same.
 
    The screen says what it is doing, for a photo: three large lines at the top (the console's address, the PC it looks
    for, beacons sent and answers heard) can be read off a TV. A on the pad restarts the link at once. */
@@ -36,6 +42,7 @@
 #include "cl_core.h"
 #include "dcql_net.h"
 #include "cl_arm.h"
+#include "dcql_hw.h"
 
 #ifndef LOADER_BUILD
 #define LOADER_BUILD "dev"
@@ -93,7 +100,7 @@ static cl_platform_t g_plat;
 static int g_pushed;
 
 /* ---------------------------------------------------------------- settings: /cd/LINK.TXT */
-typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20], dhcp[8]; unsigned port, lport; } settings_t;
+typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20], dhcp[8]; unsigned port, lport, slot; } settings_t;
 static void read_settings(settings_t *s) {
     FILE *f = fopen("/cd/LINK.TXT", "r");
     if (!f) f = fopen("/cd/link.txt", "r");
@@ -110,6 +117,7 @@ static void read_settings(settings_t *s) {
         else if (!strcmp(k, "dhcp")) snprintf(s->dhcp, sizeof(s->dhcp), "%s", v);
         else if (!strcmp(k, "port")) s->port = (unsigned)atoi(v);
         else if (!strcmp(k, "lport")) s->lport = (unsigned)atoi(v);
+        else if (!strcmp(k, "slot")) s->slot = (unsigned)atoi(v);
     }
     fclose(f);
 }
@@ -165,10 +173,14 @@ static void big_at(int line, uint32_t colour, const char *fmt, ...) {
     }
 }
 static const char *g_host_text = "ANY (BROADCAST)";
+static int g_linked, g_ever_heard;   /* a PC answered in the last 6 s / ever since this boot */
 static const char *run_state_name(uint32_t s) {
     static const char *n[] = {"NONE", "RUNNING", "DONE", "CRASHED", "TIMEOUT", "LOST (NO HAND-IN)", "RESET BY THE PC"};
     return s < 7 ? n[s] : "?";
 }
+/* the return stub's own record of the last way back (hand-off tramp[], read at boot before anything changes it) */
+static int g_stub_seen;
+static uint32_t g_stub_step, g_stub_err, g_stub_gdemu, g_stub_entries;
 static void draw(unsigned frame, uint32_t rate_Bps) {
     enum { WHITE = 0xffff, GREY = 0x8410, GREEN = 0x07e0, YELLOW = 0xffe0, RED = 0xf800, CYAN = 0x07ff };
     char t[64];
@@ -183,10 +195,16 @@ static void draw(unsigned frame, uint32_t rate_Bps) {
     const unsigned char *hp = (const unsigned char *)&hst;
     if (hst && hst != 0xFFFFFFFFu) big_at(1, WHITE, "PC %u.%u.%u.%u", hp[0], hp[1], hp[2], hp[3]);
     else big_at(1, WHITE, "PC %s", g_host_text);
-    big_at(2, c->rx_pkts ? GREEN : YELLOW, "BEACONS %u HEARD %u", (unsigned)c->tx_pkts, (unsigned)c->rx_pkts);
+    if (up && g_linked) big_at(2, GREEN, "LINKED (HEARD %u)", (unsigned)c->rx_pkts);
+    else if (up && g_ever_heard) big_at(2, YELLOW, "PC LOST: BEACONS %u", (unsigned)c->tx_pkts);
+    else big_at(2, YELLOW, "BEACONS %u NO PC YET", (unsigned)c->tx_pkts);
     line_at(0, CYAN, "%s  %s%s", LOADER_TITLE, LOADER_BUILD, g_pushed ? " (PUSHED)" : "");
-    line_at(1, GREY, "BOOT %u  PORT %u  STUB %u B  PROTO %u", (unsigned)g_core.boot_count, dcql_net_port(),
-            (unsigned)H->h.stub_bytes, (unsigned)CL_VERSION);
+    const uint32_t gv = H->h.reserved[CL_RSV_GDEMU_VER], slot = H->h.reserved[CL_RSV_GDEMU_SLOT];
+    if (gv) line_at(1, GREY, "BOOT %u PORT %u STUB %u B GDEMU %u.%u.%u SLOT %u", (unsigned)g_core.boot_count,
+                    dcql_net_port(), (unsigned)H->h.stub_bytes, (unsigned)(gv >> 16), (unsigned)((gv >> 8) & 255),
+                    (unsigned)(gv & 255), (unsigned)slot);
+    else line_at(1, GREY, "BOOT %u PORT %u STUB %u B NO GDEMU SLOT %u", (unsigned)g_core.boot_count, dcql_net_port(),
+                 (unsigned)H->h.stub_bytes, (unsigned)slot);
     dcql_net_text(t, sizeof(t));
     line_at(2, up ? GREEN : YELLOW, "LINK: %s", t);
     if (!up) {
@@ -216,7 +234,9 @@ static void draw(unsigned frame, uint32_t rate_Bps) {
         line_at(6, GREY, "EXIT %d   REPORT %u BYTES", (int)h->exit_code, (unsigned)h->report_len);
     unsigned tx, rx, txd, rxd;
     dcql_net_counters(&tx, &rx, &txd, &rxd);
-    line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
+    if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "STUB: STEP %u ERR %X GDEMU %X ENTRIES %u",
+                             (unsigned)g_stub_step, (unsigned)g_stub_err, (unsigned)g_stub_gdemu, (unsigned)g_stub_entries);
+    else line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
     /* the last five log lines (rows 8 to 12: the screen's bottom) */
     unsigned n = g_log_n;
     for (unsigned i = 0; i < 5; ++i) {
@@ -269,17 +289,34 @@ int main(int argc, char **argv) {
     strcpy(s.net, "auto");
     s.port = s.lport = CL_PORT;
     read_settings(&s);
+    /* GDEMU's version (nothing answers on a GD-ROM drive or in Flycast: bounded, harmless), before any disc work */
+    irq_mask_t im = irq_disable();
+    const uint32_t gver = dcql_gdemu_version();
+    irq_restore(im);
     memset(&g_plat, 0, sizeof(g_plat));
     g_plat.send = p_send; g_plat.now_ms = p_now; g_plat.alloc = p_alloc; g_plat.free = p_free; g_plat.log = p_log;
     g_plat.handoff = H;
     g_plat.max_raw = CL_HANDOFF_ADDR - 0x11000u - CL_LOAD_ADDR;
     g_plat.build = "loader " LOADER_BUILD;
     cl_core_init(&g_core, &g_plat);   /* reads the last run's hand-off before anything grows */
+    if (cl_handoff_valid(H) && H->h.tramp[CL_STUBW_MAGIC] == CL_STUB_MAGIC) {
+        g_stub_seen = 1;
+        g_stub_step = H->h.tramp[CL_STUBW_STEP]; g_stub_err = H->h.tramp[CL_STUBW_ERR];
+        g_stub_gdemu = H->h.tramp[CL_STUBW_GDEMU]; g_stub_entries = H->h.tramp[CL_STUBW_ENTRIES];
+        loader_log("stub's last way back: step %u err %x gdemu %x", (unsigned)g_stub_step, (unsigned)g_stub_err,
+                   (unsigned)g_stub_gdemu);
+        H->h.tramp[CL_STUBW_MAGIC] = 0;   /* said once: a later boot by another way does not repeat it */
+    }
     g_pushed = cl_handoff_valid(H) && H->h.reserved[3] == PUSH_MAGIC;
     uint8_t pushed_sha8[8];
     memcpy(pushed_sha8, &H->h.reserved[4], 8);
     H->h.reserved[3] = 0;
+    H->h.reserved[CL_RSV_GDEMU_SLOT] = s.slot <= 999 ? s.slot : 0;
+    H->h.reserved[CL_RSV_GDEMU_VER] = gver;
     cl_handoff_seal(H);
+    if (gver) loader_log("GDEMU %u.%u.%u, loader image %u", (unsigned)(gver >> 16), (unsigned)((gver >> 8) & 255),
+                         (unsigned)(gver & 255), s.slot);
+    else loader_log("no GDEMU answered; image %u%s", s.slot, s.slot ? " (selected anyway on the way back)" : "");
     const int hr = cl_arm_find();
     if (hr) loader_log("no way back by the stub: LOADER.BIN %d", hr);
     else loader_log("LOADER.BIN at sector %u, %u bytes", (unsigned)cl_arm_lba(), (unsigned)cl_arm_len());
@@ -310,6 +347,8 @@ int main(int argc, char **argv) {
     uint32_t rate_have = 0, rate = 0;
     unsigned frame = 0;
     int was_up = 0, a_was = 0;
+    uint64_t heard_ms = 0, up_ms = 0;
+    uint32_t rx_seen = 0;
     static uint8_t buf[1408];
     for (;;) {
         const uint64_t now = timer_ms_gettime64();
@@ -320,7 +359,9 @@ int main(int argc, char **argv) {
                 g_core.p.link_port = dcql_net_port();
                 g_core.p.link_lport = dcql_net_lport();
                 g_core.p.net_mask = dcql_net_mask(); g_core.p.net_gw = dcql_net_gw();
+                dcql_net_mac(g_core.p.mac);
                 was_up = 1;
+                up_ms = now;
             }
             g_core.p.link_host = dcql_net_host();   /* learnt from the PC's first datagram */
             int n;
@@ -329,7 +370,15 @@ int main(int argc, char **argv) {
                 if (g_core.exec_pending) break;
             }
             cl_core_tick(&g_core);
+            if (g_core.rx_pkts != rx_seen) { rx_seen = g_core.rx_pkts; heard_ms = now; g_ever_heard = 1; }
+            g_linked = g_ever_heard && now - heard_ms < 6000;
+            const uint64_t quiet_since = heard_ms > up_ms ? heard_ms : up_ms;
+            if (now - quiet_since >= 10000 && !dcql_net_learning()) {   /* autoconnect: any PC that answers */
+                loader_log(g_ever_heard ? "PC lost 10 s: looking for any PC" : "no PC in 10 s: looking for any PC");
+                dcql_net_relearn();
+            }
         } else {
+            g_linked = 0;
             was_up = 0;
             if (!dcql_net_busy() && (st == DCQL_LINK_OFF || st == DCQL_LINK_FAILED || st == DCQL_LINK_DROPPED)) {
                 if (st == DCQL_LINK_DROPPED || now >= next_try) {
