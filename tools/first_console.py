@@ -9,7 +9,9 @@ network. Nothing here touches a firewall: Windows may ask once whether Python ma
 
 Steps, each a row of the table (ql-core2: the "ret" row first, every program run with diag=1 so each step is on the
 TV for about a second; the screen colour while the return stub runs: blue entered, cyan quiet, magenta GDEMU image,
-yellow disc init, orange read, green checked, white jump, red reboot):
+yellow disc init, violet the drive's own read, orange read, green checked, white jump, red reboot; before a reboot
+the stub shows red and three rows of bars for about 10 s: tall = 1, short = 0, four to a hex digit; and with
+--console each run row also prints the record of the way back the loader carries in its beacon, ql-core3):
   1 beacon     wait for the loader's HELLO (its address is learnt from it unless --console names it)
   2 ret        the test program returns at once without its link: exec and the way back alone
   3 push+run   send the client test program, verify it, run it, read its report back (5 lines over the link)
@@ -24,6 +26,53 @@ import argparse, glob, json, os, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOP = os.path.normpath(os.path.join(HERE, '..', 'pc', 'dcql_loop.py'))
+
+RUNG_STAGE = {1: 'drive not ready', 2: 'no way back recorded', 3: 'read failed', 4: 'SHA-256 mismatch'}
+STEP_NAME = {1: 'entered', 2: 'quiet', 3: 'GD init', 4: 'read', 5: 'checked', 6: 'jump', 7: 'reboot', 8: 'GDEMU select',
+             9: 'drive read'}
+
+
+def way_back(console, port, wait_s):
+    """Listen (send nothing) for the loader's HELLO from `console` and decode the last way back's record it carries
+    (include/dcql_loop.h CL_HELLO_WB, ql-core3). None when no such beacon came in wait_s."""
+    import socket, struct
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('', port))
+    except OSError:
+        return None
+    s.settimeout(1.0)
+    t_end = time.time() + wait_s
+    try:
+        while time.time() < t_end:
+            try:
+                d, src = s.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if src[0] != console or len(d) < 16 + 156 + 4 or d[:2] != b'CL' or d[3] != 0x01:
+                continue
+            pl = d[16:16 + 156]
+            if struct.unpack_from('<I', pl, 100)[0] != 1:   # role LOADER only
+                continue
+            where, stp, err, aux, run = struct.unpack_from('<5I', pl, 136)
+            kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM')) if where & b]
+            rungs = []
+            for i, name in enumerate(('BIOS', 'drive', 'after select')):
+                b = (err >> (8 * i)) & 255
+                if b:
+                    rungs.append('%s: %s code %d' % (name, RUNG_STAGE.get(b >> 4, 'stage %d' % (b >> 4)), b & 15))
+            sel = err >> 24
+            text = ('run %08x step %d (%s), %s; select %s; BIOS answer err1 %d err2 %d after %d CMD_INIT tries; kept by %s'
+                    % (run, stp, STEP_NAME.get(stp, '?'), '; '.join(rungs) or 'no rung failed',
+                       'not tried' if not sel else 'taken' if sel == 0x10 else 'refused code %d' % (sel & 15),
+                       aux & 255, (aux >> 8) & 255, aux >> 24, ', '.join(kept) or 'nothing (no record survived)'))
+            if not where & 15:
+                text = 'no record: the loader found none in any place (a cold boot, or nothing survived)'
+            return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
+    finally:
+        s.close()
+    return None
 
 
 def main():
@@ -54,6 +103,10 @@ def main():
         text = open(log, encoding='latin-1').read()
         rows.append({'step': name, 'pass': rc == ok_rc, 'rc': rc, 'seconds': round(secs, 1), 'log': log})
         print('%-12s %-4s %6.1f s  (rc %s, %s)' % (name, 'PASS' if rc == ok_rc else 'FAIL', secs, rc, log), flush=True)
+        if out and a.console != 'auto':   # the loader's own record of how the way back ended (listen only)
+            wb = way_back(a.console, a.bind, 75.0)
+            rows[-1]['way_back'] = wb
+            print('             way back: %s' % (wb['text'] if wb else 'no beacon with a record in 75 s'), flush=True)
         return rc == ok_rc, text
 
     print('first console run: %s; waiting up to %.0f s for the loader\'s beacon' % (

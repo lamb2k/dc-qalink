@@ -25,6 +25,7 @@ typedef struct {
     uint32_t hello_flags;      /* CL_HF_* */
     uint8_t loader_sha8[8];
     uint8_t mac[6];            /* the adapter's MAC address (HELLO offset CL_HELLO_MAC), all zero if none */
+    uint32_t wb[5];            /* the last way back's record (HELLO offset CL_HELLO_WB): where, step, err, aux, run */
 } cl_platform_t;
 
 typedef struct {

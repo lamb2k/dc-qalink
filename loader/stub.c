@@ -17,14 +17,23 @@
  * held about a second a step when the client's args had diag=1).
  * Runs in P2 (uncached) with SR.BL set: an exception inside it resets the CPU (the BIOS boots the mounted disc).
  *
+ * Console fixes (lane ql-core3, 2026-11-22, after the first console runs: every way back refused, red then the BIOS):
+ *   - three rungs instead of one: (1) the BIOS's disc calls without an image select or a drive reset first, CMD_INIT
+ *     asked again while the drive answers not ready / disc changed (10 s; it was 8 tries in a few milliseconds, which
+ *     a real drive or GDEMU after a reset or an image change does not meet; Flycast's BIOS answers at once); (2) the
+ *     drive's own read command on its ATA registers, no BIOS at all; (3) the GDEMU image selected, the drive reset,
+ *     both again. Every wait has a limit on the clock (dcql_rtc_s); the error word keeps one byte per rung;
+ *   - the GD-ROM's DMA stopped with the rest (KallistiOS reads the disc by DMA);
+ *   - a refusal is shown for about 10 s as bars (step, error word, the BIOS's last answer) before the reboot, and the
+ *     record is kept in three more places (main RAM at 8 MiB, the top of sound and video RAM) for the next loader.
  * Console fixes (lane ql-core2, 2026-11-22; Flycast has no operand cache and answers the BIOS's disc calls itself, so
  * neither showed there):
  *   - the operand cache is written back and invalidated first: a dirty line of the program's, evicted while the stub
  *     reads LOADER.BIN to 0x8C010000 through P2, would be written back over the bytes just read (the SHA-256 check then
  *     fails and the stub reboots);
  *   - VBR is the BIOS's while the BIOS's disc code runs (the program's handlers are dead by then);
- *   - with a GDEMU image known (hand-off reserved[CL_RSV_GDEMU_SLOT]) the image is selected before the disc is read,
- *     and again before a reboot, so a reboot boots the loader's image like openMenu's disc switch, not openMenu. */
+ *   - with a GDEMU image known (hand-off reserved[CL_RSV_GDEMU_SLOT]) the image is selected (ql-core3: only after the
+ *     first two rungs failed), and again before a reboot, so a reboot boots the loader's image, not openMenu. */
 #include <stdint.h>
 #include "dcql_loop.h"
 #include "dcql_hw.h"
@@ -45,19 +54,27 @@ static void serial_put(char c) {
     *(volatile uint8_t *)0xffe8000cu = (uint8_t)c;
     *fsr &= (uint16_t)~0x60u;
 }
+static const uint32_t colours[] = CL_STUB_COLOURS;
+/* the record that outlives a reboot (dcql_hw.h): rewritten at every step */
+static void crumb(void) {
+    volatile cl_handoff_hdr_t *h = HD;
+    dcql_crumb_t c = {0, h->run_id, h->tramp[CL_STUBW_STEP], h->tramp[CL_STUBW_ERR], h->tramp[CL_STUBW_GDST],
+                      h->tramp[CL_STUBW_ENTRIES], h->tramp[CL_STUBW_W0], 0};
+    dcql_crumb_put(&c);
+}
 static void step(uint32_t s) {
-    static const uint32_t colours[] = CL_STUB_COLOURS;
     HD->tramp[CL_STUBW_STEP] = s;
+    crumb();
     dcql_screen_colour(colours[s < sizeof(colours) / sizeof(colours[0]) ? s : 0]);
     serial_put('S');
     serial_put((char)('0' + s));
     serial_put(s == CL_STUB_STEP_JUMP || s == CL_STUB_STEP_REBOOT ? '\n' : ' ');
-    if (HD->flags & CL_F_DIAG) dcql_wait_vbl(s == CL_STUB_STEP_REBOOT ? 180 : 60);   /* about 1 s (3 s for a reboot) */
+    if (HD->flags & CL_F_DIAG) dcql_wait_vbl(60);   /* about 1 s */
 }
 /* the GDEMU image the loader came from, selected (0 = done or none known); the result kept for the next loader */
 static int gdemu_select(void) {
     const uint32_t slot = HD->reserved[CL_RSV_GDEMU_SLOT];
-    if (!slot || slot > 999) return 0;
+    if (!slot || slot > 999) return 1;
     step(CL_STUB_STEP_GDEMU);
     const int r = dcql_gdemu_select((uint16_t)slot);
     HD->tramp[CL_STUBW_GDEMU] = 0x100u | (uint32_t)(-r);
@@ -90,17 +107,47 @@ static int gd(uint32_t func, uint32_t r4, uint32_t r5) {
 enum { G_SEND = 0, G_CHECK = 1, G_EXEC = 2, G_INIT = 3, G_DRIVE = 4, G_RESET = 9, G_MODE = 10 };
 enum { CMD_PIOREAD = 16, CMD_INIT = 24 };
 
+/* one command to the end, 10 s at most (the clock); the BIOS's answer words kept in tramp[CL_STUBW_GDST].
+   0 = done; -1 not taken, -2 failed (err1 says why), -3 no end in time */
 static int gd_cmd(uint32_t cmd, void *params) {
-    int st[4];
-    int h = gd(G_SEND, cmd, (uint32_t)params);
-    if (h <= 0) return -1;
-    for (uint32_t i = 0; i < 20000000u; ++i) {
-        gd(G_EXEC, 0, 0);
-        const int r = gd(G_CHECK, (uint32_t)h, (uint32_t)st);
-        if (r == 2 || r == 3) return 0;      /* completed / streaming */
-        if (r != 1 && r != 4) return -2;    /* failed / not found */
+    int st[4] = {0, 0, 0, 0};
+    int h = gd(G_SEND, cmd, (uint32_t)params), e = -1;
+    if (h > 0) {
+        const uint32_t t0 = dcql_rtc_s();
+        for (uint32_t i = 0;; ++i) {
+            gd(G_EXEC, 0, 0);
+            const int r = gd(G_CHECK, (uint32_t)h, (uint32_t)st);
+            if (r == 2 || r == 3) { e = 0; break; }      /* completed / streaming */
+            if (r != 1 && r != 4) { e = -2; break; }    /* failed / not found */
+            if ((i & 1023u) == 1023u && (dcql_rtc_s() - t0 >= 6u || i > 50000000u)) { e = -3; break; }
+        }
     }
-    return -3;
+    volatile uint32_t *w = &HD->tramp[CL_STUBW_GDST];
+    *w = (*w & 0xff000000u) | (uint32_t)(st[0] & 0xff) | ((uint32_t)(st[1] & 0xff) << 8) | ((uint32_t)(-e & 0xff) << 16);
+    return e;
+}
+/* the drive ready through the BIOS: CMD_INIT asked again while the drive answers not ready or "disc changed" (a real
+   drive or GDEMU after a reset or an image change; KallistiOS's cdrom_reinit loops the same way), 12 s at most; then
+   KallistiOS's default data mode (cdrom_change_datatype): data area, 2048-byte sectors */
+static int bios_ready(int reset) {
+    if (reset) gd(G_RESET, 0, 0);
+    gd(G_INIT, 0, 0);
+    const uint32_t t0 = dcql_rtc_s();
+    int r;
+    uint32_t tries = 0;
+    do {
+        r = gd_cmd(CMD_INIT, 0);
+        ++tries;
+        HD->tramp[CL_STUBW_GDST] = (HD->tramp[CL_STUBW_GDST] & 0xffffffu) | ((tries > 255 ? 255 : tries) << 24);
+        if (!r) break;
+        dcql_wait_vbl(6);   /* a tenth of a second between tries */
+    } while (dcql_rtc_s() - t0 < 10u && tries < 150);
+    if (r) return r;
+    int drive[2] = {0, 0};
+    gd(G_DRIVE, (uint32_t)drive, 0);
+    uint32_t mode[4] = {0 /* set */, drive[1] == 0x20 /* CD-ROM XA */ ? 2048u : 1024u, 0x1000 /* data area */, 2048};
+    gd(G_MODE, (uint32_t)mode, 0);
+    return 0;
 }
 
 /* ---------------------------------------------------------------- SHA-256 (FIPS 180-4) */
@@ -165,7 +212,70 @@ static void quiet(void) {
                                       0xa05f6930, 0xa05f6934, 0xa05f6938};
     for (int i = 0; i < 9; ++i) REG32(masks[i]) = 0;   /* no ASIC interrupt routed anywhere */
     for (int i = 0; i < 3; ++i) REG32(0xa05f6900 + 4 * i) = REG32(0xa05f6900 + 4 * i);   /* pending events cleared */
+    dcql_g1_dma_stop();                /* a disc read the program left running by DMA stopped (KallistiOS reads by DMA) */
     if (HD->net_kind == CL_NET_BBA) *(vu8 *)0xa1001737 = 0x10;   /* the adapter's RTL8139: software reset (CR.RST) */
+}
+
+/* a rung's result as one byte of the error word: stage << 4 | the failing call's code */
+static uint32_t rung_code(uint32_t stage, int r) { return (stage << 4) | (uint32_t)(-r > 15 ? 15 : -r); }
+static int read_bios(uint8_t *dst, uint32_t lba, uint32_t secs) {
+    for (uint32_t s = 0; s < secs;) {
+        const uint32_t n = secs - s < 16 ? secs - s : 16;
+        uint32_t params[4] = {lba + s, n, (uint32_t)(dst + s * 2048), 0};
+        int e = -1;
+        for (int tries = 0; tries < 4 && e; ++tries) e = gd_cmd(CMD_PIOREAD, params);
+        if (e) return e;
+        s += n;
+    }
+    return 0;
+}
+/* the drive's own read; a refusal (unit attention after an image change, not ready) asked again, 10 s at most */
+static int read_ata(uint8_t *dst, uint32_t lba, uint32_t secs) {
+    dcql_gd_unstick();
+    const uint32_t t0 = dcql_rtc_s();
+    for (uint32_t s = 0; s < secs;) {
+        const uint32_t n = secs - s < 16 ? secs - s : 16;
+        int e;
+        while ((e = dcql_gd_read_pio(lba + s, n, (uint16_t *)(dst + s * 2048))) != 0) {
+            if (dcql_rtc_s() - t0 >= 10u) return e;
+            if (e != -6) dcql_gd_unstick();
+            dcql_wait_vbl(6);
+        }
+        s += n;
+    }
+    return 0;
+}
+/* one rung: the drive ready, LOADER.BIN read to 0x8C010000 (uncached), its SHA-256 checked; 0 = the loader is there,
+   else the rung's byte for the error word */
+static uint32_t rung(int bios, int reset) {
+    volatile cl_handoff_hdr_t *h = HD;
+    uint8_t *dst = (uint8_t *)P2(CL_LOAD_ADDR);
+    const uint32_t bytes = h->loader_len, lba = h->ret_lba, secs = (bytes + 2047) / 2048;
+    int r;
+    if (bios) {
+        if ((r = bios_ready(reset)) != 0) return rung_code(1, r);
+        step(CL_STUB_STEP_GDINIT);
+        if ((r = read_bios(dst, lba, secs)) != 0) return rung_code(3, r);
+    } else {
+        step(CL_STUB_STEP_ATA);
+        if ((r = read_ata(dst, lba, secs)) != 0) return rung_code(3, r);
+    }
+    h->tramp[CL_STUBW_W0] = *(volatile uint32_t *)dst;   /* what was read, for a mismatch */
+    step(CL_STUB_STEP_READ);
+    if (!sha_matches(dst, bytes, h->ret_sha)) return rung_code(4, -1);
+    return 0;
+}
+
+/* the refusal on the TV before the reboot (about 10 s): the whole screen red, then three rows of bars
+   (dcql_hw.h dcql_screen_bars): the last step reached, the error word, the BIOS's last answer */
+static void show_refusal(uint32_t last_step) {
+    volatile cl_handoff_hdr_t *h = HD;
+    for (int k = 0; k < 3; ++k) {
+        dcql_screen_colour(0xff0000);
+        dcql_wait_vbl(60);
+        dcql_screen_bars(last_step, h->tramp[CL_STUBW_ERR], h->tramp[CL_STUBW_GDST], 0xff0000);
+        dcql_wait_vbl(150);
+    }
 }
 
 void stub_main(void) {
@@ -174,40 +284,37 @@ void stub_main(void) {
     h->tramp[CL_STUBW_ENTRIES]++;
     h->tramp[CL_STUBW_ERR] = 0;
     h->tramp[CL_STUBW_GDEMU] = 0;
+    h->tramp[CL_STUBW_GDST] = 0;
+    h->tramp[CL_STUBW_RUNG] = 0;
+    h->tramp[CL_STUBW_W0] = 0;
     dcql_ocache_purge_all();   /* first: no line of the program's may be written back over what the stub reads */
     if (h->reserved[CL_RSV_BIOS_VBR]) __asm__ __volatile__("ldc %0, vbr" : : "r"(h->reserved[CL_RSV_BIOS_VBR]));
     step(CL_STUB_STEP_ENTERED);
     quiet();
     step(CL_STUB_STEP_QUIET);
-    /* the disc switch: the loader's image served again (a no-op when it still is; nothing without GDEMU) */
-    const int sel = gdemu_select();
-    if (sel) h->tramp[CL_STUBW_ERR] = 0x8000u | ((uint32_t)(-sel) << 16);
-    gd(G_RESET, 0, 0);
-    gd(G_INIT, 0, 0);
-    int r = 0;
-    for (int tries = 0; tries < 8; ++tries)
-        if ((r = gd_cmd(CMD_INIT, 0)) == 0) break;
-    int drive[2] = {0, 0};
-    gd(G_DRIVE, (uint32_t)drive, 0);
-    /* KallistiOS's default data mode (cdrom_change_datatype): data area, 2048-byte sectors */
-    uint32_t mode[4] = {0 /* set */, drive[1] == 0x20 /* CD-ROM XA */ ? 2048u : 1024u, 0x1000 /* data area */, 2048};
-    gd(G_MODE, (uint32_t)mode, 0);
-    step(CL_STUB_STEP_GDINIT);
-    if (r) { h->tramp[CL_STUBW_ERR] |= 0x100u | (uint32_t)(-r); goto reboot; }
+    uint32_t last = CL_STUB_STEP_QUIET;
     const uint32_t bytes = h->loader_len, lba = h->ret_lba;
-    if (!bytes || !lba || bytes > 4u * 1024u * 1024u) { h->tramp[CL_STUBW_ERR] |= 0x200; goto reboot; }
-    uint8_t *dst = (uint8_t *)P2(CL_LOAD_ADDR);
-    const uint32_t secs = (bytes + 2047) / 2048;
-    for (uint32_t s = 0; s < secs;) {
-        const uint32_t n = secs - s < 16 ? secs - s : 16;
-        uint32_t params[4] = {lba + s, n, (uint32_t)(dst + s * 2048), 0};
-        int e = -1;
-        for (int tries = 0; tries < 4 && e; ++tries) e = gd_cmd(CMD_PIOREAD, params);
-        if (e) { h->tramp[CL_STUBW_ERR] |= 0x300u | (uint32_t)(-e); goto reboot; }
-        s += n;
+    if (!bytes || !lba || bytes > 4u * 1024u * 1024u) { h->tramp[CL_STUBW_ERR] = 0x20; goto reboot; }
+    /* rung 1: the BIOS's disc calls, as KallistiOS uses them (no image select first: an image change is a "disc
+       changed" the drive reports for a while; the loader's image is normally still the one served) */
+    uint32_t e = (h->flags & CL_F_STUB_NOBIOS) ? 0x0fu : rung(1, 0);
+    if (!e) { h->tramp[CL_STUBW_RUNG] = 1; goto go; }
+    h->tramp[CL_STUBW_ERR] = e;
+    /* rung 2: the drive's own read command, no BIOS (its vectors, its state, its interrupts do not matter) */
+    if (!(e = rung(0, 0))) { h->tramp[CL_STUBW_RUNG] = 2; goto go; }
+    h->tramp[CL_STUBW_ERR] |= e << 8;
+    /* rung 3: the loader's GDEMU image selected (the program may have changed images), then the drive reset and both
+       reads again */
+    const int sel = gdemu_select();
+    if (sel != 1) {
+        h->tramp[CL_STUBW_ERR] |= (0x10u | (uint32_t)(-sel & 15)) << 24;
+        dcql_wait_vbl(30);
+        if (!(e = rung(1, 1)) || !(e = rung(0, 0))) { h->tramp[CL_STUBW_RUNG] = 3; goto go; }
+        h->tramp[CL_STUBW_ERR] |= e << 16;
     }
-    step(CL_STUB_STEP_READ);
-    if (!sha_matches(dst, bytes, h->ret_sha)) { h->tramp[CL_STUBW_ERR] |= 0x400; goto reboot; }
+    last = h->tramp[CL_STUBW_STEP];
+    goto reboot;
+go:
     step(CL_STUB_STEP_SHA);
     /* the run's state and the start-up registers the loader gets, on the serial line (8 hex digits each) */
     serial_hex(h->state);
@@ -221,7 +328,9 @@ void stub_main(void) {
     stub_go(h->reserved[CL_RSV_BIOS_SR], h->reserved[CL_RSV_BIOS_VBR], h->reserved[CL_RSV_BIOS_FPSCR]);
 reboot:
     serial_hex(h->tramp[CL_STUBW_ERR]);
+    serial_hex(h->tramp[CL_STUBW_GDST]);
     step(CL_STUB_STEP_REBOOT);
+    show_refusal(last);   /* always, diag or not: a refusal is rare and the TV is the only witness */
     /* the BIOS then boots the loader's image, not openMenu's (the step word stays REBOOT for the next loader) */
     if (h->reserved[CL_RSV_GDEMU_SLOT] && h->reserved[CL_RSV_GDEMU_SLOT] <= 999)
         h->tramp[CL_STUBW_GDEMU] |= (0x200u | (uint32_t)(-dcql_gdemu_select((uint16_t)h->reserved[CL_RSV_GDEMU_SLOT]))) << 12;

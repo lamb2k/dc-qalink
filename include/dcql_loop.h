@@ -117,10 +117,15 @@ typedef struct {
     uint8_t mac[6];           /* offset 128: the adapter's MAC address (all zero on the modem): one console across
                                  DHCP address changes */
     uint16_t gdemu_slot;      /* offset 134: the GDEMU image the loader returns to (0 = none known) */
+    /* v2, additive (ql-core3): the last way back's record as this loader found it at boot (CL_WB_*) */
+    uint32_t wb_where;        /* offset 136: bit 0 hand-off header, 1 main RAM at 8 MiB, 2 sound RAM, 3 video RAM held
+                                 it (0 = no record anywhere); bits 8..15 the stub's entries */
+    uint32_t wb_step, wb_err, wb_aux, wb_run;   /* offsets 140, 144, 148, 152 */
 } cl_hello_t;
-#define CL_HELLO_LEN 136
+#define CL_HELLO_LEN 156
 #define CL_HELLO_MAC 128
 #define CL_HELLO_SLOT 134
+#define CL_HELLO_WB 136
 #define CL_HF_PUSHED_LOADER 1u   /* this loader was pushed by the PC (self-update), not read from the disc */
 #define CL_HF_STUB_ARMED 2u
 
@@ -162,6 +167,7 @@ enum { CL_RUN_NONE = 0, CL_RUN_RUNNING = 1, CL_RUN_DONE = 2, CL_RUN_CRASHED = 3,
 #define CL_F_WDT_ARMED 1u      /* the client armed the SH-4 watchdog (reset mode) */
 #define CL_F_STUB_USED 2u      /* the way back went through the return stub */
 #define CL_F_DIAG 4u           /* args diag=1: the client and the stub hold each step on screen about a second */
+#define CL_F_STUB_NOBIOS 8u    /* lab arm (testprog "stubata"): the stub skips its BIOS rung (the drive's own read) */
 
 #define CL_TRAMP_WORDS 32
 typedef struct {
@@ -213,12 +219,19 @@ enum { CL_STUBW_MAGIC = 0, CL_STUBW_STEP = 1, CL_STUBW_ERR = 2, CL_STUBW_ENTRIES
 #define CL_STUB_MAGIC 0x42545353u   /* "SSTB" */
 enum { CL_STUB_STEP_ENTERED = 1, CL_STUB_STEP_QUIET = 2, CL_STUB_STEP_GDINIT = 3, CL_STUB_STEP_READ = 4,
        CL_STUB_STEP_SHA = 5, CL_STUB_STEP_JUMP = 6, CL_STUB_STEP_REBOOT = 7,
-       CL_STUB_STEP_GDEMU = 8 /* v2 (ql-core2): the loader's GDEMU image selected before the disc is read */ };
-/* tramp[CL_STUBW_ERR]: 0x1nn GD init, 0x200 no way back recorded, 0x3nn read, 0x400 SHA-256; | 0x8000 when the
-   GDEMU image select was refused (its code in bits 16..23); tramp[CL_STUBW_GDEMU]: the select's result + 0x100 */
-enum { CL_STUBW_GDEMU = 4 };
+       CL_STUB_STEP_GDEMU = 8 /* v2 (ql-core2): the loader's GDEMU image selected */,
+       CL_STUB_STEP_ATA = 9 /* ql-core3: rung 2, the drive's own read */ };
+/* tramp[CL_STUBW_ERR] (ql-core3): one byte per rung of the stub, 0 = not tried, else (stage << 4) | code:
+     byte 0  rung 1, the BIOS's disc calls          stage 1 drive not ready (CMD_INIT), 2 no way back recorded,
+     byte 1  rung 2, the drive's own read (no BIOS)       3 read, 4 SHA-256 mismatch; code = the failing call's
+     byte 2  rung 3, after the GDEMU image select         -return (1..15)
+     byte 3  the GDEMU select: 0 not tried, 0x10 | -code (0x10 = taken, 0x14 = refused: no GDEMU)
+   tramp[CL_STUBW_GDST]: the BIOS's last answer: err1 | err2 << 8 | -(last call) << 16 | CMD_INIT tries << 24
+   (err1 2 = not ready, 6 = unit attention / disc changed). tramp[CL_STUBW_RUNG]: the rung that came back (1..3).
+   tramp[CL_STUBW_GDEMU]: the select's result + 0x100 (before the reboot: | (0x200 + code) << 12) */
+enum { CL_STUBW_GDEMU = 4, CL_STUBW_GDST = 5, CL_STUBW_RUNG = 6, CL_STUBW_W0 = 7 };
 /* the screen colour of each stub step (dcql_hw.h dcql_screen_colour): the stub has no text */
-#define CL_STUB_COLOURS {0x000000, 0x0000ff /* 1 entered: blue */, 0x00ffff /* 2 quiet: cyan */,     0xffff00 /* 3 GD init: yellow */, 0xff8000 /* 4 read: orange */, 0x00ff00 /* 5 SHA ok: green */,     0xffffff /* 6 jump: white */, 0xff0000 /* 7 reboot: red */, 0xff00ff /* 8 GDEMU select: magenta */}
+#define CL_STUB_COLOURS {0x000000, 0x0000ff /* 1 entered: blue */, 0x00ffff /* 2 quiet: cyan */,     0xffff00 /* 3 GD init: yellow */, 0xff8000 /* 4 read: orange */, 0x00ff00 /* 5 SHA ok: green */,     0xffffff /* 6 jump: white */, 0xff0000 /* 7 reboot: red */, 0xff00ff /* 8 GDEMU select: magenta */,     0x8000ff /* 9 the drive's own read: violet */}
 
 /* ------------------------------------------------------------------------------------------------ helpers */
 uint32_t cl_crc32(uint32_t crc, const void *buf, size_t n);  /* zlib-compatible: start with 0 */

@@ -180,7 +180,19 @@ static const char *run_state_name(uint32_t s) {
 }
 /* the return stub's own record of the last way back (hand-off tramp[], read at boot before anything changes it) */
 static int g_stub_seen;
-static uint32_t g_stub_step, g_stub_err, g_stub_gdemu, g_stub_entries;
+static uint32_t g_stub_step, g_stub_err, g_stub_gdemu, g_stub_entries, g_stub_aux, g_stub_rung, g_stub_run, g_stub_w0;
+/* the same record in three more places (dcql_hw.h dcql_crumb_*), read before anything of KallistiOS starts (before the
+   BSS is cleared, and before KallistiOS clears sound and video RAM), so the loader can say which of them kept it across
+   a BIOS reboot: the console run of 2026-11-22 lost the hand-off area on every reboot (ql-core3) */
+static dcql_crumb_t g_crumb[DCQL_CRUMB_PLACES] __attribute__((section(".data")));
+static uint32_t g_crumb_ok __attribute__((section(".data")));
+static void early_read_crumbs(void) {
+    for (int k = 0; k < DCQL_CRUMB_PLACES; ++k)
+        if (dcql_crumb_get(k, &g_crumb[k])) g_crumb_ok |= 1u << k;
+    dcql_crumb_clear();   /* said once: a later boot by another way does not repeat it */
+}
+KOS_INIT_EARLY(early_read_crumbs);
+static uint32_t g_wb_where;   /* CL_HELLO_WB bits: 0 hand-off, 1 main RAM, 2 sound RAM, 3 video RAM */
 static void draw(unsigned frame, uint32_t rate_Bps) {
     enum { WHITE = 0xffff, GREY = 0x8410, GREEN = 0x07e0, YELLOW = 0xffe0, RED = 0xf800, CYAN = 0x07ff };
     char t[64];
@@ -234,8 +246,10 @@ static void draw(unsigned frame, uint32_t rate_Bps) {
         line_at(6, GREY, "EXIT %d   REPORT %u BYTES", (int)h->exit_code, (unsigned)h->report_len);
     unsigned tx, rx, txd, rxd;
     dcql_net_counters(&tx, &rx, &txd, &rxd);
-    if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "STUB: STEP %u ERR %X GDEMU %X ENTRIES %u",
-                             (unsigned)g_stub_step, (unsigned)g_stub_err, (unsigned)g_stub_gdemu, (unsigned)g_stub_entries);
+    if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "BACK S%u R%u ERR %08X AUX %08X %c%c%c%c",
+                             (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux,
+                             g_wb_where & 1 ? 'H' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
+                             g_wb_where & 8 ? 'V' : '-');
     else line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
     /* the last five log lines (rows 8 to 12: the screen's bottom) */
     unsigned n = g_log_n;
@@ -298,15 +312,35 @@ int main(int argc, char **argv) {
     g_plat.handoff = H;
     g_plat.max_raw = CL_HANDOFF_ADDR - 0x11000u - CL_LOAD_ADDR;
     g_plat.build = "loader " LOADER_BUILD;
-    cl_core_init(&g_core, &g_plat);   /* reads the last run's hand-off before anything grows */
-    if (cl_handoff_valid(H) && H->h.tramp[CL_STUBW_MAGIC] == CL_STUB_MAGIC) {
+    /* the last way back: the hand-off header's words first, else the first place that kept the record */
+    const int in_hdr = cl_handoff_valid(H) && H->h.tramp[CL_STUBW_MAGIC] == CL_STUB_MAGIC;
+    g_wb_where = (in_hdr ? 1u : 0u) | (g_crumb_ok << 1);
+    if (in_hdr) {
         g_stub_seen = 1;
         g_stub_step = H->h.tramp[CL_STUBW_STEP]; g_stub_err = H->h.tramp[CL_STUBW_ERR];
         g_stub_gdemu = H->h.tramp[CL_STUBW_GDEMU]; g_stub_entries = H->h.tramp[CL_STUBW_ENTRIES];
-        loader_log("stub's last way back: step %u err %x gdemu %x", (unsigned)g_stub_step, (unsigned)g_stub_err,
-                   (unsigned)g_stub_gdemu);
+        g_stub_aux = H->h.tramp[CL_STUBW_GDST]; g_stub_rung = H->h.tramp[CL_STUBW_RUNG];
+        g_stub_w0 = H->h.tramp[CL_STUBW_W0]; g_stub_run = H->h.run_id;
         H->h.tramp[CL_STUBW_MAGIC] = 0;   /* said once: a later boot by another way does not repeat it */
+    } else {
+        for (int k = 0; k < DCQL_CRUMB_PLACES && !g_stub_seen; ++k)
+            if (g_crumb_ok & (1u << k)) {
+                const dcql_crumb_t *c = &g_crumb[k];
+                g_stub_seen = 1;
+                g_stub_step = c->step; g_stub_err = c->err; g_stub_aux = c->aux; g_stub_entries = c->entries;
+                g_stub_w0 = c->w0; g_stub_run = c->run_id;
+            }
     }
+    if (g_stub_seen) {
+        loader_log("way back of run %08x: step %u rung %u err %08x aux %08x", (unsigned)g_stub_run,
+                   (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux);
+        loader_log("kept by: hand-off %s, RAM 8M %s, sound %s, video %s; w0 %08x gdemu %x", in_hdr ? "yes" : "no",
+                   g_crumb_ok & 1 ? "yes" : "no", g_crumb_ok & 2 ? "yes" : "no", g_crumb_ok & 4 ? "yes" : "no",
+                   (unsigned)g_stub_w0, (unsigned)g_stub_gdemu);
+    }
+    const uint32_t wb[5] = {g_wb_where | ((g_stub_entries & 255u) << 8), g_stub_step, g_stub_err, g_stub_aux, g_stub_run};
+    memcpy(g_plat.wb, wb, sizeof(wb));
+    cl_core_init(&g_core, &g_plat);   /* reads the last run's hand-off before anything grows */
     g_pushed = cl_handoff_valid(H) && H->h.reserved[3] == PUSH_MAGIC;
     uint8_t pushed_sha8[8];
     memcpy(pushed_sha8, &H->h.reserved[4], 8);

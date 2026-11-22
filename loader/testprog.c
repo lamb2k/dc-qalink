@@ -243,6 +243,16 @@ int main(int argc, char **argv) {
         cl_handoff_seal(w);
         cl_exit(0);
     }
+    if (word(args, "stubata")) {   /* lab arm: the stub's BIOS rung skipped, so its second rung (the drive's own read) must
+                                      bring the loader back alone */
+        say(4, "STUB: NO BIOS RUNG, DRIVE READ");
+        cl_report("stubata: the stub's BIOS rung skipped; the drive's own read must bring the loader\n");
+        thd_sleep(1000);
+        cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
+        w->h.flags |= CL_F_STUB_NOBIOS;
+        cl_handoff_seal(w);
+        cl_exit(0);
+    }
     if (has(args, "return")) {
         say(4, "RETURN FROM MAIN");
         thd_sleep(1500);

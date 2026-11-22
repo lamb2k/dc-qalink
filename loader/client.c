@@ -290,6 +290,31 @@ static void on_datagram(const uint8_t *d, int n) {
         break;
     }
 }
+/* the path to the PC proven before the link counts as up (ql-core3): an ARP answer from the PC (or the gateway, for a PC
+   on another network), asked again every second, 30 s at most. A switch port that has just seen the adapter's link
+   come up can forward nothing for seconds (spanning tree's listening and learning); with DHCP that hides in DHCP's
+   own resends, but a static address sent its only HELLO into it (the console run of 2026-11-22: `static=1`, no link
+   line, no report). Returns the ms it took, or -1 when nothing answered (the link is then used anyway). */
+int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
+static int g_path_ms = -2;
+static int path_wait(void) {
+    netif_t *nif = net_default_dev;
+    uint32_t host = H->h.link_host, me, mask, gw;
+    if (!nif || !host || host == 0xffffffffu) return -2;
+    memcpy(&me, nif->ip_addr, 4);
+    memcpy(&mask, nif->netmask, 4);
+    memcpy(&gw, nif->gateway, 4);
+    if (mask && (host & mask) != (me & mask) && gw) host = gw;
+    uint8_t ip[4], mac[6];
+    memcpy(ip, &host, 4);
+    const uint64_t t0 = timer_ms_gettime64();
+    for (int i = 0; i < 120; ++i) {
+        if (net_arp_lookup(nif, ip, mac, NULL, NULL, 0) == 0) return (int)(timer_ms_gettime64() - t0);
+        if (i % 4 == 3) net_arp_query(nif, ip);
+        thd_sleep(250);
+    }
+    return -1;
+}
 static void *link_thread(void *arg) {
     (void)arg;
     static uint8_t d[CL_DGRAM_MAX + 8];
@@ -303,6 +328,9 @@ static void *link_thread(void *arg) {
         }
         thd_sleep(20);
     }
+    g_path_ms = path_wait();
+    if (g_path_ms >= 0) diag_step(0x07e0, "CL 3 PATH TO PC %d MS", g_path_ms);
+    else diag_step(0xffe0, "CL 3 NO ARP ANSWER");
     g_link_up = 1;
     g_link_up_ms = (uint32_t)(timer_ms_gettime64() - g_t0_ms);
     dcql_live_link(1);
@@ -313,12 +341,15 @@ static void *link_thread(void *arg) {
     }
     client_hello();
     diag_step(0xffff, "CL 4 HELLO SENT");
-    uint64_t last = 0;
+    uint64_t last = 0, hello_at = timer_ms_gettime64();
+    int hellos = 1;
     for (;;) {   /* answers at once; live data out every 20 ms (a batch of about one picture) */
         const int n = dcql_net_recv_wait(d, sizeof(d), 20);
         if (n > 0) on_datagram(d, n);
         const uint64_t now = timer_ms_gettime64();
         if (now - last >= 20) { last = now; dcql_live_pump(live_send); }
+        /* HELLO again each second until the PC has sent anything, 10 times at most: one lost HELLO is not a lost run */
+        if (!g_rx_seen && hellos < 10 && now - hello_at >= 1000) { client_hello(); hello_at = now; ++hellos; }
     }
     return NULL;
 }
@@ -641,7 +672,8 @@ static void summary(void) {
     if (g_leaving) return;
     cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us (the watchdog resets after about 20970 us)\n",
               g_wdt_armed ? "armed" : "measured only", (unsigned)g_wdt_feeds, (unsigned)g_wdt_gap_us);
-    if (g_link_up) cl_report("cl-link: up %u ms after start\n", (unsigned)g_link_up_ms);
+    if (g_link_up) cl_report("cl-link: up %u ms after start (path to the PC: %s %d ms)\n", (unsigned)g_link_up_ms,
+                             g_path_ms >= 0 ? "ARP answered after" : "no ARP answer in", g_path_ms >= 0 ? g_path_ms : 30000);
     if (g_link)
         cl_report("cl-link: %s, files opened %u refused %u, reads %u, %u bytes in %u ms, lines %u dropped %u, stills %u\n",
                   g_link_up ? "up" : "never up", g_st.files_opened, g_st.files_refused, g_st.reads, g_st.read_bytes,
