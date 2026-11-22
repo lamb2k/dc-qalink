@@ -19,13 +19,13 @@
  * caller: the game thread waits only inside its own read call, for the blocks that call needs.
  *
  * Wire (include/dcql_loop.h, additive to protocol 2; pc/dcql_disc.py is the PC side):
- *   DOPEN  0x21 console->PC  a = request id; payload u32 flags (DCQL_DO_*), path below the disc root
- *   DINFO  0x24 PC->console  a = request id; payload i32 status (0 open, <0 refused), u32 handle, u32 size, u32 flags
- *   DREAD  0x22 console->PC  a = request id; payload u32 handle, offset, len (<= 32 KiB), mask (1 KiB pieces wanted),
+ *   DOPEN  0x27 console->PC  a = request id; payload u32 flags (DCQL_DO_*), path below the disc root
+ *   DINFO  0x2a PC->console  a = request id; payload i32 status (0 open, <0 refused), u32 handle, u32 size, u32 flags
+ *   DREAD  0x28 console->PC  a = request id; payload u32 handle, offset, len (<= 32 KiB), mask (1 KiB pieces wanted),
  *                            prev_id, prev_us (the console's own time for its previous finished request)
- *   DDATA  0x25 PC->console  a = request id, b = piece index; payload up to 1024 bytes
- *   DCLOSE 0x23 console->PC  a = handle; payload prev_id, prev_us
- *   DLOG   0x26 console->PC  a = sequence; payload: the program's reads as it made them (file, offset, bytes, us,
+ *   DDATA  0x2b PC->console  a = request id, b = piece index; payload up to 1024 bytes
+ *   DCLOSE 0x29 console->PC  a = handle; payload prev_id, prev_us
+ *   DLOG   0x2c console->PC  a = sequence; payload: the program's reads as it made them (file, offset, bytes, us,
  *                            side), sequential reads of one file merged into one record
  */
 #ifndef DCQL_DISC_H

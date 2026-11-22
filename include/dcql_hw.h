@@ -250,6 +250,33 @@ static inline void dcql_save_handoff(uint32_t area_p2, uint32_t hdr_bytes, uint3
     }
 }
 
+/* ---------------------------------------------------------------- the broadband adapter at the way back (ql-core4) */
+/* The adapter's PCI bridge ("GAPS") and its RTL8139, on the G2 bus. A BIOS reboot does not know the adapter, so its
+   32 KiB of memory (KallistiOS's receive ring and transmit buffers, 0x01840000) is a fourth place a saved hand-off may
+   outlive the reboot in, where main and sound RAM did not (the console, 2026-11-22). Read only when the bridge says it
+   is there and still set up (its ID, and the "ready" bit KallistiOS's gaps_init waits for), so a console without an
+   adapter, or one whose bridge was reset, reads nothing from it. */
+#define DCQL_GAPS_ID 0xa1001400u
+#define DCQL_GAPS_READY 0xa1001418u
+#define DCQL_BBA_NIC 0xa1001700u
+#define DCQL_SAVE_BBA 0xa1840000u      /* header at +0 (CL_STUB_OFF bytes), the report from +0x1000 */
+#define DCQL_SAVE_BBA_REPORT 0x1000u
+#define DCQL_SAVE_BBA_SIZE 0x8000u
+static inline int dcql_gaps_ready(void) {
+    static const char id[16] = {'G', 'A', 'P', 'S', 'P', 'C', 'I', '_', 'B', 'R', 'I', 'D', 'G', 'E', '_', '2'};
+    for (int i = 0; i < 16; ++i)
+        if (DCQL_HW_R8(DCQL_GAPS_ID + i) != (uint8_t)id[i]) return 0;
+    return (DCQL_HW_R32(DCQL_GAPS_READY) & 1u) != 0;
+}
+/* the adapter stopped from anywhere (interrupts off, no KallistiOS): receiver and transmitter off, its interrupts
+   masked, so nothing it receives is written into its memory or raises an interrupt across the reboot */
+static inline void dcql_bba_quiet(void) {
+    if (!dcql_gaps_ready()) return;
+    DCQL_HW_R16(DCQL_BBA_NIC + 0x3c) = 0;        /* RT_INTRMASK */
+    DCQL_HW_R8(DCQL_BBA_NIC + 0x37) = 0;         /* RT_CHIPCMD: rx and tx off */
+    DCQL_HW_R16(DCQL_BBA_NIC + 0x3e) = 0xffff;   /* RT_INTRSTATUS cleared */
+}
+
 /* ---------------------------------------------------------------- three words as bars on the TV */
 /* The stub has no font: its words go on the screen as bars a TV or a photo can read. Three rows, read left to right,
    most significant bit first, four bars to a hex digit with a wider gap between digits: a tall white bar is 1, a short

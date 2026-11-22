@@ -60,7 +60,14 @@ def way_back(console, port, wait_s):
             stp, _entries, _gd, err, _ver, where, aux, run, sense = struct.unpack_from('<BBHIIIIII', pl, 136)
             kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM'),
                                    (16, 'hand-off put back from main RAM copy'),
-                                   (32, 'hand-off put back from sound RAM copy')) if where & b]
+                                   (32, 'hand-off put back from sound RAM copy'),
+                                   (64, 'hand-off put back from the adapter\'s memory')) if where & b]
+            if stp in (16, 17):   # ql-core4: the full restart's crumb (no stub)
+                text = ('run %08x: %s; kept by %s%s%s' % (
+                    run, 'the full restart taken' if stp == 17 else 'NO ENDING (watchdog, reset or power)',
+                    ', '.join(kept) or 'nothing', '; the loader started on the saved address' if where & 256 else '',
+                    '' if where & 0x70 else ' (no saved copy survived: the crumb only)'))
+                return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
             rungs = []
             for i, name in enumerate(('BIOS', 'drive', 'after select')):
                 b = (err >> (8 * i)) & 255
@@ -72,8 +79,10 @@ def way_back(console, port, wait_s):
                        'not tried' if not sel else 'taken' if sel == 0x10 else 'refused code %d' % (sel & 15),
                        aux & 255, (aux >> 8) & 255, aux >> 24, ', '.join(kept) or 'nothing (no record survived)'))
             text += '; drive sense key %d ASC %02x' % (sense & 15, (sense >> 8) & 255)
-            if not where & 15:
+            if not where & 0x7f:
                 text = 'no record: the loader found none in any place (a cold boot, or nothing survived)'
+            if where & 256:
+                text += '; the loader started on the saved address'
             return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
     finally:
         s.close()
@@ -89,11 +98,15 @@ def main():
     ap.add_argument('--beacon-wait', type=float, default=300.0, help='seconds to wait for the first beacon')
     ap.add_argument('--switch', action='store_true', help='also row 7: the disc switch (GDEMU image, BIOS reboot)')
     ap.add_argument('--no-diag', action='store_true', help='run the program without diag=1 (no 1 s holds)')
+    ap.add_argument('--stub', action='store_true', help='the loader disc says "return stub": the old rows (the quick '
+                    'in-RAM way back must keep the run, so "ret" must hand in its report; plus the drive\'s own read)')
+    ap.add_argument('--hang', action='store_true', help='also the watchdog row: the program hangs with interrupts off')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rows = []
 
     def step(name, args, timeout, ok_rc=0, out=None):
+        ok_rcs = ok_rc if isinstance(ok_rc, tuple) else (ok_rc,)
         cmd = [sys.executable, '-u', LOOP, '--udp', a.console, '--bind', str(a.bind)] + args
         if out:
             cmd += ['--out', os.path.join(a.out, out)]
@@ -106,13 +119,21 @@ def main():
                 rc = 'timeout'
         secs = time.time() - t0
         text = open(log, encoding='latin-1').read()
-        rows.append({'step': name, 'pass': rc == ok_rc, 'rc': rc, 'seconds': round(secs, 1), 'log': log})
-        print('%-12s %-4s %6.1f s  (rc %s, %s)' % (name, 'PASS' if rc == ok_rc else 'FAIL', secs, rc, log), flush=True)
+        ok = rc in ok_rcs
+        rows.append({'step': name, 'pass': ok, 'rc': rc, 'seconds': round(secs, 1), 'log': log})
+        for ln in text.splitlines():   # ql-core4: the full restart's own numbers, from dcql_loop's lines
+            if 'end to beacon' in ln or 'END from the program' in ln or 'program\'s link up' in ln:
+                key = 'end_to_beacon' if 'end to beacon' in ln else 'end' if 'END from' in ln else 'link'
+                rows[-1][key] = ln.split(' ', 1)[1] if ' ' in ln else ln
+        print('%-12s %-4s %6.1f s  (rc %s, %s)' % (name, 'PASS' if ok else 'FAIL', secs, rc, log), flush=True)
+        for key in ('link', 'end', 'end_to_beacon'):
+            if key in rows[-1]:
+                print('             %s' % rows[-1][key], flush=True)
         if out and a.console != 'auto':   # the loader's own record of how the way back ended (listen only)
             wb = way_back(a.console, a.bind, 75.0)
             rows[-1]['way_back'] = wb
             print('             way back: %s' % (wb['text'] if wb else 'no beacon with a record in 75 s'), flush=True)
-        return rc == ok_rc, text
+        return ok, text
 
     print('first console run: %s; waiting up to %.0f s for the loader\'s beacon' % (
         'the console that beacons first' if a.console == 'auto' else a.console, a.beacon_wait), flush=True)
@@ -129,7 +150,13 @@ def main():
               % a.beacon_wait)
     else:
         dg = '' if a.no_diag else ' diag=1'
-        step('2 ret', ['run', a.program, '--args', 'ret' + dg, '--deadline', '60', '--wait', '120'], 180, out='ret')
+        # ql-core4: with the full restart (the default) "ret" has no link, so no END: the console must come back (rc 0
+        # when a saved copy survived the reboot, 4 when nothing did); with --stub the stub must keep the run (rc 0)
+        step('2 ret', ['run', a.program, '--args', 'ret' + dg, '--deadline', '60', '--wait', '120'], 180,
+             ok_rc=0 if a.stub else (0, 4), out='ret')
+        if a.stub:
+            step('2b stubata', ['run', a.program, '--args', 'stubata' + dg, '--deadline', '60', '--wait', '120'], 180,
+                 out='stubata')
         ok2, _ = step('3 push+run', ['run', a.program, '--args', 'report lines:5' + dg, '--deadline', '120', '--wait',
                                      '180'], 240, out='run')
         ok3, _ = step('4 screen x3', ['run', a.program, '--args', 'report screen:3', '--deadline', '120', '--wait',
@@ -143,15 +170,27 @@ def main():
         if ok4 and 'back to the loader' not in t4:
             rows[-1]['pass'] = False
             rows[-1]['detail'] = 'no "back to the loader" after RESET'
-        step('6 back', ['status'], 90)
+        # ql-core4: a crash hands in CRASHED (rc 5) with its registers, by END sent from the exception handler
+        ok5, t5 = step('6 crash', ['run', a.program, '--args', 'report lines:2 crash', '--deadline', '90', '--wait',
+                                   '150'], 210, ok_rc=5, out='crash')
+        if ok5 and 'crash: event' not in t5 and 'CRASHED' not in t5:
+            rows[-1]['pass'] = False
+            rows[-1]['detail'] = 'back, but no CRASHED with registers'
+        if a.hang:   # the watchdog: interrupts off for good; the console restarts with no ending (rc 4, or 5 = LOST)
+            step('6b hang', ['run', a.program, '--args', 'report lines:2 hangoff', '--deadline', '90', '--wait', '150'],
+                 210, ok_rc=(4, 5), out='hang')
+        step('7 back', ['status'], 90)
         if a.switch:
-            step('7 disc switch', ['run', a.program, '--args', 'gdreboot' + dg, '--deadline', '60', '--wait', '120'],
-                 180, out='switch')
+            step('8 disc switch', ['run', a.program, '--args', 'gdreboot' + dg, '--deadline', '60', '--wait', '120'],
+                 180, ok_rc=(0, 4), out='switch')
     print('\n%-12s %-5s %8s  %s' % ('step', 'result', 'seconds', 'detail'))
     for r in rows:
         print('%-12s %-5s %8.1f  %s' % (r['step'], 'PASS' if r['pass'] else 'FAIL', r['seconds'],
                                         r.get('detail', 'rc %s' % r['rc'])))
-    allok = rows and all(r['pass'] for r in rows) and len(rows) == (7 if a.switch else 6)
+    for r in rows:
+        if 'end_to_beacon' in r:
+            print('  %-10s %s' % (r['step'].split()[0], r['end_to_beacon']))
+    allok = rows and all(r['pass'] for r in rows) and len(rows) == 7 + bool(a.switch) + bool(a.stub) + bool(a.hang)
     print('\n%s' % ('ALL PASS: push, run, report, screen grabs and RESET work on this console' if allok else
                     'NOT ALL PASS: the logs are in %s' % os.path.abspath(a.out)))
     with open(os.path.join(a.out, 'first-run.json'), 'w') as f:

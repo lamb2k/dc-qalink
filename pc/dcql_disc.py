@@ -13,7 +13,7 @@ the base (or every overlay file when no base is given); whole: every file from t
 """
 import hashlib, json, os, struct, threading, time
 
-DOPEN, DREAD, DCLOSE, DINFO, DDATA, DLOG = 0x21, 0x22, 0x23, 0x24, 0x25, 0x26
+DOPEN, DREAD, DCLOSE, DINFO, DDATA, DLOG = 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C   # (0x21 is END, ql-core4)
 DISC_TYPES_FROM_CONSOLE = frozenset((DOPEN, DREAD, DCLOSE, DLOG))
 DISC_TYPES_FROM_PC = frozenset((DINFO, DDATA))
 DO_MOUNT, DO_DIR, DO_OVERLAY = 1, 2, 4
