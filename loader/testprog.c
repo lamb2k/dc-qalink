@@ -7,7 +7,8 @@
      lines:<n>  n numbered lines on the serial line (forwarded live to the PC on the adapter)
      file:<p>   open /pc/<p> from the PC's file service, read it whole, report its length, time and SHA-256
      cdfile:<p> the same from the loader's disc (/cd/<p>), for the load-time comparison
-     still      one 640x480 test still (colour bars) to the PC
+     still      one 640x480 test still (colour bars) to the PC; stills:<n> n of them
+     screen:<n> n grabs of the screen itself (the frame buffer, bars drawn on its lower part) to the PC
      crash      a misaligned write (then an illegal instruction, then abort, as Flycast raises none of the first):
                 CRASHED with the registers, back through the return stub
      heapwreck  overwrite the whole heap (and KOS's own records in it), then crash: the stub still brings the loader
@@ -90,7 +91,7 @@ int main(int argc, char **argv) {
               (unsigned)h->h.deadline_s, (unsigned)h->h.stub_bytes,
               cl_stub_armed((const cl_handoff_t *)h) ? "stub" : "preload", (unsigned)h->h.net_kind);
     cl_report("timer %u ms since boot\n", (unsigned)timer_ms_gettime64());
-    if (h->h.net_kind == CL_NET_BBA) {
+    if (h->h.net_kind == CL_NET_BBA && !has(args, "hangoff")) {   /* hangoff: interrupts off before any RESET can come */
         const uint64_t t0 = timer_ms_gettime64();
         const int up = cl_link_wait(10000);
         cl_report("link %s after %u ms\n", up ? "up" : "not up", (unsigned)(timer_ms_gettime64() - t0));
@@ -135,6 +136,24 @@ int main(int argc, char **argv) {
                       (unsigned)(timer_ms_gettime64() - t1));
         }
         cl_report("stills %u of %u held in %u ms\n", held, n, (unsigned)(timer_ms_gettime64() - t0));
+    }
+    const char *sc = strstr(args, "screen:");
+    if (sc) {   /* "screen:<n>": n grabs of the screen itself (the frame buffer in video memory), each with new bars */
+        static const uint16_t bars[8] = {0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x0000};
+        const unsigned n = (unsigned)strtoul(sc + 7, NULL, 10);
+        unsigned held = 0;
+        for (unsigned k = 0; k < n; ++k) {
+            for (int y = 200; y < 480; ++y)
+                for (int x = 0; x < 640; ++x) vram_s[y * 640 + x] = bars[((x / 80) + k) & 7];
+            snprintf(line, sizeof(line), "SCREEN GRAB %u OF %u", k + 1, n);
+            say(6, line);
+            const uint64_t t1 = timer_ms_gettime64();
+            const int r = cl_still(vram_s, 640, 480, 1280, k + 1);
+            held += r == 0;
+            cl_report("screen %u: %s in %u ms\n", k + 1, r ? "NOT HELD" : "held by the PC",
+                      (unsigned)(timer_ms_gettime64() - t1));
+        }
+        cl_report("screens %u of %u held\n", held, n);
     }
     if (has(args, "heapwreck")) {
         say(4, "HEAP WRECKED, THEN A CRASH");

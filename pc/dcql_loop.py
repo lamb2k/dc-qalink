@@ -237,11 +237,16 @@ def big_buffers(s):
 
 
 class UdpTransport:
+    """--udp host[:port]: that console. --udp auto: whichever console beacons first (a loader whose LINK.TXT names
+    this PC, or `host peer`): the peer is learnt from the first well-formed datagram, until then sends are broadcast."""
     def __init__(self, remote, bind_port):
         host, _, port = remote.partition(':')
-        self.remote = (host, int(port or PORT))
+        self.auto = host == 'auto'
+        self.remote = ('255.255.255.255' if self.auto else host, int(port or PORT))
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.auto:
+            self.s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         big_buffers(self.s)
         self.s.bind(('127.0.0.1' if host.startswith('127.') else '0.0.0.0', bind_port))
         self.peer = None
@@ -253,6 +258,9 @@ class UdpTransport:
         self.s.settimeout(max(timeout, 0.001))
         try:
             d, a = self.s.recvfrom(4096)
+            if self.auto and self.peer is None and unframe(d) is not None:
+                self.peer = a
+                print('%s console at %s:%d' % (time.strftime('%H:%M:%S'), a[0], a[1]), flush=True)
             return d
         except (socket.timeout, BlockingIOError):
             return None
@@ -674,6 +682,14 @@ class Loop:
                       every=2.0, poke=lambda: self.send(RUN, session))
         if r is None:
             return 'no answer'
+        if r[0] == ERR and r[2] == 8:
+            # "not verified" for a RUN we re-sent: the first RUN may have run the program and its EXEC been lost (the
+            # loader that answers is the next boot). Its beacon says whether this session's report is the last run.
+            h = self.wait_hello(6.0)
+            if h and h.get('report_run') == session and h.get('report_state', 0) != 0:
+                self.log('RUN %08x refused as not verified by a loader whose last run it is: it ran (EXEC lost)' % session)
+                self.ran_back = h
+                return 'exec'
         return 'exec' if r[0] == EXEC else 'refused: %s' % ERRORS.get(r[2], r[2])
 
     def fetch_report(self, h, out_dir):
@@ -1005,9 +1021,9 @@ def collect(a, loop, stamp, session, result, h):
                 (loop.hello['boot_count'] != b0 or loop.hello['uptime_ms'] < 1000 * (time.time() - t0)):
             return loop.hello
         return None
-    hb = None
+    hb = getattr(loop, 'ran_back', None)   # run_verified already saw the loader back with this run's report
     rung = None
-    if a.reset_after is not None:
+    if hb is None and a.reset_after is not None:
         hb = loop.wait(back, a.reset_after)
         if hb is None:
             stamp('RESET after %.0f s' % a.reset_after)

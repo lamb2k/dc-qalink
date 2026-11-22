@@ -12,10 +12,13 @@
    loader on the disc is the first stage: with no PC it simply carries on).
 
    /cd/LINK.TXT, one setting a line (all optional):
-     net auto|bba|modem      ip a.b.c.d (adapter, static; default DHCP)   mask a.b.c.d   gw a.b.c.d
-     host a.b.c.d|peer       port 52060   lport 52060   number 1111111 (modem)
+     net auto|bba|modem      ip a.b.c.d mask a.b.c.d gw a.b.c.d (adapter: the address asked of DHCP, and used as a
+                             static address when no DHCP server answers; default DHCP alone)   dhcp no (ip without DHCP)
+     host a.b.c.d|peer       (peer: beacons to the whole network, the first PC to answer is kept)
+     port 52060   lport 52060   number 1111111 (modem)
 
-   The screen says what it is doing, for a photo. A on the pad restarts the link at once. */
+   The screen says what it is doing, for a photo: three large lines at the top (the console's address, the PC it looks
+   for, beacons sent and answers heard) can be read off a TV. A on the pad restarts the link at once. */
 #include <kos.h>
 #include <arch/exec.h>
 #include <arch/cache.h>
@@ -90,7 +93,7 @@ static cl_platform_t g_plat;
 static int g_pushed;
 
 /* ---------------------------------------------------------------- settings: /cd/LINK.TXT */
-typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20]; unsigned port, lport; } settings_t;
+typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20], dhcp[8]; unsigned port, lport; } settings_t;
 static void read_settings(settings_t *s) {
     FILE *f = fopen("/cd/LINK.TXT", "r");
     if (!f) f = fopen("/cd/link.txt", "r");
@@ -104,6 +107,7 @@ static void read_settings(settings_t *s) {
         else if (!strcmp(k, "ip")) snprintf(s->ip, sizeof(s->ip), "%s", v);
         else if (!strcmp(k, "mask")) snprintf(s->mask, sizeof(s->mask), "%s", v);
         else if (!strcmp(k, "gw")) snprintf(s->gw, sizeof(s->gw), "%s", v);
+        else if (!strcmp(k, "dhcp")) snprintf(s->dhcp, sizeof(s->dhcp), "%s", v);
         else if (!strcmp(k, "port")) s->port = (unsigned)atoi(v);
         else if (!strcmp(k, "lport")) s->lport = (unsigned)atoi(v);
     }
@@ -119,6 +123,9 @@ static unsigned parse_ip(const char *s) {
 }
 
 /* ---------------------------------------------------------------- screen */
+/* three large lines at the top (the BIOS font at twice its size, 20 characters a line) for reading off a TV across a
+   room: the console's address, the PC it looks for, the beacons; the small rows below them */
+#define BIG_ROWS_PX 152
 static void line_at(int row, uint32_t colour, const char *fmt, ...) {
     char b[64];
     va_list ap;
@@ -128,8 +135,36 @@ static void line_at(int row, uint32_t colour, const char *fmt, ...) {
     if (n < 0) n = 0;
     for (int i = n; i < 53; ++i) b[i] = ' ';   /* pad: the old text goes */
     b[53] = 0;
-    bfont_draw_str_ex(vram_s + (8 + row * 24) * 640 + 4, 640, colour, 0, 16, true, b);
+    bfont_draw_str_ex(vram_s + (BIG_ROWS_PX + row * 24) * 640 + 4, 640, colour, 0, 16, true, b);
 }
+static void big_at(int line, uint32_t colour, const char *fmt, ...) {
+    char b[32];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    if (n > 26) n = 26;
+    for (int i = n; i < 26; ++i) b[i] = ' ';
+    b[26] = 0;
+    static char last[3][27];
+    static uint32_t last_colour[3];
+    if (line < 0 || line > 2 || (!strcmp(last[line], b) && last_colour[line] == colour)) return;   /* drawn only on change */
+    memcpy(last[line], b, 27);
+    last_colour[line] = colour;
+    static uint16_t g[BFONT_HEIGHT * BFONT_THIN_WIDTH];
+    for (int k = 0; k < 26; ++k) {
+        bfont_draw_ex(g, BFONT_THIN_WIDTH, colour, 0, 16, true, (uint8_t)b[k], false, false);
+        uint16_t *dst = vram_s + (4 + line * 48) * 640 + 8 + k * 24;
+        for (int y = 0; y < BFONT_HEIGHT; ++y)
+            for (int x = 0; x < BFONT_THIN_WIDTH; ++x) {
+                const uint16_t p = g[y * BFONT_THIN_WIDTH + x];
+                dst[(2 * y) * 640 + 2 * x] = dst[(2 * y) * 640 + 2 * x + 1] = p;
+                dst[(2 * y + 1) * 640 + 2 * x] = dst[(2 * y + 1) * 640 + 2 * x + 1] = p;
+            }
+    }
+}
+static const char *g_host_text = "ANY (BROADCAST)";
 static const char *run_state_name(uint32_t s) {
     static const char *n[] = {"NONE", "RUNNING", "DONE", "CRASHED", "TIMEOUT", "LOST (NO HAND-IN)", "RESET BY THE PC"};
     return s < 7 ? n[s] : "?";
@@ -137,45 +172,56 @@ static const char *run_state_name(uint32_t s) {
 static void draw(unsigned frame, uint32_t rate_Bps) {
     enum { WHITE = 0xffff, GREY = 0x8410, GREEN = 0x07e0, YELLOW = 0xffe0, RED = 0xf800, CYAN = 0x07ff };
     char t[64];
+    static const char spin[4] = {'|', '/', '-', '\\'};
+    const cl_core_t *c = &g_core;
+    const int up = dcql_net_state() == DCQL_LINK_UP;
+    const unsigned char *ip = (const unsigned char *)&(unsigned){dcql_net_ip()};
+    if (up) big_at(0, GREEN, "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    else if (dcql_net_kind() == DCQL_NET_MODEM) big_at(0, YELLOW, "IP: DIALLING %c", spin[frame & 3]);
+    else big_at(0, YELLOW, "IP: ASKING DHCP %c", spin[frame & 3]);
+    const unsigned hst = dcql_net_host();
+    const unsigned char *hp = (const unsigned char *)&hst;
+    if (hst && hst != 0xFFFFFFFFu) big_at(1, WHITE, "PC %u.%u.%u.%u", hp[0], hp[1], hp[2], hp[3]);
+    else big_at(1, WHITE, "PC %s", g_host_text);
+    big_at(2, c->rx_pkts ? GREEN : YELLOW, "BEACONS %u HEARD %u", (unsigned)c->tx_pkts, (unsigned)c->rx_pkts);
     line_at(0, CYAN, "%s  %s%s", LOADER_TITLE, LOADER_BUILD, g_pushed ? " (PUSHED)" : "");
     line_at(1, GREY, "BOOT %u  PORT %u  STUB %u B  PROTO %u", (unsigned)g_core.boot_count, dcql_net_port(),
             (unsigned)H->h.stub_bytes, (unsigned)CL_VERSION);
     dcql_net_text(t, sizeof(t));
-    line_at(3, dcql_net_state() == DCQL_LINK_UP ? GREEN : YELLOW, "LINK: %s", t);
-    static const char spin[4] = {'|', '/', '-', '\\'};
-    const cl_core_t *c = &g_core;
-    if (dcql_net_state() != DCQL_LINK_UP) {
-        line_at(5, YELLOW, "NOT CONNECTED: A = START THE LINK NOW");
-        line_at(6, GREY, "");
+    line_at(2, up ? GREEN : YELLOW, "LINK: %s", t);
+    if (!up) {
+        line_at(3, YELLOW, "NOT CONNECTED: A = START THE LINK NOW");
+        line_at(4, GREY, "");
     } else if (c->state == CL_ST_RECEIVING) {
-        line_at(5, WHITE, "RECEIVING %08X: %u / %u CHUNKS", (unsigned)c->session, (unsigned)c->have, (unsigned)c->nchunks);
-        line_at(6, WHITE, "%u OF %u KB   %u.%02u KB/S   BAD %u DUP %u", (unsigned)(c->have * CL_CHUNK / 1024),
+        line_at(3, WHITE, "RECEIVING %08X: %u / %u CHUNKS", (unsigned)c->session, (unsigned)c->have, (unsigned)c->nchunks);
+        line_at(4, WHITE, "%u OF %u KB   %u.%02u KB/S   BAD %u DUP %u", (unsigned)(c->have * CL_CHUNK / 1024),
                 (unsigned)(c->comp_len / 1024), (unsigned)(rate_Bps / 1000), (unsigned)(rate_Bps % 1000 / 10),
                 (unsigned)c->rx_bad, (unsigned)c->rx_dup);
     } else if (c->state == CL_ST_VERIFIED) {
-        line_at(5, GREEN, "VERIFIED %08X: %u BYTES, SHA-256 OK", (unsigned)c->session, (unsigned)c->raw_len);
-        line_at(6, GREEN, "WAITING FOR RUN %c", spin[frame & 3]);
+        line_at(3, GREEN, "VERIFIED %08X: %u BYTES, SHA-256 OK", (unsigned)c->session, (unsigned)c->raw_len);
+        line_at(4, GREEN, "WAITING FOR RUN %c", spin[frame & 3]);
     } else if (c->state == CL_ST_FAILED) {
-        line_at(5, RED, "REFUSED %08X: %s", (unsigned)c->session, cl_err_name(c->verdict));
-        line_at(6, YELLOW, "NOTHING RAN. WAITING FOR THE PC %c", spin[frame & 3]);
+        line_at(3, RED, "REFUSED %08X: %s", (unsigned)c->session, cl_err_name(c->verdict));
+        line_at(4, YELLOW, "NOTHING RAN. WAITING FOR THE PC %c", spin[frame & 3]);
     } else {
-        line_at(5, GREEN, "WAITING FOR THE PC %c", spin[frame & 3]);
-        line_at(6, GREY, "BEACONS SENT %u   RECEIVED %u", (unsigned)c->tx_pkts, (unsigned)c->rx_pkts);
+        line_at(3, GREEN, "WAITING FOR THE PC %c", spin[frame & 3]);
+        line_at(4, GREY, "");
     }
     const cl_handoff_hdr_t *h = &g_plat.handoff->h;
-    line_at(8, GREY, "LAST RUN %08X: %s%s", (unsigned)h->run_id, run_state_name(h->state),
+    line_at(5, GREY, "LAST RUN %08X: %s%s", (unsigned)h->run_id, run_state_name(h->state),
             (h->flags & CL_F_STUB_USED) ? " (STUB)" : "");
     if (h->state == CL_RUN_CRASHED)
-        line_at(9, RED, "EXC %03X PC %08X PR %08X", (unsigned)h->crash_evt, (unsigned)h->crash_pc, (unsigned)h->crash_pr);
+        line_at(6, RED, "EXC %03X PC %08X PR %08X", (unsigned)h->crash_evt, (unsigned)h->crash_pc, (unsigned)h->crash_pr);
     else
-        line_at(9, GREY, "EXIT %d   REPORT %u BYTES", (int)h->exit_code, (unsigned)h->report_len);
+        line_at(6, GREY, "EXIT %d   REPORT %u BYTES", (int)h->exit_code, (unsigned)h->report_len);
     unsigned tx, rx, txd, rxd;
     dcql_net_counters(&tx, &rx, &txd, &rxd);
-    line_at(11, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
+    line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
+    /* the last five log lines (rows 8 to 12: the screen's bottom) */
     unsigned n = g_log_n;
-    for (unsigned i = 0; i < LOG_LINES; ++i) {
-        unsigned k = n >= LOG_LINES ? n - LOG_LINES + i : i;
-        line_at(13 + (int)i, GREY, "%s", k < n ? g_log[k % LOG_LINES] : "");
+    for (unsigned i = 0; i < 5; ++i) {
+        unsigned k = n >= 5 ? n - 5 + i : i;
+        line_at(8 + (int)i, GREY, "%s", k < n ? g_log[k % LOG_LINES] : "");
     }
 }
 
@@ -248,6 +294,7 @@ int main(int argc, char **argv) {
     nc.port = (unsigned short)s.port;
     nc.lport = (unsigned short)s.lport;
     nc.ip = parse_ip(s.ip); nc.mask = parse_ip(s.mask); nc.gw = parse_ip(s.gw);
+    nc.dhcp_first = strcmp(s.dhcp, "no") ? 2 : 0;   /* "ip" in LINK.TXT: the fallback when no DHCP server answers */
     nc.rx_mem = rx_mem; nc.rx_size = sizeof(rx_mem);
     nc.tx_mem = tx_mem; nc.tx_size = sizeof(tx_mem);
     nc.ppp_wait_ms = 45000;

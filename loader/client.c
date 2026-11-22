@@ -119,6 +119,7 @@ static semaphore_t g_req_sem = SEM_INITIALIZER(0), g_up_sem = SEM_INITIALIZER(0)
 static volatile uint32_t g_req_id, g_req_blocks, g_req_got, g_req_len;
 static uint8_t *volatile g_req_buf;
 static volatile int32_t g_req_status;
+static volatile int g_req_type;
 static volatile uint32_t g_req_handle, g_req_size;
 static uint8_t g_req_bits[CL_FREAD_MAX / CL_CHUNK / 8 + 1];
 static volatile uint32_t g_still_index, g_still_missing;
@@ -156,9 +157,14 @@ static void client_hello(void) {
 static void __attribute__((noreturn)) finish(uint32_t state, int code);
 static void summary(void);
 
+static int g_diag;                  /* args "diag=1": the link's first datagrams and a heartbeat on the serial line */
+static volatile uint32_t g_rx_seen, g_rx_bad;
 static void on_datagram(const uint8_t *d, int n) {
     const int len = cl_unframe(d, (size_t)n);
-    if (len < 0) return;
+    ++g_rx_seen;
+    if (g_diag && g_rx_seen <= 6)
+        dbgio_printf("cl: from the PC: %d bytes type %02x frame %d\n", n, n > 3 ? d[3] : 0, len);
+    if (len < 0) { ++g_rx_bad; return; }
     const uint8_t type = d[3];
     const uint32_t session = cl_rd32(d + 4), a = cl_rd32(d + 8);
     const uint16_t b = cl_rd16(d + 14);
@@ -173,25 +179,34 @@ static void on_datagram(const uint8_t *d, int n) {
         cl_report("\nRESET by the PC\n");
         summary();
         finish(CL_RUN_RESET, 0);
-    case CL_FINFO:
-        if (a == g_req_id && len >= (int)sizeof(cl_finfo_t)) {
+    /* the request's words are set and cleared by the asking thread with interrupts off: an answer to an older request
+       never lands in the next request's buffer */
+    case CL_FINFO: {
+        const irq_mask_t m = irq_disable();
+        if (a == g_req_id && g_req_type == CL_FOPEN && len >= (int)sizeof(cl_finfo_t)) {
             g_req_status = (int32_t)cl_rd32(pl);
             g_req_handle = cl_rd32(pl + 4);
             g_req_size = cl_rd32(pl + 8);
             sem_signal(&g_req_sem);
         }
+        irq_restore(m);
         break;
-    case CL_FDATA:
-        if (a == g_req_id && g_req_buf && b < g_req_blocks) {
+    }
+    case CL_FDATA: {
+        const irq_mask_t m = irq_disable();
+        uint8_t *const dst = g_req_buf;
+        if (a == g_req_id && g_req_type == CL_FREAD && dst && b < g_req_blocks) {
             const uint32_t off = (uint32_t)b * CL_CHUNK;
             const uint32_t want = g_req_len - off < CL_CHUNK ? g_req_len - off : CL_CHUNK;
             if ((uint32_t)len == want && !(g_req_bits[b >> 3] & (1u << (b & 7)))) {
-                memcpy(g_req_buf + off, pl, want);
+                memcpy(dst + off, pl, want);
                 g_req_bits[b >> 3] |= (uint8_t)(1u << (b & 7));
                 if (++g_req_got == g_req_blocks) sem_signal(&g_req_sem);
             }
         }
+        irq_restore(m);
         break;
+    }
     case CL_STILLACK:
         if (a == g_still_index) {
             const unsigned nb = (unsigned)len < sizeof(g_still_bits) ? (unsigned)len : sizeof(g_still_bits);
@@ -243,13 +258,16 @@ static int pc_request(int type, const void *pl, uint16_t n, uint8_t *buf, uint32
     if (!cl_link_wait(8000)) return -EIO;
     mutex_lock(&g_req_mx);
     int rc = -ETIMEDOUT;
+    irq_mask_t m = irq_disable();
     g_req_id++;
+    g_req_type = type;
     g_req_buf = buf;
     g_req_len = len;
     g_req_blocks = (len + CL_CHUNK - 1) / CL_CHUNK;
     g_req_got = 0;
     g_req_status = 1;
     memset(g_req_bits, 0, sizeof(g_req_bits));
+    irq_restore(m);
     while (sem_trywait(&g_req_sem) == 0) {}
     for (int tries = 0; tries < 12; ++tries) {
         link_out_wait((uint8_t)type, g_req_id, 0, pl, n);
@@ -259,13 +277,21 @@ static int pc_request(int type, const void *pl, uint16_t n, uint8_t *buf, uint32
         if (type == CL_FOPEN && g_req_status != 1) { rc = 0; break; }
         if (type == CL_FREAD && g_req_got == g_req_blocks) { rc = 0; break; }
     }
+    m = irq_disable();
     g_req_buf = NULL;
+    g_req_type = 0;
+    irq_restore(m);
     mutex_unlock(&g_req_mx);
     return rc;
 }
 
 typedef struct { int used; uint32_t handle, size, pos; } pcf_t;
 static pcf_t g_pcf[16];
+/* one read-ahead block: a C library's small buffered reads (1 KiB each through newlib's FILE) cost one round trip per
+   CL_FREAD_MAX, not per call */
+static uint8_t g_ra[CL_FREAD_MAX] __attribute__((aligned(32)));
+static const pcf_t *g_ra_file;
+static uint32_t g_ra_handle, g_ra_off, g_ra_len;
 static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
     (void)vfs;
     if ((mode & O_MODE_MASK) != O_RDONLY || (mode & O_DIR)) { errno = EROFS; return NULL; }
@@ -296,6 +322,7 @@ static int pc_close(void *h) {
     pcf_t *f = pcf(h);
     if (!f) return -1;
     link_out(CL_FCLOSE, f->handle, 0, NULL, 0);
+    if (g_ra_file == f) g_ra_file = NULL;
     f->used = 0;
     return 0;
 }
@@ -306,6 +333,22 @@ static ssize_t pc_read(void *h, void *buf, size_t cnt) {
     if (cnt > f->size - f->pos) cnt = f->size - f->pos;
     const uint64_t t0 = timer_ms_gettime64();
     size_t done = 0;
+    if (cnt < CL_FREAD_MAX) {
+        if (!(g_ra_file == f && g_ra_handle == f->handle && f->pos >= g_ra_off && f->pos + cnt <= g_ra_off + g_ra_len)) {
+            const uint32_t n = f->size - f->pos < CL_FREAD_MAX ? f->size - f->pos : CL_FREAD_MAX;
+            uint8_t pl[12];
+            cl_wr32(pl, f->handle); cl_wr32(pl + 4, f->pos); cl_wr32(pl + 8, n);
+            g_ra_file = NULL;
+            if (pc_request(CL_FREAD, pl, sizeof(pl), g_ra, n)) { errno = EIO; return -1; }
+            g_ra_file = f; g_ra_handle = f->handle; g_ra_off = f->pos; g_ra_len = n;
+            ++g_st.reads;
+            g_st.read_bytes += n;
+        }
+        memcpy(buf, g_ra + (f->pos - g_ra_off), cnt);
+        f->pos += cnt;
+        g_st.read_ms += (unsigned)(timer_ms_gettime64() - t0);
+        return (ssize_t)cnt;
+    }
     while (done < cnt) {
         const uint32_t n = cnt - done < CL_FREAD_MAX ? (uint32_t)(cnt - done) : CL_FREAD_MAX;
         uint8_t pl[12];
@@ -386,6 +429,20 @@ int cl_still(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigne
     return rc;
 }
 
+static void net_log(const char *line) { dbgio_printf("cl: %s\n", line); }
+/* args "diag=1": once a second for a minute, what the link has seen (a stop in these lines is a dead scheduler) */
+static void *diag_thread(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 60; ++i) {
+        thd_sleep(1000);
+        unsigned tx, rx, txd, rxd;
+        dcql_net_counters(&tx, &rx, &txd, &rxd);
+        dbgio_printf("cl-diag %d: state %d tx %u rx %u drops %u/%u seen %u bad %u req %u status %d got %u/%u\n", i,
+                     dcql_net_state(), tx, rx, txd, rxd, (unsigned)g_rx_seen, (unsigned)g_rx_bad, (unsigned)g_req_id,
+                     (int)g_req_status, (unsigned)g_req_got, (unsigned)g_req_blocks);
+    }
+    return NULL;
+}
 static void link_start(void) {
     dcql_net_config_t c;
     memset(&c, 0, sizeof(c));
@@ -393,12 +450,27 @@ static void link_start(void) {
     c.host = H->h.link_host;
     c.port = (unsigned short)H->h.link_port;
     c.lport = (unsigned short)H->h.link_lport;
-    c.ip = H->h.console_ip; c.mask = H->h.net_mask; c.gw = H->h.net_gw;   /* the loader's address: no DHCP again */
+    /* the loader's address, asked of DHCP first (the static address if no server answers). Lab arms: "static=1" sets
+       it without DHCP (in Flycast that console then receives nothing), "dhcp=1" asks DHCP for any address */
+    if (!has_arg("dhcp=1")) {
+        c.ip = H->h.console_ip; c.mask = H->h.net_mask; c.gw = H->h.net_gw;
+        c.dhcp_first = !has_arg("static=1");
+    }
     c.rx_mem = g_rx_mem; c.rx_size = sizeof(g_rx_mem);
     c.tx_mem = g_tx_mem; c.tx_size = sizeof(g_tx_mem);
+    g_diag = has_arg("diag=1");
+    c.log = net_log;
     dcql_net_config(&c);
     if (dcql_net_start() < 0) return;
     nmmgr_handler_add(&g_pc_vfs.nmmgr);
+    if (g_diag) {
+        kthread_attr_t d;
+        memset(&d, 0, sizeof(d));
+        d.create_detached = true;
+        d.prio = 2;
+        d.label = "cl-diag";
+        thd_create_ex(&d, diag_thread, NULL);
+    }
     kthread_attr_t a;
     memset(&a, 0, sizeof(a));
     a.create_detached = true;
@@ -492,6 +564,7 @@ static void crash_handler(irq_t code, irq_context_t *ctx, void *data) {
         for (int k = 0; k < 4; ++k)
             for (int d = 0; d < digits[k]; ++d) b[at[k] + d] = hx[(vals[k] >> (4 * (digits[k] - 1 - d))) & 15];
         cl_report_bytes(b, sizeof(b) - 1);
+        dbgio_write_str(b);   /* polled serial: the line also reaches a PC log when the stub cannot come back */
     }
     finish(CL_RUN_CRASHED, -1);
 }

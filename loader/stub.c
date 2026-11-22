@@ -40,6 +40,10 @@ static void step(uint32_t s) {
     serial_put((char)('0' + s));
     serial_put(s == CL_STUB_STEP_JUMP || s == CL_STUB_STEP_REBOOT ? '\n' : ' ');
 }
+static void serial_hex(uint32_t v) {
+    for (int i = 28; i >= 0; i -= 4) serial_put("0123456789abcdef"[(v >> i) & 15]);
+    serial_put(' ');
+}
 
 /* the compiler's own calls (array initialisers); no C library here */
 void *memcpy(void *d, const void *s, unsigned n) {
@@ -176,6 +180,11 @@ void stub_main(void) {
     step(CL_STUB_STEP_READ);
     if (!sha_matches(dst, bytes, h->ret_sha)) { h->tramp[CL_STUBW_ERR] = 0x400; goto reboot; }
     step(CL_STUB_STEP_SHA);
+    /* the run's state and the start-up registers the loader gets, on the serial line (8 hex digits each) */
+    serial_hex(h->state);
+    serial_hex(h->reserved[CL_RSV_BIOS_SR]);
+    serial_hex(h->reserved[CL_RSV_BIOS_VBR]);
+    serial_hex(h->tramp[CL_STUBW_ENTRIES]);
     /* the KallistiOS exec contract: the words after the image are what the jump copies; nothing else to set up */
     step(CL_STUB_STEP_JUMP);
     stub_go(h->reserved[CL_RSV_BIOS_SR], h->reserved[CL_RSV_BIOS_VBR], h->reserved[CL_RSV_BIOS_FPSCR]);

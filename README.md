@@ -21,8 +21,13 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
   the LAN adapter; DHCP or a static address). The 0.1 API is unchanged; `dcql_config_t` gains `net`, `ip`, `mask`,
   `gw` at its end (zero = modem, as before).
 - **A loader disc** (`loader/`): boots, brings the link up, and runs programs the PC pushes (deflated, CRC per chunk,
-  SHA-256 checked before it runs). `LINK.TXT` on the disc: `net bba|modem`, `ip`/`mask`/`gw` (static) or none (DHCP),
-  `host` (the PC), `port`, `lport`, `number` (modem).
+  SHA-256 checked before it runs). `LINK.TXT` on the disc: `net bba|modem`, `host` (the PC, or `peer`: the first PC
+  that answers), `port`, `lport`, `number` (modem); the adapter asks DHCP first, and `ip`/`mask`/`gw` are used only
+  when no DHCP server answers (`dhcp no`: those alone). Its screen shows three large lines you can read off a TV: the
+  console's address, the PC it looks for, beacons sent and answers heard.
+- **The first run on a console:** `python tools/first_console.py --program build/testprog.elf` waits for the beacon,
+  pushes the test program, reads its report, grabs the console's screen 3 times, sends RESET and prints a pass/fail
+  table. The PC tool learns the console's address from its beacon (`--udp auto`).
 - **The client library** (`loader/client.mk`) in each pushed program: its report and exit code back to the PC, its
   serial lines live, stills (RGB565 frame buffers as PNG on the PC), the PC's files as `/pc/...` (load time; a
   program that wants reads in play counted does it itself), and RESET from the PC.
@@ -41,7 +46,10 @@ Dreamcast --broadband adapter/UDP 52060--> PC (dc_qalink.py loop ...)      or, o
 
 `make -C loader OUT=build` builds `loader.elf`, `LOADER.BIN` (put it on the loader disc next to `1ST_READ.BIN`),
 `testprog.elf` and the host test build (`make ... host`). Flycast: `[network] EmulateBBA = yes`, run
-`dc_qalink.py loop relay-local` before the loader boots, and give `LINK.TXT` an `lport` other than `port`.
+`dc_qalink.py loop relay-local` before the loader boots, and give `LINK.TXT` an `lport` other than `port`. Stock
+desktop Flycast changes the SH-4's interrupt state from its network thread without a lock, so under heavy adapter
+traffic an emulated program can panic ("spurious RESET exception") or hang; that is the emulator, not the console.
+Keep Flycast runs short, one boot per few steps.
 
 ## Hardware
 

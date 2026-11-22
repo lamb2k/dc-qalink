@@ -40,9 +40,11 @@ _stub_go:
 	mov.l	.boot_stack, r15
 	mov.l	.boot_pr, r1
 	lds	r1, pr
-	mov.l	.dst, r1
+	! the target in r8: r0-r7 are banked, and the BIOS's SR has RB = 1, so after the ldc an r1 would be bank 1's (left
+	! by the last interrupt or by the program's own call into the stub: the stub then started itself again, lane ql-core)
+	mov.l	.dst, r8
 	ldc	r4, sr
-	jmp	@r1
+	jmp	@r8
 	nop
 	.align 2
 .ccr:		.long 0xff00001c

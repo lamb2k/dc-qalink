@@ -31,6 +31,9 @@ typedef struct {
     unsigned host;              /* the peer, network order; 0xFFFFFFFF or 0 = learn it from its first datagram */
     unsigned short port, lport; /* the peer's UDP port and ours */
     unsigned ip, mask, gw;      /* adapter: static address (network order); ip 0 = DHCP */
+    int dhcp_first;             /* adapter with ip set: 1 ask DHCP for that address first (as KOS's net_init(ip) does
+                                   for dcload-ip), 2 ask DHCP for any address first; the static address only if no DHCP
+                                   server answers. 0: the static address alone */
     unsigned char *rx_mem, *tx_mem;   /* ring memory (static); NULL = the built-in 4 KiB rings */
     unsigned rx_size, tx_size;
     unsigned ppp_wait_ms;       /* modem: bound on PPP negotiation (0 = unbounded, as dc-qalink 0.1) */

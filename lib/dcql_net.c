@@ -56,6 +56,10 @@ static unsigned char g_ip[4], g_peer[4], g_mask[4], g_gw[4];
 static char g_number[24] = "1111111", g_user[24] = "dream", g_pass[24] = "dreamcast";
 static unsigned g_host = 0xFFFFFFFFu, g_configured_host = 0xFFFFFFFFu;   /* network order; all-ones = learn it */
 static unsigned g_cfg_ip, g_cfg_mask, g_cfg_gw;
+static int g_dhcp_first;
+#if DCQL_NET_HAVE_BBA
+static int g_static_used;
+#endif
 static unsigned short g_port = 52040, g_lport = 52040;
 static unsigned g_ppp_wait_ms;
 static void (*g_logfn)(const char *);
@@ -115,10 +119,16 @@ static int ring_get(ring_t *r, void *p, unsigned max) {
 static void ring_clear(ring_t *r) { r->tail = r->head; }
 
 /* a received datagram: the peer's port, and its address once known (learnt from the first one) */
+static volatile unsigned g_rx_refused;
 static int accept_from(const struct sockaddr_in *from, socklen_t fl, int n) {
     if (n > DCQL_NET_DGRAM || fl < sizeof(*from) || from->sin_family != AF_INET || from->sin_port != htons(g_port) ||
-        (g_host != 0xFFFFFFFFu && g_host != 0 && from->sin_addr.s_addr != g_host))
+        (g_host != 0xFFFFFFFFu && g_host != 0 && from->sin_addr.s_addr != g_host)) {
+        if (g_rx_refused++ < 4) {
+            const unsigned char *a = (const unsigned char *)&from->sin_addr.s_addr;
+            logf_("dcql: refused %d bytes from %u.%u.%u.%u:%u", n, a[0], a[1], a[2], a[3], ntohs(from->sin_port));
+        }
         return 0;
+    }
     if (g_host == 0xFFFFFFFFu || g_host == 0) {
         g_host = from->sin_addr.s_addr;
         memcpy(g_peer, &g_host, 4);
@@ -453,7 +463,23 @@ static void bba_main(void) {
     g_attempt = 1;
     g_host = g_configured_host;
     memcpy(g_peer, &g_host, 4);
+    if (!g_net_ready && g_cfg_ip && g_dhcp_first) {
+        /* DHCP asked for the known address (a quick REQUEST where a server answers), then the static address: in
+           Flycast's adapter emulation a console that skips DHCP sends but receives nothing (lane ql-core, 2026-11-22) */
+        const int r = net_init(g_dhcp_first == 2 ? 0 : ntohl(g_cfg_ip));   /* 2: any address the server gives */
+        if (!net_default_dev) { g_err = -41; g_state = DCQL_LINK_FAILED; logf_("dcql: no adapter (%d)", r); return; }
+        g_net_ready = true;
+        if (!net_default_dev->netmask[0] || !net_default_dev->ip_addr[0]) {   /* no DHCP answer (KOS set at most the address) */
+            const unsigned m = g_cfg_mask ? g_cfg_mask : htonl(0xffffff00u);
+            set4(net_default_dev->ip_addr, g_cfg_ip);
+            set4(net_default_dev->netmask, m);
+            set4(net_default_dev->gateway, g_cfg_gw);
+            set4(net_default_dev->broadcast, (g_cfg_ip & m) | ~m);
+            g_static_used = 1;
+        } else g_static_used = 0;
+    }
     if (!g_net_ready) {
+        g_static_used = g_cfg_ip != 0;
         if (g_cfg_ip) {   /* a static address: on the device before net_init, so it asks no DHCP server */
             if (net_dev_init() < 0 || !net_default_dev) { g_err = -40; g_state = DCQL_LINK_FAILED; return; }
             set4(net_default_dev->ip_addr, g_cfg_ip);
@@ -497,7 +523,8 @@ static void bba_main(void) {
         g_bthreads = 1;
     }
     g_state = g_stop ? DCQL_LINK_OFF : DCQL_LINK_UP;
-    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s)", g_ip[0], g_ip[1], g_ip[2], g_ip[3], g_cfg_ip ? "static" : "DHCP");
+    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
+          g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP");
 }
 #endif /* DCQL_NET_HAVE_BBA */
 
@@ -560,6 +587,7 @@ void dcql_net_config(const dcql_net_config_t *c) {
     if (c->port) g_port = c->port;
     if (c->lport) g_lport = c->lport;
     g_cfg_ip = c->ip; g_cfg_mask = c->mask; g_cfg_gw = c->gw;
+    g_dhcp_first = c->dhcp_first;
     if (c->rx_mem && c->rx_size >= 2048) { g_rx.buf = c->rx_mem; g_rx.size = c->rx_size; g_rx.head = g_rx.tail = 0; }
     if (c->tx_mem && c->tx_size >= 2048) { g_tx.buf = c->tx_mem; g_tx.size = c->tx_size; g_tx.head = g_tx.tail = 0; }
     g_ppp_wait_ms = c->ppp_wait_ms;
