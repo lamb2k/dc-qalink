@@ -180,19 +180,48 @@ static const char *run_state_name(uint32_t s) {
 }
 /* the return stub's own record of the last way back (hand-off tramp[], read at boot before anything changes it) */
 static int g_stub_seen;
-static uint32_t g_stub_step, g_stub_err, g_stub_gdemu, g_stub_entries, g_stub_aux, g_stub_rung, g_stub_run, g_stub_w0;
+static uint32_t g_stub_step, g_stub_err, g_stub_gdemu, g_stub_entries, g_stub_aux, g_stub_rung, g_stub_run, g_stub_w0,
+                g_stub_sense;
 /* the same record in three more places (dcql_hw.h dcql_crumb_*), read before anything of KallistiOS starts (before the
    BSS is cleared, and before KallistiOS clears sound and video RAM), so the loader can say which of them kept it across
    a BIOS reboot: the console run of 2026-11-22 lost the hand-off area on every reboot (ql-core3) */
 static dcql_crumb_t g_crumb[DCQL_CRUMB_PLACES] __attribute__((section(".data")));
 static uint32_t g_crumb_ok __attribute__((section(".data")));
+/* the saved copies of the hand-off area (dcql_hw.h dcql_save_handoff): the one in sound RAM moved to the one in main
+   RAM now, before KallistiOS clears sound RAM; main() checks it and puts it back when the area itself was lost */
+static uint32_t g_save_from __attribute__((section(".data")));   /* 1 main RAM copy, 2 sound RAM copy */
+static int save_looks_whole(uint32_t base) {
+    const volatile cl_handoff_hdr_t *s = (const volatile cl_handoff_hdr_t *)base;
+    return s->magic == CL_HANDOFF_MAGIC && s->version == CL_HANDOFF_VERSION && s->report_len <= CL_REPORT_MAX;
+}
 static void early_read_crumbs(void) {
     for (int k = 0; k < DCQL_CRUMB_PLACES; ++k)
         if (dcql_crumb_get(k, &g_crumb[k])) g_crumb_ok |= 1u << k;
     dcql_crumb_clear();   /* said once: a later boot by another way does not repeat it */
+    if (save_looks_whole(DCQL_SAVE_RAM)) g_save_from = 1;
+    else if (save_looks_whole(DCQL_SAVE_SND)) {
+        const uint32_t rep = ((const volatile cl_handoff_hdr_t *)DCQL_SAVE_SND)->report_len;
+        dcql_copy_words(DCQL_SAVE_RAM + CL_REPORT_OFF, DCQL_SAVE_SND + CL_REPORT_OFF, (rep + 3) & ~3u, 0);
+        dcql_copy_words(DCQL_SAVE_RAM, DCQL_SAVE_SND, CL_STUB_OFF, 0);
+        g_save_from = 2;
+    }
+    ((volatile cl_handoff_hdr_t *)DCQL_SAVE_SND)->magic = 0;
 }
 KOS_INIT_EARLY(early_read_crumbs);
-static uint32_t g_wb_where;   /* CL_HELLO_WB bits: 0 hand-off, 1 main RAM, 2 sound RAM, 3 video RAM */
+/* CL_HELLO_WB bits: 0 hand-off, 1 main RAM, 2 sound RAM, 3 video RAM (the record); 4 / 5: the area itself was lost and
+   put back from the copy in main / sound RAM */
+static uint32_t g_wb_where;
+static uint32_t restore_handoff(void) {
+    cl_handoff_t *s = (cl_handoff_t *)DCQL_SAVE_RAM;
+    uint32_t r = 0;
+    if (g_save_from && !cl_handoff_valid(H) && cl_handoff_valid(s)) {
+        memcpy((uint8_t *)H + CL_REPORT_OFF, (const uint8_t *)s + CL_REPORT_OFF, (s->h.report_len + 3) & ~3u);
+        memcpy(H, s, CL_STUB_OFF);
+        r = g_save_from == 1 ? 0x10u : 0x20u;
+    }
+    if (g_save_from) s->h.magic = 0;
+    return r;
+}
 static void draw(unsigned frame, uint32_t rate_Bps) {
     enum { WHITE = 0xffff, GREY = 0x8410, GREEN = 0x07e0, YELLOW = 0xffe0, RED = 0xf800, CYAN = 0x07ff };
     char t[64];
@@ -248,7 +277,7 @@ static void draw(unsigned frame, uint32_t rate_Bps) {
     dcql_net_counters(&tx, &rx, &txd, &rxd);
     if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "BACK S%u R%u ERR %08X AUX %08X %c%c%c%c",
                              (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux,
-                             g_wb_where & 1 ? 'H' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
+                             g_wb_where & 1 ? 'H' : g_wb_where & 0x30 ? 'P' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
                              g_wb_where & 8 ? 'V' : '-');
     else line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
     /* the last five log lines (rows 8 to 12: the screen's bottom) */
@@ -306,21 +335,28 @@ int main(int argc, char **argv) {
     /* GDEMU's version (nothing answers on a GD-ROM drive or in Flycast: bounded, harmless), before any disc work */
     irq_mask_t im = irq_disable();
     const uint32_t gver = dcql_gdemu_version();
+    if (!gver) (void)dcql_gd_req_error();   /* refused: the drive's "illegal request" read, so no later command sees it */
     irq_restore(im);
     memset(&g_plat, 0, sizeof(g_plat));
     g_plat.send = p_send; g_plat.now_ms = p_now; g_plat.alloc = p_alloc; g_plat.free = p_free; g_plat.log = p_log;
     g_plat.handoff = H;
     g_plat.max_raw = CL_HANDOFF_ADDR - 0x11000u - CL_LOAD_ADDR;
     g_plat.build = "loader " LOADER_BUILD;
+    /* the area lost on a BIOS reboot: put back from its saved copy (header and report) */
+    const int top_ok = cl_handoff_valid(H);
+    const uint32_t restored = restore_handoff();
+    if (restored) loader_log("hand-off lost on the reboot: put back from the copy in %s RAM (run %08x, report %u B)",
+                             restored == 0x10u ? "main" : "sound", (unsigned)H->h.run_id, (unsigned)H->h.report_len);
+    else if (g_save_from && !top_ok) loader_log("hand-off lost and its saved copy not whole: fresh");
     /* the last way back: the hand-off header's words first, else the first place that kept the record */
     const int in_hdr = cl_handoff_valid(H) && H->h.tramp[CL_STUBW_MAGIC] == CL_STUB_MAGIC;
-    g_wb_where = (in_hdr ? 1u : 0u) | (g_crumb_ok << 1);
+    g_wb_where = (top_ok && in_hdr ? 1u : 0u) | (g_crumb_ok << 1) | restored;
     if (in_hdr) {
         g_stub_seen = 1;
         g_stub_step = H->h.tramp[CL_STUBW_STEP]; g_stub_err = H->h.tramp[CL_STUBW_ERR];
         g_stub_gdemu = H->h.tramp[CL_STUBW_GDEMU]; g_stub_entries = H->h.tramp[CL_STUBW_ENTRIES];
         g_stub_aux = H->h.tramp[CL_STUBW_GDST]; g_stub_rung = H->h.tramp[CL_STUBW_RUNG];
-        g_stub_w0 = H->h.tramp[CL_STUBW_W0]; g_stub_run = H->h.run_id;
+        g_stub_w0 = H->h.tramp[CL_STUBW_W0]; g_stub_run = H->h.run_id; g_stub_sense = H->h.tramp[CL_STUBW_SENSE];
         H->h.tramp[CL_STUBW_MAGIC] = 0;   /* said once: a later boot by another way does not repeat it */
     } else {
         for (int k = 0; k < DCQL_CRUMB_PLACES && !g_stub_seen; ++k)
@@ -334,7 +370,9 @@ int main(int argc, char **argv) {
     if (g_stub_seen) {
         loader_log("way back of run %08x: step %u rung %u err %08x aux %08x", (unsigned)g_stub_run,
                    (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux);
-        loader_log("kept by: hand-off %s, RAM 8M %s, sound %s, video %s; w0 %08x gdemu %x", in_hdr ? "yes" : "no",
+        loader_log("drive sense %08x (rung 2), w0 %08x", (unsigned)g_stub_sense, (unsigned)g_stub_w0);
+        loader_log("kept by: hand-off %s, RAM 8M %s, sound %s, video %s; w0 %08x gdemu %x",
+                   top_ok && in_hdr ? "yes" : restored ? "restored" : "no",
                    g_crumb_ok & 1 ? "yes" : "no", g_crumb_ok & 2 ? "yes" : "no", g_crumb_ok & 4 ? "yes" : "no",
                    (unsigned)g_stub_w0, (unsigned)g_stub_gdemu);
     }

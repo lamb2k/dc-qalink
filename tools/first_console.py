@@ -56,7 +56,9 @@ def way_back(console, port, wait_s):
             if struct.unpack_from('<I', pl, 100)[0] != 1:   # role LOADER only
                 continue
             where, stp, err, aux, run = struct.unpack_from('<5I', pl, 136)
-            kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM')) if where & b]
+            kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM'),
+                                   (16, 'hand-off put back from main RAM copy'),
+                                   (32, 'hand-off put back from sound RAM copy')) if where & b]
             rungs = []
             for i, name in enumerate(('BIOS', 'drive', 'after select')):
                 b = (err >> (8 * i)) & 255

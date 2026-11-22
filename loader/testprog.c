@@ -218,7 +218,8 @@ int main(int argc, char **argv) {
         irq_disable();
         for (;;) {}
     }
-    if (has(args, "reboot")) {
+    if (word(args, "reboot")) {   /* a whole word: "gdreboot" took this branch until ql-core3 (the console's row 7 was a
+                                     plain reboot, no image select and no hand-in) */
         say(4, "BIOS REBOOT, NO HAND-IN");
         thd_sleep(1500);
         arch_reboot();

@@ -24,6 +24,11 @@ void __attribute__((noreturn)) dcql_bios_reboot(void) {
     if (cl_handoff_valid(H)) {
         const uint32_t slot = H->h.reserved[CL_RSV_GDEMU_SLOT];
         if (slot && slot <= 999) dcql_gdemu_select((uint16_t)slot);
+        /* the run's header and report saved where a reboot leaves them; the next loader puts them back (ql-core3) */
+        dcache_wback_range(CL_HANDOFF_ADDR, CL_HANDOFF_SIZE);
+        *(volatile uint32_t *)0xa0702c00u |= 1;   /* the sound CPU held while its RAM is written */
+        dcql_save_handoff((CL_HANDOFF_ADDR & 0x1fffffffu) | 0xa0000000u, CL_STUB_OFF, CL_REPORT_OFF,
+                          H->h.report_len <= CL_REPORT_MAX ? H->h.report_len : CL_REPORT_MAX);
     }
     ((void (*)(void))0xa0000000u)();
     for (;;) {}

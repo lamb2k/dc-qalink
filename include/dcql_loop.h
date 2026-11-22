@@ -119,7 +119,8 @@ typedef struct {
     uint16_t gdemu_slot;      /* offset 134: the GDEMU image the loader returns to (0 = none known) */
     /* v2, additive (ql-core3): the last way back's record as this loader found it at boot (CL_WB_*) */
     uint32_t wb_where;        /* offset 136: bit 0 hand-off header, 1 main RAM at 8 MiB, 2 sound RAM, 3 video RAM held
-                                 it (0 = no record anywhere); bits 8..15 the stub's entries */
+                                 it (0 = no record anywhere); 4 / 5: the hand-off area was lost on a reboot and put
+                                 back from its copy in main / sound RAM (dcql_hw.h); bits 8..15 the stub's entries */
     uint32_t wb_step, wb_err, wb_aux, wb_run;   /* offsets 140, 144, 148, 152 */
 } cl_hello_t;
 #define CL_HELLO_LEN 156
@@ -229,7 +230,9 @@ enum { CL_STUB_STEP_ENTERED = 1, CL_STUB_STEP_QUIET = 2, CL_STUB_STEP_GDINIT = 3
    tramp[CL_STUBW_GDST]: the BIOS's last answer: err1 | err2 << 8 | -(last call) << 16 | CMD_INIT tries << 24
    (err1 2 = not ready, 6 = unit attention / disc changed). tramp[CL_STUBW_RUNG]: the rung that came back (1..3).
    tramp[CL_STUBW_GDEMU]: the select's result + 0x100 (before the reboot: | (0x200 + code) << 12) */
-enum { CL_STUBW_GDEMU = 4, CL_STUBW_GDST = 5, CL_STUBW_RUNG = 6, CL_STUBW_W0 = 7 };
+enum { CL_STUBW_GDEMU = 4, CL_STUBW_GDST = 5, CL_STUBW_RUNG = 6, CL_STUBW_W0 = 7,
+       CL_STUBW_SENSE = 8 /* the drive's last sense the stub read and cleared before a rung (key | ASC << 8 | ASCQ << 16;
+                             0xff no answer; bit 24: rung 2 had a read refused) */ };
 /* the screen colour of each stub step (dcql_hw.h dcql_screen_colour): the stub has no text */
 #define CL_STUB_COLOURS {0x000000, 0x0000ff /* 1 entered: blue */, 0x00ffff /* 2 quiet: cyan */,     0xffff00 /* 3 GD init: yellow */, 0xff8000 /* 4 read: orange */, 0x00ff00 /* 5 SHA ok: green */,     0xffffff /* 6 jump: white */, 0xff0000 /* 7 reboot: red */, 0xff00ff /* 8 GDEMU select: magenta */,     0x8000ff /* 9 the drive's own read: violet */}
 

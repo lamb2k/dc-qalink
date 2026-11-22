@@ -1,6 +1,6 @@
 ! stub_entry.S: entry and exit of the control loop's return stub (dc-qalink 0.2, MIT licence). See stub.c.
-! Entered by a jump with interrupts off, in any register bank: SR becomes MD=1 RB=0 BL=1 IMASK=15, the stack the top of
-! the stub's area (P2), then stub_main. stub_go(sr, vbr, fpscr) leaves for the loader at 0x8C010000 as KallistiOS's
+! Entered by a jump with interrupts off, in any register bank: SR becomes MD=1 RB=0 BL=1 IMASK=15, the stack the hand-off
+! area's pad below the stub (P2), then stub_main. stub_go(sr, vbr, fpscr) leaves for the loader at 0x8C010000 as KallistiOS's
 ! exec trampoline does: caches off and invalidated (CCR = 0x808), the BIOS's SR / VBR / FPSCR, its boot stack
 ! (0x8C00F400) and PR = 0xA0000000 (a loader that returns reboots).
 	.section .text.entry,"ax"
@@ -17,7 +17,9 @@ _stub_entry:
 	nop
 	.align 2
 .sr_init:	.long 0x500000f0
-.stack_top:	.long 0xacfe3000
+! the stack: the hand-off area's pad between its header (884 bytes) and the stub, 3.2 KiB (ql-core3: the stub grew to
+! 6 KiB, which left the BIOS's disc calls 2 KiB above its code; an overflow now spoils scratch words, not code)
+.stack_top:	.long 0xacfe1000
 .main:		.long _stub_main
 
 	.text

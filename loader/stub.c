@@ -46,6 +46,8 @@ typedef volatile uint8_t vu8;
 #define REG32(a) (*(vu32 *)(a))
 
 void stub_go(uint32_t sr, uint32_t vbr, uint32_t fpscr) __attribute__((noreturn));   /* stub_entry.S */
+/* the stub's stack is the pad between the header and the stub (stub_entry.S): at least 3 KiB of it */
+_Static_assert(sizeof(cl_handoff_hdr_t) <= 0x400, "hand-off header grew into the stub's stack");
 
 /* each step also as two characters on the serial port ("S1".."S7", polled; a console without a cable loses nothing) */
 static void serial_put(char c) {
@@ -130,6 +132,11 @@ static int gd_cmd(uint32_t cmd, void *params) {
    drive or GDEMU after a reset or an image change; KallistiOS's cdrom_reinit loops the same way), 12 s at most; then
    KallistiOS's default data mode (cdrom_change_datatype): data area, 2048-byte sectors */
 static int bios_ready(int reset) {
+    /* a command the program left running ended, and a sense left pending read and cleared (Flycast, 2026-11-22: the
+       loader's GDEMU probe, refused by a drive without GDEMU, left "illegal request" pending, and every later command
+       reported CHECK until it was read) */
+    dcql_gd_unstick();
+    HD->tramp[CL_STUBW_SENSE] = dcql_gd_req_error();
     if (reset) gd(G_RESET, 0, 0);
     gd(G_INIT, 0, 0);
     const uint32_t t0 = dcql_rtc_s();
@@ -232,6 +239,7 @@ static int read_bios(uint8_t *dst, uint32_t lba, uint32_t secs) {
 /* the drive's own read; a refusal (unit attention after an image change, not ready) asked again, 10 s at most */
 static int read_ata(uint8_t *dst, uint32_t lba, uint32_t secs) {
     dcql_gd_unstick();
+    HD->tramp[CL_STUBW_SENSE] = dcql_gd_req_error();   /* a sense left pending would mark every read failed */
     const uint32_t t0 = dcql_rtc_s();
     for (uint32_t s = 0; s < secs;) {
         const uint32_t n = secs - s < 16 ? secs - s : 16;
@@ -239,6 +247,7 @@ static int read_ata(uint8_t *dst, uint32_t lba, uint32_t secs) {
         while ((e = dcql_gd_read_pio(lba + s, n, (uint16_t *)(dst + s * 2048))) != 0) {
             if (dcql_rtc_s() - t0 >= 10u) return e;
             if (e != -6) dcql_gd_unstick();
+            HD->tramp[CL_STUBW_SENSE] = dcql_gd_req_error() | 0x1000000u;   /* bit 24: a read was refused */
             dcql_wait_vbl(6);
         }
         s += n;
@@ -287,6 +296,7 @@ void stub_main(void) {
     h->tramp[CL_STUBW_GDST] = 0;
     h->tramp[CL_STUBW_RUNG] = 0;
     h->tramp[CL_STUBW_W0] = 0;
+    h->tramp[CL_STUBW_SENSE] = 0;
     dcql_ocache_purge_all();   /* first: no line of the program's may be written back over what the stub reads */
     if (h->reserved[CL_RSV_BIOS_VBR]) __asm__ __volatile__("ldc %0, vbr" : : "r"(h->reserved[CL_RSV_BIOS_VBR]));
     step(CL_STUB_STEP_ENTERED);
@@ -334,6 +344,9 @@ reboot:
     /* the BIOS then boots the loader's image, not openMenu's (the step word stays REBOOT for the next loader) */
     if (h->reserved[CL_RSV_GDEMU_SLOT] && h->reserved[CL_RSV_GDEMU_SLOT] <= 999)
         h->tramp[CL_STUBW_GDEMU] |= (0x200u | (uint32_t)(-dcql_gdemu_select((uint16_t)h->reserved[CL_RSV_GDEMU_SLOT]))) << 12;
+    /* the run's header and report saved where a reboot leaves them (dcql_hw.h); the next loader puts them back */
+    dcql_save_handoff(P2(CL_HANDOFF_ADDR), CL_STUB_OFF, CL_REPORT_OFF,
+                      h->report_len <= CL_REPORT_MAX ? h->report_len : CL_REPORT_MAX);
     ((void (*)(void))0xa0000000u)();
     for (;;) {}
 }

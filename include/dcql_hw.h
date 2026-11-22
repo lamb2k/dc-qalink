@@ -131,6 +131,18 @@ static inline void dcql_gd_unstick(void) {
     (void)dcql_gd_wait(DCQL_ATA_BSY, 0);
     (void)DCQL_HW_R8(DCQL_ATA_STATUS);
 }
+/* the drive's pending error read and cleared (SPI REQ_ERROR 0x13): until it is, every command reports CHECK (the ERR
+   bit) for a sense left by an earlier command (a refused vendor command, the unit attention after an image change;
+   Flycast's drive works the same way). Returns sense key | ASC << 8 | ASCQ << 16, or 0xff when it did not answer */
+static inline uint32_t dcql_gd_req_error(void) {
+    const uint8_t cmd[12] = {0x13, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0};
+    uint16_t b[5] = {0, 0, 0, 0, 0};
+    uint32_t n = sizeof(b);
+    const int rc = dcql_gd_packet(cmd, b, &n);
+    if ((rc && rc != -4) || n < 10) return 0xffu;
+    const uint8_t *r = (const uint8_t *)b;
+    return (uint32_t)(r[2] & 15) | ((uint32_t)r[8] << 8) | ((uint32_t)r[9] << 16);
+}
 /* n 2048-byte sectors from frame address fad to dst (2-byte aligned; pass an uncached address) with the drive's own
    read command (SPI CD_READ 0x30, data area, PIO, as Linux's gdrome driver sends it), without the BIOS: nothing of
    the BIOS's state, vectors or disc code is needed. 0 = read; -1 busy before, -2 no packet phase, -3 no data in
@@ -209,6 +221,32 @@ static inline void dcql_crumb_clear(void) {
     for (int k = 0; k < DCQL_CRUMB_PLACES; ++k) {
         if (k == 1) dcql_g2_fifo_wait();
         dcql_crumb_at(k)[0] = 0;
+    }
+}
+
+/* ---------------------------------------------------------------- the hand-off area saved across a BIOS reboot */
+/* Before a BIOS reboot the way back copies the hand-off header and the run's report (not the stub) to main RAM at
+   7.75 MiB and to sound RAM at 1.75 MiB; the next loader puts a copy back when the area at the top of RAM did not
+   survive (Flycast, 2026-11-22: the top 128 KiB is lost on a reboot while main RAM at 8 MiB, sound and video RAM keep
+   their words; the console lost it on every reboot the same day). */
+#define DCQL_SAVE_RAM 0xac7c0000u
+#define DCQL_SAVE_SND 0xa09c0000u
+/* n bytes (a multiple of 4) from src to dst, both uncached; g2: dst is sound RAM (the G2 FIFO waited) */
+static inline void dcql_copy_words(uint32_t dst, uint32_t src, uint32_t n, int g2) {
+    volatile uint32_t *d = (volatile uint32_t *)dst;
+    const volatile uint32_t *s = (const volatile uint32_t *)src;
+    for (uint32_t i = 0; i < n / 4; ++i) {
+        if (g2 && !(i & 7)) dcql_g2_fifo_wait();
+        d[i] = s[i];
+    }
+}
+/* the area at area_p2 (header hdr_bytes, report rep_bytes at rep_off) saved to both places */
+static inline void dcql_save_handoff(uint32_t area_p2, uint32_t hdr_bytes, uint32_t rep_off, uint32_t rep_bytes) {
+    rep_bytes = (rep_bytes + 3) & ~3u;
+    for (int k = 0; k < 2; ++k) {
+        const uint32_t base = k ? DCQL_SAVE_SND : DCQL_SAVE_RAM;
+        dcql_copy_words(base + rep_off, area_p2 + rep_off, rep_bytes, k);
+        dcql_copy_words(base, area_p2, hdr_bytes, k);
     }
 }
 
