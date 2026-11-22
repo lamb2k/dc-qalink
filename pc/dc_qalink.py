@@ -189,6 +189,13 @@ def action(link, a, words):
 
 
 def main(argv=None):
+    # 0.2: one PC tool. "loop ..." is the control loop (dcql_loop.py: push, run, report, stills, serve, tail, reset,
+    # power); everything else is the 0.1 telemetry link, unchanged.
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args and args[0] == 'loop':
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dcql_loop
+        return dcql_loop.main(args[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--relay', default=os.environ.get('DCQL_RELAY', '127.0.0.1:52041'), help='control host:port')
     ap.add_argument('--ssh', default=os.environ.get('DCQL_SSH', ''), help='ssh host of the relay (instead of --relay)')

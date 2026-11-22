@@ -15,6 +15,34 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
 <p align="center"><sub>Flycast captures of example/ through Flycast's emulated modem: connected after a remote
 <code>GOTO level1-boss</code>, and dialling.</sub></p>
 
+## New in 0.2 (branch `v0.2-bba-loader`, not released): the control loop and the broadband adapter
+
+- **One link layer, two transports** (`lib/dcql_net.h`): the modem as in 0.1, or the broadband adapter (HIT-0400 or
+  the LAN adapter; DHCP or a static address). The 0.1 API is unchanged; `dcql_config_t` gains `net`, `ip`, `mask`,
+  `gw` at its end (zero = modem, as before).
+- **A loader disc** (`loader/`): boots, brings the link up, and runs programs the PC pushes (deflated, CRC per chunk,
+  SHA-256 checked before it runs). `LINK.TXT` on the disc: `net bba|modem`, `ip`/`mask`/`gw` (static) or none (DHCP),
+  `host` (the PC), `port`, `lport`, `number` (modem).
+- **The client library** (`loader/client.mk`) in each pushed program: its report and exit code back to the PC, its
+  serial lines live, stills (RGB565 frame buffers as PNG on the PC), the PC's files as `/pc/...` (load time; a
+  program that wants reads in play counted does it itself), and RESET from the PC.
+- **Every exit returns to the loader without a power cycle**: a 2 KB return stub in the hand-off area quiets the
+  hardware, reads `LOADER.BIN` from the disc with the BIOS's own disc calls, checks its SHA-256 and jumps. Normal
+  exit, deadline, exception, `abort`/`assert` and RESET go there, also after a program wrecked the heap. A program
+  with interrupts off for ever: the SH-4 watchdog (reset mode, fed from the vertical blank, `wdt=1`) or, last,
+  `pc/power.py` ("power cycle needed", or your smart plug).
+- **One PC tool**: `python pc/dc_qalink.py loop status|push|run|report|serve|tail|stills|reset|power|relay-local`
+  (`pc/dcql_loop.py`). The protocol and the hand-off area are one versioned header (`include/dcql_loop.h`,
+  protocol 2); the loader and the PC tool refuse each other's other versions.
+
+```
+Dreamcast --broadband adapter/UDP 52060--> PC (dc_qalink.py loop ...)      or, on the modem, via the DreamPi relay
+```
+
+`make -C loader OUT=build` builds `loader.elf`, `LOADER.BIN` (put it on the loader disc next to `1ST_READ.BIN`),
+`testprog.elf` and the host test build (`make ... host`). Flycast: `[network] EmulateBBA = yes`, run
+`dc_qalink.py loop relay-local` before the loader boots, and give `LINK.TXT` an `lport` other than `port`.
+
 ## Hardware
 
 - A Dreamcast with its modem, and a PPP peer on a phone line: a **DreamPi** (Raspberry Pi + USB modem + line
@@ -88,13 +116,18 @@ capture cut accepts any echo of a marker (C, M, A or the L line), so one lost da
 
 ## Agent skills
 
-`skill/` holds three short skills for coding agents (Claude Code and similar): `dc-qalink-integrate` (add the library
-to a KOS game), `dc-qalink-pi-setup` (set up the relay on a Pi) and `dc-qalink-capture` (measure on hardware).
+`skill/` holds four short skills for coding agents (Claude Code and similar): `dc-qalink-integrate` (add the library
+to a KOS game), `dc-qalink-pi-setup` (set up the relay on a Pi), `dc-qalink-capture` (measure on hardware) and
+`dc-qalink-loop` (0.2: push programs, pull reports and stills, recover hangs).
 
 ## Tests
 
 `python3 -m unittest discover -s tests` runs the relay and PC tool against a fake console (loss, reorder, a dropped
 start marker) and checks `pi_setup.py`'s discovery parsing, ssh config writing and dry run.
+`python3 tests/test_loop.py --host build/cl_host --out <dir>` runs the control loop's own console code (built for the
+PC) against the PC tool over a simulated bad line: loss, corruption, a dead line, a restarted sender, damaged images
+that must be refused, the protocol-version refusal both ways, the file service and stills. Every check has a control
+that must fail. No game and no console needed.
 
 ## Licence
 

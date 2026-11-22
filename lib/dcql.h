@@ -1,4 +1,4 @@
-/* dcql.h: dc-qalink, a QA/telemetry link for KallistiOS programs over the Dreamcast modem.
+/* dcql.h: dc-qalink, a QA/telemetry link for KallistiOS programs over the Dreamcast modem or broadband adapter.
  *
  * The console dials a PPP peer (a DreamPi or any Linux box with a modem and pppd), then one UDP socket carries short
  * text rows both ways. Network work runs on two background threads with static stacks; the functions below that the
@@ -44,6 +44,13 @@ typedef struct {
     int (*bulk_ok)(void);
     /* Optional: the library's own diagnostics ("dcql: up ip=..."). Called from any thread; keep it cheap. */
     void (*log)(const char* line);
+    /* 0.2 (appended: a zeroed 0.1 config keeps 0.1's behaviour). Which transport: 0 = automatic (the broadband
+     * adapter if one is fitted and dcql.mk built it in, else the modem), 1 = modem, 2 = adapter. dcql.mk's default
+     * build (DCQL_NET=modem) has only the modem, so 0 means the modem there. */
+    int net;
+    const char* ip;          /* adapter: static "a.b.c.d", or NULL = DHCP */
+    const char* mask;        /* adapter: netmask, default 255.255.255.0 */
+    const char* gw;          /* adapter: gateway */
 } dcql_config_t;
 
 /* A command handler. Return 1 if handled (answer it with dcql_answer, now or later), 0 for "unknown". Runs on the
