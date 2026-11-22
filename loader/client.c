@@ -27,6 +27,8 @@
 #include "cl_client.h"
 #include "cl_core.h"
 #include "dcql_net.h"
+#include "dcql_live.h"
+#include <dc/video.h>
 
 /* the program's stack and heap end below the hand-off area (dcql_loop.h) */
 uintptr_t arch_stack_16m = CL_HANDOFF_ADDR;
@@ -141,6 +143,28 @@ static void link_out_wait(uint8_t type, uint32_t a, uint16_t b, const void *p, u
         thd_sleep(1);
     }
 }
+static int live_send(uint8_t type, uint32_t a, uint16_t b, const void *p, uint16_t n) {
+    uint8_t d[CL_DGRAM_MAX];
+    const size_t len = cl_frame(d, type, H->h.run_id, a, b, p, n);
+    return len && dcql_net_send(d, (unsigned)len);
+}
+/* GRAB from the PC: the displayed picture, read from video memory in pieces on the grab thread (cl_still blocks until
+   the PC holds it, and its answers arrive on the link thread) */
+static semaphore_t g_grab_sem = SEM_INITIALIZER(0);
+static volatile uint32_t g_grab_req;
+static int still_send(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigned picture, uint32_t req);
+static void *grab_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sem_wait(&g_grab_sem);
+        const uint32_t req = g_grab_req;
+        const uint32_t sof = *(volatile uint32_t *)0xa05f8050 & 0x7fffffu;   /* FB_R_SOF1: the picture on screen */
+        if (!vid_mode || vid_mode->pm != PM_RGB565) { dbgio_printf("cl: grab: only RGB565 screens\n"); continue; }
+        still_send((const void *)(0xa5000000u + sof), vid_mode->width, vid_mode->height, vid_mode->width * 2,
+                   dcql_live_picture(), req);
+    }
+    return NULL;
+}
 static void client_hello(void) {
     uint8_t pl[CL_HELLO_LEN];
     memset(pl, 0, sizeof(pl));
@@ -207,6 +231,10 @@ static void on_datagram(const uint8_t *d, int n) {
         irq_restore(m);
         break;
     }
+    case CL_GRAB:
+        g_grab_req = a;
+        sem_signal(&g_grab_sem);
+        break;
     case CL_STILLACK:
         if (a == g_still_index) {
             const unsigned nb = (unsigned)len < sizeof(g_still_bits) ? (unsigned)len : sizeof(g_still_bits);
@@ -216,7 +244,9 @@ static void on_datagram(const uint8_t *d, int n) {
             sem_signal(&g_req_sem);
         }
         break;
-    default: break;
+    default:
+        dcql_live_datagram(type, a, b, pl, len, live_send);
+        break;
     }
 }
 static void *link_thread(void *arg) {
@@ -227,11 +257,15 @@ static void *link_thread(void *arg) {
         thd_sleep(20);
     }
     g_link_up = 1;
+    dcql_live_link(1);
     sem_signal(&g_up_sem);
     client_hello();
-    for (;;) {
-        const int n = dcql_net_recv_wait(d, sizeof(d), 3600 * 1000);
+    uint64_t last = 0;
+    for (;;) {   /* answers at once; live data out every 20 ms (a batch of about one picture) */
+        const int n = dcql_net_recv_wait(d, sizeof(d), 20);
         if (n > 0) on_datagram(d, n);
+        const uint64_t now = timer_ms_gettime64();
+        if (now - last >= 20) { last = now; dcql_live_pump(live_send); }
     }
     return NULL;
 }
@@ -395,6 +429,9 @@ static void still_bytes(const uint8_t *pix, uint32_t row, uint32_t stride, uint3
     }
 }
 int cl_still(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigned picture) {
+    return still_send(pix, w, hgt, stride, picture, 0);
+}
+static int still_send(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigned picture, uint32_t req) {
     if (!g_link_up || !pix || w > 640 || hgt > 480 || !w || !hgt) return -1;
     const uint8_t *src = (const uint8_t *)pix;
     const uint32_t row = w * 2, bytes = row * hgt, blocks = (bytes + CL_CHUNK - 1) / CL_CHUNK;
@@ -402,7 +439,7 @@ int cl_still(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigne
     for (unsigned y = 0; y < hgt; ++y) crc = cl_crc32(crc, src + y * stride, row);
     mutex_lock(&g_req_mx);
     const uint32_t index = ++g_still_index;
-    cl_still_head_t hd = {index, picture, w, hgt, CL_PIX_RGB565, bytes, crc, 0};
+    cl_still_head_t hd = {index, picture, w, hgt, CL_PIX_RGB565, bytes, crc, req};
     uint8_t blk[CL_CHUNK];
     uint8_t hb[sizeof(hd)];
     memcpy(hb, &hd, sizeof(hd));   /* both ends little-endian */
@@ -478,6 +515,9 @@ static void link_start(void) {
     a.label = "cl-link";
     a.stack_size = 16384;
     if (thd_create_ex(&a, link_thread, NULL)) g_link = 1;
+    a.label = "cl-grab";
+    a.stack_size = 8192;
+    thd_create_ex(&a, grab_thread, NULL);
 }
 
 /* ---------------------------------------------------------------- the way back */
@@ -541,6 +581,16 @@ static void summary(void) {
         cl_report("cl-link: %s, files opened %u refused %u, reads %u, %u bytes in %u ms, lines %u dropped %u, stills %u\n",
                   g_link_up ? "up" : "never up", g_st.files_opened, g_st.files_refused, g_st.reads, g_st.read_bytes,
                   g_st.read_ms, g_st.lines, g_st.lines_dropped, g_st.stills);
+    if (g_link) {
+        dcql_live_stats_t ls;
+        dcql_live_stats(&ls);
+        cl_report("cl-live: pictures %lu, records sent %lu dropped %lu, trace %lu dropped %lu, log %lu dropped %lu, "
+                  "commands %lu, copy %lu us in all, link sends %lu us in %lu pumps\n", (unsigned long)ls.frames,
+                  (unsigned long)ls.recs_sent, (unsigned long)ls.recs_dropped, (unsigned long)ls.trace_sent,
+                  (unsigned long)ls.trace_dropped, (unsigned long)ls.logs_sent, (unsigned long)ls.logs_dropped,
+                  (unsigned long)ls.cmds, (unsigned long)ls.frame_us_total, (unsigned long)ls.pump_us_total,
+                  (unsigned long)ls.pumps);
+    }
 }
 
 void cl_exit(int code) {

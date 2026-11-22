@@ -59,7 +59,13 @@ enum {
     CL_RESET = 0x18,     /* v2: a = run id (0 = whatever runs): back to the loader through the return stub */
     CL_FINFO = 0x19,     /* v2: answer to FOPEN: a = request id, payload = cl_finfo_t */
     CL_FDATA = 0x1a,     /* v2: answer to FREAD: a = request id, b = block index, payload = up to CL_CHUNK bytes */
-    CL_STILLACK = 0x1b   /* v2: a = still index, b = blocks still missing, payload = bitmap of blocks held */
+    CL_STILLACK = 0x1b,  /* v2: a = still index, b = blocks still missing, payload = bitmap of blocks held */
+    /* v2 live data (dc-qalink 0.2 bridge; lib/dcql_live.h, pc/bridge/wire.py; additive: old ends ignore them).
+       console -> PC: REC records, LIVEDEF the program's declaration, TRACE numbered events, CMDACK; LINE with b = 1..4
+       is a game log line (payload u32 picture + text). PC -> console: SUB channels, GRAB the displayed picture as a
+       STILL (its head's reserved word = the request), CMD pause / resume / step / warp / option / pad. */
+    CL_REC = 0x0d, CL_LIVEDEF = 0x0e, CL_TRACE = 0x0f, CL_CMDACK = 0x20,
+    CL_SUB = 0x1c, CL_GRAB = 0x1d, CL_CMD = 0x1e
 };
 
 /* VERDICT / ERR codes */

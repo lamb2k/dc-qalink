@@ -1,6 +1,6 @@
 # dc-qalink control loop (0.2): the loader, its return stub, the test program and the host test build.
 # Needs a KallistiOS environment (source environ.sh: KOS_BASE, kos-cc, KOS_CC).
-#   make OUT=<dir>                 loader.elf, LOADER.BIN, testprog.elf, testprog.bin, stub.bin
+#   make OUT=<dir>                 loader.elf, LOADER.BIN, testprog.elf, testprog.bin, stub.bin, liveprog.elf
 #   make OUT=<dir> host            cl_host (the protocol core on the PC, for tests/test_loop.py)
 # Options: BUILD=<text> (on the loader's screen and in HELLO), TITLE="<text>" (the screen's first line),
 #   EXTRA_OBJS=<objects> linked into the loader and the test program (a user's patched KOS files, say),
@@ -28,18 +28,19 @@ LOADER_PPP := $(if $(filter bba,$(LOADER_NET)),,$(PPP_OBJS))
 LOADER_OBJS := $(addprefix $(OUT)/,loader.o cl_core.o cl_util.o cl_arm.o dcql_net.o stub_blob.o) $(LOADER_PPP) $(EXTRA_OBJS)
 include $(L)/client.mk
 TEST_OBJS := $(OUT)/testprog.o $(CL_CLIENT_OBJS) $(EXTRA_OBJS)
+LIVE_OBJS := $(OUT)/liveprog.o $(CL_CLIENT_OBJS) $(EXTRA_OBJS)
 WRAPS := -Wl,--wrap=createChainBuffer -Wl,--wrap=destroyChainBuffer -Wl,--wrap=thd_worker_create_ex \
          -Wl,--wrap=cdrom_read_toc
 STUB_CFLAGS := -ml -m4-single-only -Os -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -nostdlib \
                -fno-pic -Wall -Wextra -I$(QL)/include
 
 .PHONY: all host
-all: $(OUT)/loader.elf $(OUT)/LOADER.BIN $(OUT)/testprog.elf $(OUT)/testprog.bin $(OUT)/stub.bin
+all: $(OUT)/loader.elf $(OUT)/LOADER.BIN $(OUT)/testprog.elf $(OUT)/testprog.bin $(OUT)/stub.bin $(OUT)/liveprog.elf
 
 $(OUT)/ppp/%.o: $(PPP_DIR)/%.c
 	@mkdir -p $(dir $@)
 	kos-cc $(KOS_CFLAGS) -Os -I$(PPP_DIR) -I$(KOS_BASE)/kernel/net $(PPP_DEFS) -c $< -o $@
-HDRS := $(QL)/include/dcql_loop.h $(L)/cl_core.h $(QL)/lib/dcql_net.h $(L)/cl_client.h $(L)/cl_arm.h
+HDRS := $(QL)/include/dcql_loop.h $(L)/cl_core.h $(QL)/lib/dcql_net.h $(L)/cl_client.h $(L)/cl_arm.h $(QL)/lib/dcql_live.h
 $(OUT)/%.o: $(L)/%.c $(HDRS)
 	@mkdir -p $(dir $@)
 	kos-cc $(CFLAGS_L) -c $< -o $@
@@ -63,6 +64,8 @@ $(OUT)/LOADER.BIN: $(OUT)/loader.elf
 	sh-elf-objcopy -R .stack -O binary $< $@
 $(OUT)/testprog.elf: $(TEST_OBJS)
 	kos-cc $(CFLAGS_L) $^ -Wl,--wrap=cdrom_read_toc $(CL_CLIENT_LDFLAGS) -o $@
+$(OUT)/liveprog.elf: $(LIVE_OBJS)
+	kos-cc $(CFLAGS_L) $^ -Wl,--wrap=cdrom_read_toc $(CL_CLIENT_LDFLAGS) -Wl,-Map=$(OUT)/liveprog.map -o $@
 $(OUT)/testprog.bin: $(OUT)/testprog.elf
 	sh-elf-objcopy -R .stack -O binary $< $@
 
