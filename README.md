@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/images/mascot.svg" width="160" alt="Dialo, the dc-qalink mascot"></p>
-
 # dc-qalink
 
 A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the console's own 56k modem.
@@ -142,5 +140,4 @@ that must fail. No game and no console needed.
 
 ## Licence
 
-MIT (see LICENSE). KallistiOS and libppp are under their own licences (THIRD_PARTY.md). The mascot (Dialo) is
-original art for this kit, under the same MIT licence. Not affiliated with Sega.
+MIT (see LICENSE). KallistiOS and libppp are under their own licences (THIRD_PARTY.md). Not affiliated with Sega.
