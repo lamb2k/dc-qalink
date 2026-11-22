@@ -53,6 +53,8 @@ TYPE_NAMES = {HELLO: 'HELLO', ACK: 'ACK', VERDICT: 'VERDICT', REPORT: 'REPORT', 
 ERRORS = {0: 'ok', 1: 'stream crc', 2: 'inflate', 3: 'raw length', 4: 'sha256', 5: 'size', 6: 'load address',
           7: 'no memory', 8: 'not verified', 9: 'unknown session', 10: 'bad load', 11: 'codec', 12: 'no report',
           13: 'busy', 14: 'protocol version'}
+PC_TYPES = frozenset((LOAD, DATA, RUN, REPQ, REPDONE, PING, ABORT, VERIFY, RESET, FINFO, FDATA, STILLACK,
+                      0x1c, 0x1d, 0x1e))   # PC -> console (with the live additions SUB, GRAB, CMD)
 STATES = {0: 'IDLE', 1: 'RECEIVING', 2: 'VERIFIED', 3: 'FAILED', 4: 'EXEC'}
 RUN_STATES = {0: 'NONE', 1: 'RUNNING', 2: 'DONE', 3: 'CRASHED', 4: 'TIMEOUT', 5: 'LOST', 6: 'RESET'}
 NETS = {0: '-', 1: 'modem', 2: 'adapter'}
@@ -258,9 +260,20 @@ class UdpTransport:
         self.s.settimeout(max(timeout, 0.001))
         try:
             d, a = self.s.recvfrom(4096)
-            if self.auto and self.peer is None and unframe(d) is not None:
+            m = unframe(d, any_version=True)
+            if m is not None and m[0] in PC_TYPES:
+                return None   # our own datagram (a broadcast Windows loops back to this socket): never the console's
+            if self.auto and self.peer is None:
+                # learn the console only from a loader's HELLO (first console run, 2026-11-22: the PC's own looped-back
+                # broadcast was taken as the console and every LOAD went to this PC)
+                if m is None or m[0] != HELLO or len(m[4]) < 96:
+                    return None
+                h = parse_hello(m[4])
+                if h['role'] == 2:
+                    return None
                 self.peer = a
-                print('%s console at %s:%d' % (time.strftime('%H:%M:%S'), a[0], a[1]), flush=True)
+                print('%s console at %s:%d (the loader says its address is %s)' % (time.strftime('%H:%M:%S'), a[0], a[1],
+                                                                                 h['console_ip']), flush=True)
             return d
         except (socket.timeout, BlockingIOError):
             return None

@@ -49,6 +49,8 @@ class BridgeUdp:
         self.peer = self.fixed
         self.chosen_ip = self.fixed[0] if self.fixed else None
         self.seen = {}           # ip -> discovery row
+        self.echoes = 0          # our own datagrams looped back (dropped)
+        self.log = None
         self.lock = threading.Lock()
         self.locals = local_addresses()
 
@@ -78,6 +80,12 @@ class BridgeUdp:
         m = cl.unframe(d, any_version=True)
         if m is None:
             return d if a[0] == self.chosen_ip else None   # counted as bad by the loop
+        if m[0] in cl.PC_TYPES:
+            # a PC-to-console datagram is ours (or another PC tool's) looped back, from this PC's own address: never
+            # the console. A console's HELLO from this PC's own address is Flycast's (it maps the emulated console
+            # onto the PC's address), so a source address alone cannot decide (first console run, 2026-11-22).
+            self.echoes += 1
+            return None
         if m[0] == cl.HELLO and len(m[4]) >= 96:
             try:
                 h = cl.parse_hello(m[4])
@@ -90,8 +98,11 @@ class BridgeUdp:
                     if h['role'] != 2:
                         row['beacons'] += 1
                         row['hello'] = h
-                    if self.chosen_ip is None and h['role'] != 2:
+                    if self.chosen_ip is None and h['role'] != 2:   # the peer is learnt only from a loader's HELLO
                         self.chosen_ip = a[0]
+                        if self.log:
+                            self.log('console chosen: beacons from %s:%d, the loader says its address is %s (%s)' % (
+                                a[0], a[1], h['console_ip'], h['build']))
         if a[0] != self.chosen_ip:
             return None
         if self.peer is None or self.peer[0] == a[0]:
@@ -271,6 +282,7 @@ class Bridge:
         self.logf = open(os.path.join(self.data_dir, 'bridge.log'), 'a', encoding='utf-8')
         self._ext_log = log
         self.t = BridgeUdp(bind[0], bind[1], console)
+        self.t.log = self.log
         self.loop = TapLoop(self.t, self.log, self.tap)
         self.link_lock = threading.RLock()
         self.device_kind = device_kind
