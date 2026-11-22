@@ -306,6 +306,8 @@ int main(int argc, char **argv) {
         loader_log("stub's last way back: step %u err %x gdemu %x", (unsigned)g_stub_step, (unsigned)g_stub_err,
                    (unsigned)g_stub_gdemu);
         H->h.tramp[CL_STUBW_MAGIC] = 0;   /* said once: a later boot by another way does not repeat it */
+        g_core.p.stub_rec[0] = g_stub_step; g_core.p.stub_rec[1] = g_stub_err;   /* and in every HELLO of this boot */
+        g_core.p.stub_rec[2] = g_stub_gdemu; g_core.p.stub_rec[3] = g_stub_entries;
     }
     g_pushed = cl_handoff_valid(H) && H->h.reserved[3] == PUSH_MAGIC;
     uint8_t pushed_sha8[8];

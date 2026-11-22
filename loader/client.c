@@ -178,7 +178,7 @@ static void client_hello(void) {
     cl_wr32(pl + 96, CL_VERSION);
     cl_wr32(pl + 100, CL_ROLE_CLIENT);
     cl_wr32(pl + 104, CL_NET_BBA);
-    cl_wr32(pl + 116, H->h.run_id);
+    cl_wr32(pl + 120, H->h.run_id);   /* run_id's offset (was 116, inside loader_sha8: the PC read run 0) */
     dcql_net_mac(pl + CL_HELLO_MAC);
     cl_wr16(pl + CL_HELLO_SLOT, (uint16_t)H->h.reserved[CL_RSV_GDEMU_SLOT]);
     link_out(CL_HELLO, 0, 0, pl, sizeof(pl));

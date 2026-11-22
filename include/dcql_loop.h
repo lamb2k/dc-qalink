@@ -117,10 +117,19 @@ typedef struct {
     uint8_t mac[6];           /* offset 128: the adapter's MAC address (all zero on the modem): one console across
                                  DHCP address changes */
     uint16_t gdemu_slot;      /* offset 134: the GDEMU image the loader returns to (0 = none known) */
+    /* v2, additive (ql-data, 2026-11-22): the stub's record of the last way back as the loader read it at boot, so
+       the PC can say where a way back stopped without the TV; all zero from a client or when there was no record */
+    uint8_t stub_step;        /* offset 136: CL_STUB_STEP_* the last way back reached (0 = no record this boot) */
+    uint8_t stub_entries;     /* offset 137: times the stub was entered (low 8 bits) */
+    uint16_t stub_gdemu;      /* offset 138: tramp[CL_STUBW_GDEMU]: the GDEMU select's result + 0x100 (0 = none) */
+    uint32_t stub_err;        /* offset 140: tramp[CL_STUBW_ERR] */
+    uint32_t gdemu_ver;       /* offset 144: GDEMU's version, major << 16 | minor << 8 | patch (0 = none answered) */
 } cl_hello_t;
-#define CL_HELLO_LEN 136
+#define CL_HELLO_LEN 148
 #define CL_HELLO_MAC 128
 #define CL_HELLO_SLOT 134
+#define CL_HELLO_STUB 136
+#define CL_HELLO_GDEMU_VER 144
 #define CL_HF_PUSHED_LOADER 1u   /* this loader was pushed by the PC (self-update), not read from the disc */
 #define CL_HF_STUB_ARMED 2u
 
