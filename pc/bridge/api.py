@@ -195,7 +195,7 @@ def make_handler(bridge, level='run'):
                     return self.loader()
                 # builds and the network disc (lane ql-disc)
                 if p == '/v0/builds':
-                    return self.reply(200, {'builds': bridge.build_list(), 'current': bridge.build})
+                    return self.reply(200, {'builds': bridge.build_list(), 'current': bridge.build_id})
                 m = re.match(r'^/v0/builds/(b[0-9a-f]{12})$', p)
                 if m:
                     b = bridge.builds.get(m[1])

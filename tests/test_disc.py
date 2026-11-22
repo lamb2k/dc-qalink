@@ -239,6 +239,32 @@ def main():
         except urllib.error.HTTPError as e:
             check('CONTROL a plugin path outside the folder is refused', e.code == 404)
         srv.shutdown()
+        # Bridge.build is the current build record (ql-assets' pc/bridge/assets.py stamps its `id`)
+        check('Bridge.build is the current build record, a dict with its id',
+              isinstance(b.build, dict) and b.build['id'] == b.build_id and b.build_id in [x['id'] for x in bl2['builds']])
+        # MCP upload_asset passes its arguments to POST /v0/assets (it sent {} before)
+        from bridge import mcp_server
+
+        class FakeBC:
+            def __init__(self): self.sent = []
+            def call(self, method, path, body=None, *k, **kw):
+                self.sent.append((method, path, body)); return 200, {'ok': True}
+        fb2 = FakeBC()
+        try:
+            mcp_server.handle(fb2, 'upload_asset', {'path': 'tex/a.pvr', 'base64': 'AAAA', 'name': 'a.pvr', 'extra': 1})
+        except Exception:
+            pass
+        sent = [x for x in fb2.sent if x[1] == '/v0/assets']
+        check('MCP upload_asset sends path, base64 and name (and nothing else)',
+              bool(sent) and sent[0][2] == {'path': 'tex/a.pvr', 'base64': 'AAAA', 'name': 'a.pvr'})
+        fb3 = FakeBC()
+        try:
+            mcp_server.handle(fb3, 'upload_asset', {})
+        except Exception:
+            pass
+        sent3 = [x for x in fb3.sent if x[1] == '/v0/assets']
+        check('CONTROL upload_asset with no arguments sends an empty body (the check reads the body)',
+              bool(sent3) and sent3[0][2] == {})
         # CONTROL: a session without a build carries none (the stamp is the build's, not a constant)
         s0 = live.Session(None, 'x', {'name': 'x'}, 'mock', 'x')
         r0 = s0.add({'t': 'log', 'n': 1, 'lv': 'info', 'ph': 'play', 'msg': 'x'})

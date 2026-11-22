@@ -561,13 +561,15 @@ int dcql_disc_mount(const dcql_disc_config_t *c) {
     if (!d.mount) d.mount = "/cd";
     /* defaults from the Flycast round f1 (ql-disc): more than about 8 KiB arriving at once overran the receive path
        (KallistiOS's adapter ring is 16 KiB with frame headers; the PC sends a request's pieces back to back), each loss
-       costing a 250 ms resend; 2 x 4 KiB kept every piece. window * block is held to 16 KiB, the ring's size. */
+       costing a 250 ms resend; 2 x 4 KiB kept every piece; f2: 2 x 8 and 4 x 4 KiB (16 KiB) lost again. window * block is
+       held to inflight_max (default DCQL_DISC_INFLIGHT, 8 KiB; a lab arm may raise it to 32 KiB to measure the loss). */
     if (!d.window) d.window = 2;
     if (!d.block) d.block = 4 * 1024;
     if (!d.timeout_ms) d.timeout_ms = 3000;
     if (!d.link_wait_ms) d.link_wait_ms = 20000;
+    if (!d.inflight_max) d.inflight_max = DCQL_DISC_INFLIGHT;
     if (d.window > 4 || d.block % 1024 || d.block > 32 * 1024 || d.block > DCQL_DISC_CACHE ||
-        d.window * d.block > 16u * 1024u ||
+        d.inflight_max > 32u * 1024u || d.window * d.block > d.inflight_max ||
         strlen(d.mount) >= sizeof(g_vfs.nmmgr.pathname))
         return -5;
     g_cfg = d;

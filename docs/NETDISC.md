@@ -36,7 +36,9 @@ is in `GET /v0/disc` and in the build record (docs/BRIDGE_API.md, "Builds").
   resend asks only for the pieces still missing (after 250 ms, then every 500 ms); a request fails after `timeout_ms`
   (3 s) and the read returns EIO: nothing waits without a time limit. Read-ahead fills `window` blocks after the one
   read and never blocks the caller; the game thread waits only inside its own read call.
-- `window * block` is held to 16 KiB, the size of KallistiOS's adapter receive ring (see "Speed").
+- `window * block` is held to 8 KiB in flight (`inflight_max`, default `DCQL_DISC_INFLIGHT`; at most 32 KiB for lab
+  arms): the PC sends a request's pieces back to back and KallistiOS's adapter receive ring is 16 KiB, frame headers
+  included (see "Speed").
 - Fixed memory, no heap: the cache `DCQL_DISC_CACHE` (32 KiB), the table `DCQL_DISC_TABLE_N` x 8 B (512: 4 KiB; more
   served files set an overflow flag and every open asks the PC, still correct), 16 open files, 6 requests, a 1 KiB log
   buffer. Measured (`netdisc.map`, sh-elf-size of `dcql_disc.o`): code 7,152 B + data 424 B, fixed memory 44,012 B.
@@ -62,25 +64,41 @@ time of each request rides on its next DREAD, so the PC records it without extra
 ## Speed
 **Flycast (plain tier: function and protocol cost only, never a console speed).** Rounds f1 and f2 of lane ql-disc
 (`E:\RE4DC-Lanes\ql-disc\ev`), 1 MiB file from the PC, 8 small files, 64 single 2 KiB reads:
-FLYCAST_TABLE
 
-What Flycast shows about the protocol: a request costs about 20 ms there whatever its size (its emulated adapter), and
-more than about 8 KiB arriving at once loses pieces (each loss a 250 ms resend); hence the defaults 2 x 4 KiB and the
-16 KiB cap. Reads from Flycast's emulated GD-ROM are instant there and say nothing about GDEMU.
+| Arm (window x block, in flight) | Whole 1 MiB | 2 KiB sequential | 2 KiB scattered | Small read mean / worst | Resends | Hashes |
+|---|---|---|---|---|---|---|
+| 2 x 4 KiB, 8 KiB (default, f2) | 0.34 MB/s | 0.35 MB/s | 0.08 MB/s | 16.7 / 22.6 ms | 0 | all ok |
+| 2 x 4 KiB, whole disc from a .gdi (f2) | 0.34 MB/s | 0.35 MB/s | 0.09 MB/s | 17.2 / 26.7 ms | 0 | all ok |
+| 1 x 8 KiB, 8 KiB (f2) | 0.35 MB/s | 0.35 MB/s | 0.05 MB/s | 25.1 / 299.7 ms | 5 | all ok |
+| 2 x 8 KiB, 16 KiB (f2) | 0.016 MB/s | 0.017 MB/s | 0.05 MB/s | 29.8 / 292 ms | 510 | all ok |
+| 4 x 4 KiB, 16 KiB (f2) | 0.09 MB/s | 0.09 MB/s | 0.06 MB/s | 16.5 / 26.8 ms | 293 | all ok |
+| 2 x 16 KiB, 32 KiB (f1) | 0.03 MB/s | 0.03 MB/s | 0.004 MB/s | 792 / 798 ms | 215 | all ok |
+| Real disc in Flycast (f2, the disc pass) | 3,000 MB/s | 117 MB/s | | | | all ok |
+
+Controls (f1): a wrong byte in an overlay file gives `sha BAD` and exit 1 (`badctl`); no network disc service on the
+PC gives mount -2 after 3.8 s and exit 1 (`noserve`); f3: 2 x 8 KiB without `inflight=16` is refused at mount (-5).
+
+What Flycast shows about the protocol: a request costs about 20 ms there whatever its size (its emulated adapter, so
+MB/s is block / 20 ms and says nothing of the console), and 16 KiB or more arriving at once loses pieces, each loss a
+250 ms resend that the window then repeats; 8 KiB lost nothing as two requests and a few pieces as one. Hence the
+defaults 2 x 4 KiB and the in-flight cap of 8 KiB (`DCQL_DISC_INFLIGHT`; `inflight=` raises it for a lab arm). Reads
+from Flycast's emulated GD-ROM are instant there and say nothing about GDEMU.
 
 **Expected on a console (estimate from the code and the wire, not measured):**
 - At 10 Mbit/s a 1 KiB piece is a 1,110-byte frame on the wire (headers, CRC, preamble, gap): the data ceiling is about
   **1.15 MB/s**. A 4 KiB request takes about 3.7 ms of wire plus about 0.5 ms of round trip and PC time; with two in
   flight the wire stays busy, so **0.9 to 1.1 MB/s** for whole-file and sequential reads, and **about 4 to 5 ms** for a
-  single small read that misses the cache.
+  single small read that misses the cache (estimate). At 10 Mbit/s the ring drains faster than the wire fills it, so
+  the console may well take 16 KiB in flight without loss: the run sheet's `inflight=16` arms say whether to raise
+  the default.
 - CPU per piece on the SH-4 (estimate): the adapter's frame read over the G2 bus (about 85 us), the stack and the
   ring copies (about 30 to 50 us), the CRC-32 in software (about 40 us): about 0.15 to 0.2 ms, so at 1.1 MB/s the
   network disc takes about 20% of the CPU while it reads (loading time, not play).
 - If the adapter's link comes up at 100 Mbit/s, the wire stops being the limit and the console's CPU per piece is: an
-  estimated 3 to 5 MB/s, with the receive ring the constraint (hence the 16 KiB cap).
+  estimated 3 to 5 MB/s, with the receive ring the constraint (hence the in-flight cap).
 - What would raise it: larger datagrams on the adapter (1,400-byte pieces: 25% fewer frames; the modem path's
   1,200-byte limit does not apply to the adapter), a table CRC on the SH-4 with sh4zam-style word loads, and PC-side
-  pacing so more than 16 KiB can be in flight.
+  pacing so more can be in flight without overrunning the ring.
 
 ## The console run sheet (the next owner session)
 The disc: the loader disc with the generated `NETDISC/` base files on it (`tools/netdisc_testdata.py`; lane ql-disc's
@@ -89,8 +107,10 @@ The disc: the loader disc with the generated `NETDISC/` base files on it (`tools
 2. Overlay, both passes (real disc first, then the network disc):
    `python pc\dcql_loop.py --udp <console> run pc\netdisc.elf --args "passes=disc,net" --disc data\base --overlay data\overlay --deadline 150 --wait 240 --out nd-overlay`
 3. Whole disc from the image: `... run pc\netdisc.elf --args "passes=net" --disc disc.gdi --overlay data\overlay --whole ... --out nd-whole`
-4. Window and block arms (one variable each): `--args "passes=net window=1 block=8"`, `"passes=net window=4 block=4"`,
-   `"passes=net window=2 block=8"` (16 KiB in flight: the loss arm).
+4. Window and block arms (one variable each): `--args "passes=net window=1 block=8"`, `"passes=net window=1 block=4"`,
+   then the lab arms with more in flight: `"passes=net window=2 block=8 inflight=16"`,
+   `"passes=net window=4 block=4 inflight=16"` (lost pieces show as resends in `cl-disc:`; none means the default
+   may be raised to 16 KiB).
 5. Read from each report: `@ pc whole-file read`, `@ pc 2K sequential read`, `@ pc 2K scattered read` (MB/s),
    `@ small read latency mean / worst` (ms), `@ netdisc failures = 0`, the `cl-disc:` line (resends and timeouts: 0
    expected at the defaults), and the disc pass's lines (GDEMU's own speed beside it). The PC's `disc-reads.jsonl` and

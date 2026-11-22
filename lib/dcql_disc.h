@@ -38,6 +38,9 @@
 #ifndef DCQL_DISC_TABLE_N
 #define DCQL_DISC_TABLE_N 512
 #endif
+#ifndef DCQL_DISC_INFLIGHT
+#define DCQL_DISC_INFLIGHT (8u * 1024u)   /* Flycast rounds f1/f2: 16 KiB arriving at once lost pieces, 8 KiB none */
+#endif
 #define DCQL_DISC_FILES 16
 #define DCQL_DISC_REQS 6
 
@@ -77,8 +80,9 @@ typedef struct {
     int mode;                /* DCQL_DISC_* (default AUTO) */
     unsigned window;         /* requests in flight at once, 1..4 (default 2); also how many blocks are read ahead */
     unsigned block;          /* bytes a request asks for, 1..32 KiB in whole KiB (default 4 KiB); the cache holds
-                                DCQL_DISC_CACHE / block blocks. window * block must be at most 16 KiB (the adapter's
-                                receive ring: more arriving at once is lost and resent; docs/NETDISC.md) */
+                                DCQL_DISC_CACHE / block blocks. window * block must be at most inflight_max (more
+                                arriving at once is lost and resent; docs/NETDISC.md) */
+    unsigned inflight_max;   /* bytes in flight at most (default DCQL_DISC_INFLIGHT, 8 KiB; at most 32 KiB, lab arms) */
     unsigned timeout_ms;     /* one request's time limit (default 3000) */
     unsigned link_wait_ms;   /* how long mount waits for the link (default 20000) */
     int no_log;              /* 1: no DLOG records */

@@ -182,6 +182,7 @@ int main(int argc, char **argv) {
     c.mode = !strcmp(m, "overlay") ? DCQL_DISC_OVERLAY : !strcmp(m, "pc") ? DCQL_DISC_PC : DCQL_DISC_AUTO;
     c.window = (unsigned)arg_int("window=", 0);           /* 0: the library's default (2) */
     c.block = (unsigned)arg_int("block=", 0) * 1024u;     /* 0: the library's default (4 KiB) */
+    c.inflight_max = (unsigned)arg_int("inflight=", 0) * 1024u;   /* lab arms: allow more in flight (KiB) */
     g_cap = 2u * 1024u * 1024u;
     g_buf = memalign(32, g_cap);
     if (!g_buf) { say("netdisc: no buffer\n"); cl_exit(3); }

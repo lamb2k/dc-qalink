@@ -445,7 +445,7 @@ class Bridge:
                 self.builds = json.load(open(self.builds_path, encoding='utf-8'))
             except (OSError, ValueError):
                 self.builds = {}
-        self.build = None            # the current build's id (the last pushed, or the linked program's)
+        self.build_id = None         # the current build's id (the last pushed, or the linked program's)
         self.disc_args = (disc, overlay, bool(whole))
         self.asset_plugins = None    # a folder of decoder plugins (ES modules) for QA Link Cloud's Assets workspace
         self.disc = None
@@ -471,7 +471,7 @@ class Bridge:
 
     def audit_call(self, who, level, what, result):
         self.audit.write(json.dumps({'at': now_iso(), 'who': who, 'level': level, 'call': what, 'result': result,
-                                     'build': self.build}) + '\n')
+                                     'build': self.build_id}) + '\n')
         self.audit.flush()
 
     def tier(self):
@@ -513,7 +513,7 @@ class Bridge:
                 'n': self.current.max_n if self.current else 0, 'level': self.level, 'tier': self.tier(),
                 'queue': [r.id for r in list(self.queue.queue)], 'active_run': self.active.id if self.active else None,
                 'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
-                'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build,
+                'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build_id,
                 'disc': self.disc.manifest()['mode'] if self.disc else None}
 
     # ------------------------------------------------------------------ builds (lane ql-disc)
@@ -544,9 +544,14 @@ class Bridge:
         elif commit and not b['program'].get('commit'):
             b['program']['commit'] = commit
         b['last'] = now_iso()
-        self.build = bid
+        self.build_id = bid
         self.save_builds()
         return b
+
+    @property
+    def build(self):
+        """The current build record (a dict with `id`), or None: what a record is stamped with (its `id`)."""
+        return self.builds.get(self.build_id) if self.build_id else None
 
     def save_builds(self):
         try:
@@ -666,7 +671,7 @@ class Bridge:
         elif typ == cl.STILL:
             def held(j):
                 rr = self.runs.get(j['run'])
-                j['build'] = rr.build if rr is not None else self.build
+                j['build'] = rr.build if rr is not None else self.build_id
                 if rr is not None:
                     rr.stills.append(j['id'])
                 self.record({'t': 'still', 'run': j['run'], 'id': j['id'], 'picture': j['picture'], 'crc_ok': j['crc_ok']}, s)
