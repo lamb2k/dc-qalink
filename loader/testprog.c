@@ -91,6 +91,11 @@ int main(int argc, char **argv) {
     const int active = cl_init((has(args0, "preload0") ? CL_NO_PRELOAD : 0) | (word(args0, "ret") ? CL_NO_LINK : 0));
     const char *args = cl_args();
     char line[64];
+    if (active && has(args, "nosave")) {   /* lab arm (ql-core4): the full restart keeps nothing in RAM; END alone tells */
+        cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
+        w->h.flags |= CL_F_NOSAVE;
+        cl_handoff_seal(w);
+    }
     say(0, "CONTROL LOOP TEST PROGRAM");
     snprintf(line, sizeof(line), "RUN %08X  ACTIVE %d", (unsigned)cl_run_id(), active);
     say(1, line);

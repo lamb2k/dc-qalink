@@ -46,15 +46,17 @@ HELLO, ACK, VERDICT, REPORT, EXEC, ERR = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 LINE, STILL, FOPEN, FREAD, FCLOSE, RESETACK = 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C
 LOAD, DATA, RUN, REPQ, REPDONE, PING, ABORT, VERIFY = 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
 RESET, FINFO, FDATA, STILLACK = 0x18, 0x19, 0x1A, 0x1B
+END, ENDACK, END_HEAD = 0x21, 0x1F, 0xFFFFFFFF   # ql-core4: the run's ending over the link before the full restart
 TYPE_NAMES = {HELLO: 'HELLO', ACK: 'ACK', VERDICT: 'VERDICT', REPORT: 'REPORT', EXEC: 'EXEC', ERR: 'ERR', LINE: 'LINE',
               STILL: 'STILL', FOPEN: 'FOPEN', FREAD: 'FREAD', FCLOSE: 'FCLOSE', RESETACK: 'RESETACK', LOAD: 'LOAD',
               DATA: 'DATA', RUN: 'RUN', REPQ: 'REPQ', REPDONE: 'REPDONE', PING: 'PING', ABORT: 'ABORT',
-              VERIFY: 'VERIFY', RESET: 'RESET', FINFO: 'FINFO', FDATA: 'FDATA', STILLACK: 'STILLACK'}
+              VERIFY: 'VERIFY', RESET: 'RESET', FINFO: 'FINFO', FDATA: 'FDATA', STILLACK: 'STILLACK', END: 'END',
+              ENDACK: 'ENDACK'}
 ERRORS = {0: 'ok', 1: 'stream crc', 2: 'inflate', 3: 'raw length', 4: 'sha256', 5: 'size', 6: 'load address',
           7: 'no memory', 8: 'not verified', 9: 'unknown session', 10: 'bad load', 11: 'codec', 12: 'no report',
           13: 'busy', 14: 'protocol version'}
 PC_TYPES = frozenset((LOAD, DATA, RUN, REPQ, REPDONE, PING, ABORT, VERIFY, RESET, FINFO, FDATA, STILLACK,
-                      0x1c, 0x1d, 0x1e))   # PC -> console (with the live additions SUB, GRAB, CMD)
+                      0x1c, 0x1d, 0x1e, ENDACK))   # PC -> console (with the live additions SUB, GRAB, CMD; ENDACK)
 STATES = {0: 'IDLE', 1: 'RECEIVING', 2: 'VERIFIED', 3: 'FAILED', 4: 'EXEC'}
 RUN_STATES = {0: 'NONE', 1: 'RUNNING', 2: 'DONE', 3: 'CRASHED', 4: 'TIMEOUT', 5: 'LOST', 6: 'RESET'}
 NETS = {0: '-', 1: 'modem', 2: 'adapter'}
@@ -947,16 +949,20 @@ def ladder(loop, run, wait_s, stamp, b0=None):
     def pred(m):
         if m[0] == RESETACK:
             got['ack'] = got['ack'] or time.time() - t0
-        if m[0] == HELLO and parse_hello(m[4])['role'] != 2 and loop.hello and (b0 is None or loop.hello['boot_count'] != b0):
+        # ql-core4: a loader started since the RESET (its uptime is shorter than the wait) is back too: after a full
+        # restart where nothing survived, its boot count starts at 1 again and equals b0
+        if m[0] == HELLO and parse_hello(m[4])['role'] != 2 and loop.hello and (
+                b0 is None or loop.hello['boot_count'] != b0 or loop.hello['uptime_ms'] < 1000 * (time.time() - t0)):
             return loop.hello
         return None
-    hb = loop.wait(pred, wait_s, every=2.0, poke=lambda: loop.send(RESET, run))
+    hb = loop.wait(pred, wait_s, every=2.0, poke=lambda: loop.send(RESET, run) if got['ack'] is None else None)
     if hb is not None:
         stamp('back to the loader %.2f s after RESET (acknowledged %s)' % (
             time.time() - t0, '%.2f s' % got['ack'] if got['ack'] is not None else 'no'))
         return 'reset', round(time.time() - t0, 3), hb, got['ack']
-    stamp('RESET unanswered for %.0f s (acknowledged: %s): the program\'s link thread is not running' % (
-        wait_s, got['ack'] is not None))
+    stamp('RESET unanswered for %.0f s (acknowledged: %s): %s' % (
+        wait_s, got['ack'] is not None, 'acknowledged; the loader is not back yet' if got['ack'] is not None
+        else 'the program\'s link thread is not running'))
     stamp('next rung: the watchdog, if the program armed it (wdt=1): waiting 10 s more for the loader')
     hb = loop.wait(pred, 10.0, every=5.0, poke=lambda: loop.send(PING, 0))
     if hb is not None:
@@ -1059,7 +1065,48 @@ def collect(a, loop, stamp, session, result, h):
         elif typ == HELLO and loop.client_hello and 'client_up_s' not in marks:
             marks['client_up_s'] = round(time.time() - t0, 3)
             stamp('program\'s link up %.2f s after EXEC' % marks['client_up_s'])
+        elif typ == END:
+            end_datagram(aa, pl)
     loop.on_other = other
+    ending = {'head': None, 'bytes': {}, 'at': None}
+
+    def end_datagram(aa, pl):
+        """ql-core4: the run's ending, sent by the program before its full restart (include/dcql_loop.h CL_END)."""
+        if aa != END_HEAD:
+            ending['bytes'][aa] = bytes(pl)
+            return
+        if len(pl) < 64:
+            return
+        k = ('state', 'exit', 'crash_evt', 'crash_pc', 'crash_pr', 'crash_sp', 'report_len', 'report_crc', 'sent_off',
+             'sent_len', 'flags', 'uptime_ms', 'wdt_feeds', 'wdt_gap_us', 'link_up_ms', 'path')
+        e = dict(zip(k, struct.unpack_from('<IiIIIIIIIIIIIIII', pl, 0)))
+        if ending['head'] is None:
+            ending['at'] = time.time()
+            stamp('END from the program %.2f s after EXEC: %s exit %d, report %d bytes (%d in this END), %s' % (
+                ending['at'] - t0, RUN_STATES.get(e['state'], e['state']), e['exit'], e['report_len'], e['sent_len'],
+                'sent from an exception' if e['path'] == 2 else 'from its thread'))
+        ending['head'] = e
+        held = sum(len(v) for o, v in ending['bytes'].items() if e['sent_off'] <= o < e['sent_off'] + e['sent_len'])
+        loop.send(ENDACK, session, session, max(0, min(0xFFFF, e['sent_len'] - held)))
+
+    def end_result():
+        e = ending['head']
+        if e is None:
+            return None
+        tail = b''.join(ending['bytes'][o] for o in sorted(ending['bytes']) if o >= e['sent_off'])[:e['sent_len']]
+        whole = e['sent_off'] == 0 and len(tail) == e['report_len']
+        crc_ok = whole and (zlib.crc32(tail) & 0xFFFFFFFF) == e['report_crc']
+        path = os.path.join(a.out, 'report-%08x.txt' % session) if a.out else None
+        if path:
+            with open(path, 'wb') as f:
+                f.write(tail)
+        st = RUN_STATES.get(e['state'], e['state'])
+        r = {'run': '%08x' % session, 'state': st, 'exit': e['exit'], 'bytes': e['report_len'], 'tail_bytes': len(tail),
+             'whole': whole, 'crc_ok': crc_ok, 'path': path, 'by': 'END over the link', 'end': e}
+        if st == 'CRASHED':
+            r['crash'] = {'event': '%03x' % e['crash_evt'], 'pc': '%08x' % e['crash_pc'], 'pr': '%08x' % e['crash_pr'],
+                          'sp': '%08x' % e['crash_sp']}
+        return r
 
     def back(m):
         if m[0] == HELLO and parse_hello(m[4])['role'] != 2 and loop.hello and \
@@ -1081,12 +1128,28 @@ def collect(a, loop, stamp, session, result, h):
         serial.close()
     result['program_side'] = {'files': files.summary(), 'lines': {k: v for k, v in lines.items() if k != 'next'},
                               'stills': stills.saved, **marks}
+    er = end_result()
+    if er:
+        result['end'] = er
     if hb is None:
         stamp('the loader did not come back' + ('' if a.reset_after is not None else ' within %.0f s' % a.wait))
-        result['report'] = None
+        result['report'] = er
         return 6 if a.reset_after is not None else 4
     result['back_after_s'] = round(time.time() - t0, 3)
-    if hb['report_run'] != session or hb['report_state'] in (0, 1):
+    if ending['at'] is not None:   # ql-core4: the program's end to the loader's first beacon heard again
+        result['end_to_beacon_s'] = round(time.time() - ending['at'], 3)
+        stamp('end to beacon %.2f s (END at %.2f s after EXEC, loader up %.1f s at its beacon)' % (
+            result['end_to_beacon_s'], ending['at'] - t0, hb['uptime_ms'] / 1000.0))
+    if hb['report_run'] != session or hb['report_state'] in (0, 1) or (er and not hb['report_len']):
+        if er:   # ql-core4: back by the full restart, the run's ending already in hand: the result is the END's
+            stamp('loader back after %.2f s by the full restart; the run\'s result from its END: %s exit %d, report %d '
+                  'of %d bytes (%s) -> %s; the loader says: %s' % (
+                      time.time() - t0, er['state'], er['exit'], er['tail_bytes'], er['bytes'],
+                      'crc ok' if er['crc_ok'] else 'whole' if er['whole'] else 'its tail', er['path'], describe(hb)))
+            if er.get('crash'):
+                stamp('crash: event %(event)s pc %(pc)s pr %(pr)s sp %(sp)s' % er['crash'])
+            result['report'] = er
+            return 0 if er['state'] in ('DONE', 'RESET') else 5
         stamp('loader back after %.1f s without this run (power cycle?): %s' % (time.time() - t0, describe(hb)))
         result['report'] = None
         result['lost'] = RUN_STATES.get(hb['report_state'], hb['report_state']) if hb['report_run'] == session else None

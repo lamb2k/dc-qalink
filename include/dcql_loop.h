@@ -65,8 +65,27 @@ enum {
        is a game log line (payload u32 picture + text). PC -> console: SUB channels, GRAB the displayed picture as a
        STILL (its head's reserved word = the request), CMD pause / resume / step / warp / option / pad. */
     CL_REC = 0x0d, CL_LIVEDEF = 0x0e, CL_TRACE = 0x0f, CL_CMDACK = 0x20,
-    CL_SUB = 0x1c, CL_GRAB = 0x1d, CL_CMD = 0x1e
+    CL_SUB = 0x1c, CL_GRAB = 0x1d, CL_CMD = 0x1e,
+    /* v2, additive (ql-core4, 2026-11-22): the run's ending over the link, before the full restart (a BIOS reboot loses
+       main RAM on the console, so the PC must have the result before it). console -> PC: END, a = CL_END_HEAD with a
+       cl_end_t payload, else a = byte offset into the report and the payload its bytes (b = the head's report bytes in
+       this END, to a datagram's count). PC -> console: ENDACK, a = run id, b = report bytes still missing (0 = whole). */
+    CL_END = 0x21, CL_ENDACK = 0x1f
 };
+#define CL_END_HEAD 0xffffffffu
+typedef struct {
+    uint32_t state;               /* CL_RUN_* */
+    int32_t exit_code;
+    uint32_t crash_evt, crash_pc, crash_pr, crash_sp;
+    uint32_t report_len, report_crc;   /* the whole report (header's) */
+    uint32_t sent_off, sent_len;  /* the report bytes this END carries: [sent_off, sent_off + sent_len), the tail */
+    uint32_t flags;               /* the header's CL_F_* */
+    uint32_t uptime_ms;           /* ms from cl_init to the END */
+    uint32_t wdt_feeds, wdt_gap_us;
+    uint32_t link_up_ms;          /* the program's link: ms from cl_init to up (0 = never) */
+    uint32_t path;                /* 1 sent from the program's link thread / main thread, 2 from an exception (raw frames) */
+} cl_end_t;
+#define CL_END_LEN 64
 
 /* VERDICT / ERR codes */
 enum {
@@ -128,7 +147,10 @@ typedef struct {
     /* v2, additive (ql-core3, 2026-11-22): where the record came through and the rest of it */
     uint32_t wb_where;        /* offset 148: bit 0 the hand-off header, 1 main RAM at 8 MiB, 2 sound RAM, 3 video RAM
                                  held the record; 4 / 5: the hand-off area was lost on a reboot and put back from its
-                                 copy in main / sound RAM (dcql_hw.h); 0 = no record anywhere */
+                                 copy in main / sound RAM (dcql_hw.h); 0 = no record anywhere. ql-core4: 6 put back from
+                                 the copy in the adapter's own memory; 7 the run's last record seen only as a crumb
+                                 (a restart with no ending: watchdog, reset or power), 8 this loader started its link
+                                 on the address the record carried (no DHCP) */
     uint32_t wb_aux;          /* offset 152: tramp[CL_STUBW_GDST]: the BIOS's last answer */
     uint32_t wb_run;          /* offset 156: the run the record belongs to */
     uint32_t wb_sense;        /* offset 160: tramp[CL_STUBW_SENSE]: the drive's last sense (0 from a copy) */
@@ -181,6 +203,11 @@ enum { CL_RUN_NONE = 0, CL_RUN_RUNNING = 1, CL_RUN_DONE = 2, CL_RUN_CRASHED = 3,
 #define CL_F_STUB_USED 2u      /* the way back went through the return stub */
 #define CL_F_DIAG 4u           /* args diag=1: the client and the stub hold each step on screen about a second */
 #define CL_F_STUB_NOBIOS 8u    /* lab arm (testprog "stubata"): the stub skips its BIOS rung (the drive's own read) */
+#define CL_F_RET_REBOOT 16u    /* ql-core4: LINK.TXT "return reboot" (the default): every ending sends END over the link,
+                                  saves the area, stops the adapter and restarts the console (BIOS reboot) into the
+                                  loader's GDEMU image; the stub is not armed. Cleared = "return stub" (the quick way) */
+#define CL_F_NOSAVE 32u        /* lab arm (testprog "nosave"): the full restart saves no copy and leaves no crumb, as
+                                  when nothing survives the reboot (the console, 2026-11-22): only END can tell the PC */
 
 #define CL_TRAMP_WORDS 32
 typedef struct {
@@ -233,7 +260,10 @@ enum { CL_STUBW_MAGIC = 0, CL_STUBW_STEP = 1, CL_STUBW_ERR = 2, CL_STUBW_ENTRIES
 enum { CL_STUB_STEP_ENTERED = 1, CL_STUB_STEP_QUIET = 2, CL_STUB_STEP_GDINIT = 3, CL_STUB_STEP_READ = 4,
        CL_STUB_STEP_SHA = 5, CL_STUB_STEP_JUMP = 6, CL_STUB_STEP_REBOOT = 7,
        CL_STUB_STEP_GDEMU = 8 /* v2 (ql-core2): the loader's GDEMU image selected */,
-       CL_STUB_STEP_ATA = 9 /* ql-core3: rung 2, the drive's own read */ };
+       CL_STUB_STEP_ATA = 9 /* ql-core3: rung 2, the drive's own read */,
+       /* ql-core4, the full restart (dcql_hw.h crumbs; no stub): */
+       CL_STUB_STEP_RUNNING = 16 /* the program runs (cl_init): seen after a restart = it ended without a word */,
+       CL_STUB_STEP_RESTART = 17 /* the program ended and took the full restart (dcql_bios_reboot) */ };
 /* tramp[CL_STUBW_ERR] (ql-core3): one byte per rung of the stub, 0 = not tried, else (stage << 4) | code:
      byte 0  rung 1, the BIOS's disc calls          stage 1 drive not ready (CMD_INIT), 2 no way back recorded,
      byte 1  rung 2, the drive's own read (no BIOS)       3 read, 4 SHA-256 mismatch; code = the failing call's
