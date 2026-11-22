@@ -26,7 +26,7 @@
    discs, so the BIOS boots the loader's image (in dev mode the loader is image 01 and the select changes nothing). */
 void __attribute__((noreturn)) dcql_bios_reboot(void) {
     irq_disable();   /* as arch_reboot */
-    *(volatile uint16_t *)0xffc00004u = 0xa500;   /* the watchdog off (WTCSR): no reset in the middle of the saves */
+    dcql_wdt_off();   /* no reset in the middle of the saves (ql-core5: WTCSR at 0xffc0000c; this wrote STBCR) */
     dcql_bba_quiet();   /* the adapter stopped: nothing lands in its memory or raises an interrupt from here on */
     if (cl_handoff_valid(H) && (H->h.flags & CL_F_NOSAVE)) {   /* lab arm: as if nothing survived the reboot */
         const uint32_t slot = H->h.reserved[CL_RSV_GDEMU_SLOT];

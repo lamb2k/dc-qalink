@@ -18,8 +18,11 @@ the stub shows red and three rows of bars for about 10 s: tall = 1, short = 0, f
   4 screen x3  the same program grabs the console's screen 3 times; the PNGs land in --out
   5 reset      the program waits; the PC sends RESET; the console must come back to the loader by the return stub
   6 back       the loader's beacon after all of it (the console never left the GDEMU slot)
-  --switch adds 7 disc switch: the program hands in DONE, selects the loader's GDEMU image and reboots through the
-  BIOS (the fallback of every way back); the loader must come back with that run's report.
+  --switch adds 8 disc switch: the program ends through the client (its END to the PC), selects the loader's GDEMU
+  image and reboots through the BIOS; END must come (ql-core5).
+  --hang adds, last (ql-core5): 9 wdt armed (a good program with wdt=1: END, WTCSR read back c7), 10 hang (interrupts
+  off with wdt=1: the console must restart by itself; no beacon in 60 s = power-cycle), and when 10 passes 11 after
+  (one short run: WTCSR as the BIOS left it, WOVF = the last reset was the watchdog's).
 Exit code 0 when every row passes. Numbers are console numbers only when run on a console.
 """
 import argparse, glob, json, os, subprocess, sys, time
@@ -176,13 +179,41 @@ def main():
         if ok5 and 'crash: event' not in t5 and 'CRASHED' not in t5:
             rows[-1]['pass'] = False
             rows[-1]['detail'] = 'back, but no CRASHED with registers'
-        if a.hang:   # the watchdog: interrupts off for good; the console restarts with no ending (rc 4, or 5 = LOST)
-            step('6b hang', ['run', a.program, '--args', 'report lines:2 hangoff', '--deadline', '90', '--wait', '150'],
-                 210, ok_rc=(4, 5), out='hang')
         step('7 back', ['status'], 90)
-        if a.switch:
-            step('8 disc switch', ['run', a.program, '--args', 'gdreboot' + dg, '--deadline', '60', '--wait', '120'],
-                 180, ok_rc=(0, 4), out='switch')
+        if a.switch:   # ql-core5: the disc switch ends through the client like every ending: its END must come (rc 0)
+            ok8, t8 = step('8 disc switch', ['run', a.program, '--args', 'gdreboot' + dg, '--deadline', '60', '--wait',
+                                             '120'], 180, out='switch')
+            if ok8 and 'END from the program' not in t8:
+                rows[-1]['pass'] = False
+                rows[-1]['detail'] = 'back, but no END from the program'
+        if a.hang:   # ql-core5: the watchdog rows last (a console that does not come back needs a power cycle)
+            def report_line(out, key):
+                for p in sorted(glob.glob(os.path.join(a.out, out, 'report-*.txt'))):
+                    for ln in open(p, encoding='latin-1').read().splitlines():
+                        if ln.startswith(key):
+                            return ln
+                return None
+            # 9: a good program with the watchdog armed: END as usual (rc 0), WTCSR read back c7 (counting); a restart
+            # without END here (rc 4) is a false watchdog reset of a good program
+            ok9, _ = step('9 wdt armed', ['run', a.program, '--args', 'report lines:5 wdt=1' + dg, '--deadline', '90',
+                                          '--wait', '150'], 210, out='wdtarmed')
+            w9 = report_line('wdtarmed', 'cl-wdt:')
+            rows[-1]['wdt'] = w9
+            print('             %s' % (w9 or 'no cl-wdt line in the report'), flush=True)
+            if ok9 and (not w9 or 'after arming c7' not in w9):
+                rows[-1]['pass'] = False
+                rows[-1]['detail'] = 'the watchdog did not read back as counting (WTCSR c7)'
+            # 10: interrupts off for good with the watchdog armed: the console must restart by itself, no ending
+            # (rc 4, or 5 = LOST from the crumb). No beacon in 60 s after the hang: power-cycle (the reset did not
+            # come, or the BIOS does not stop the watchdog the SH-4 keeps across its own reset: a reset loop)
+            ok10, _ = step('10 hang', ['run', a.program, '--args', 'report lines:2 hangoff wdt=1', '--deadline', '90',
+                                       '--wait', '150'], 210, ok_rc=(4, 5), out='hang')
+            if ok10:   # back by itself: one more short run reads WTCSR as the BIOS left it (WOVF = the watchdog's reset)
+                step('11 after', ['run', a.program, '--args', 'report lines:1', '--deadline', '60', '--wait', '120'], 180,
+                     out='after')
+                w11 = report_line('after', 'cl-wdt:')
+                rows[-1]['wdt'] = w11
+                print('             %s' % (w11 or 'no cl-wdt line in the report'), flush=True)
     print('\n%-12s %-5s %8s  %s' % ('step', 'result', 'seconds', 'detail'))
     for r in rows:
         print('%-12s %-5s %8.1f  %s' % (r['step'], 'PASS' if r['pass'] else 'FAIL', r['seconds'],
@@ -190,7 +221,8 @@ def main():
     for r in rows:
         if 'end_to_beacon' in r:
             print('  %-10s %s' % (r['step'].split()[0], r['end_to_beacon']))
-    allok = rows and all(r['pass'] for r in rows) and len(rows) == 7 + bool(a.switch) + bool(a.stub) + bool(a.hang)
+    hang_rows = 0 if not a.hang else 3 if any(r['step'] == '11 after' for r in rows) else 2
+    allok = rows and all(r['pass'] for r in rows) and len(rows) == 7 + bool(a.switch) + bool(a.stub) + hang_rows
     print('\n%s' % ('ALL PASS: push, run, report, screen grabs and RESET work on this console' if allok else
                     'NOT ALL PASS: the logs are in %s' % os.path.abspath(a.out)))
     with open(os.path.join(a.out, 'first-run.json'), 'w') as f:

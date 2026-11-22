@@ -21,6 +21,34 @@
 #define DCQL_HW_R16(a) (*(volatile uint16_t *)(a))
 #define DCQL_HW_R8(a) (*(volatile uint8_t *)(a))
 
+/* ---------------------------------------------------------------- the SH-4 watchdog (ql-core5)
+ * WTCNT at 0xffc00008, WTCSR at 0xffc0000c (the SH-4's clock pulse generator; KallistiOS hardware/wdt.c: WDT_BASE
+ * 0xffc00008, WTCSR at +4). Written 16 bits wide with a key in the high byte (0x5a WTCNT, 0xa5 WTCSR), read 8 bits
+ * wide. 0xffc00004 is STBCR (module stop and standby), not WTCSR: until ql-core5 every watchdog write here went to
+ * 0xffc00004, so the watchdog never ran (the console's frozen `hangoff` row, 2026-11-22).
+ * WTCSR: bit 7 TME (count), 6 WT/IT (1 = watchdog mode: a reset on overflow), 5 RSTS (0 = power-on reset), 4 WOVF
+ * (the watchdog overflowed), 3 IOVF, 2..0 CKS (7 = Pck/4096: one count 81.92 us at Pck 50 MHz, 256 counts 20.97 ms).
+ * The SH-4 does not clear WTCNT and WTCSR on the watchdog's own reset (only the RESET pin does): after it the counter
+ * keeps counting until the boot code stops it, and WOVF stays set for the next program to read. */
+#define DCQL_WTCNT 0xffc00008u
+#define DCQL_WTCSR 0xffc0000cu
+#define DCQL_WT_TME 0x80u
+#define DCQL_WT_WTIT 0x40u
+#define DCQL_WT_WOVF 0x10u
+#define DCQL_WT_CKS4096 7u
+#define DCQL_WDT_LIMIT_US 20971u
+static inline void dcql_wdt_feed(void) { DCQL_HW_R16(DCQL_WTCNT) = 0x5a00; }
+/* watchdog mode, power-on reset, Pck/4096; TME off while the clock is chosen (WOVF cleared), the counter at 0, TME */
+static inline void dcql_wdt_arm(void) {
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_WTIT | DCQL_WT_CKS4096);
+    DCQL_HW_R16(DCQL_WTCNT) = 0x5a00;
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_TME | DCQL_WT_WTIT | DCQL_WT_CKS4096);
+}
+/* stopped: TME and the mode bit cleared (no reset, no interrupt) */
+static inline void dcql_wdt_off(void) { DCQL_HW_R16(DCQL_WTCSR) = 0xa500; }
+static inline uint8_t dcql_wdt_csr(void) { return DCQL_HW_R8(DCQL_WTCSR); }
+static inline uint8_t dcql_wdt_cnt(void) { return DCQL_HW_R8(DCQL_WTCNT); }
+
 /* ---------------------------------------------------------------- the GD-ROM's ATA registers (G1 bus, P2) */
 #define DCQL_ATA_ALTSTATUS 0xa05f7018u
 #define DCQL_ATA_DATA 0xa05f7080u
