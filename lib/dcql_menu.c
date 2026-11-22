@@ -52,7 +52,7 @@ static struct {
     page_t pages[3 + DCQL_MENU_PAGES_MAX];
     int order[3 + DCQL_MENU_PAGES_MAX];   /* page kinds in the order L / R walks them */
     dcql_menu_row_t link[16];
-    int nlink, transport;
+    int nlink, transport, interlace;
     char connect_label[12];
     /* the Log page's ring */
     char log[DCQL_MENU_LOG_LINES][DCQL_MENU_LOG_COLS + 1];
@@ -74,7 +74,15 @@ static void text(const dcql_menu_target_t *t, int x, int y, const char *s, int c
         if (upper && ch >= 'a' && ch <= 'z') ch -= 32;
         if (ch == ' ') continue;
         if (ch < DCQL_FONT_FIRST || ch > DCQL_FONT_LAST) ch = '?';
-        t->glyph(x, y, dcql_font[ch - DCQL_FONT_FIRST], rgb, t->user);
+        const uint8_t *rows = dcql_font[ch - DCQL_FONT_FIRST];
+        if (g.interlace) {
+            uint8_t two[16];
+            two[0] = rows[0];
+            for (int r = 1; r < 16; r++) two[r] = (uint8_t)(rows[r] | rows[r - 1]);
+            t->glyph(x, y, two, rgb, t->user);
+        } else {
+            t->glyph(x, y, rows, rgb, t->user);
+        }
     }
 }
 static void text_r(const dcql_menu_target_t *t, int xr, int y, const char *s, int c, int maxc, int upper) {
@@ -601,6 +609,7 @@ void dcql_menu_draw(const dcql_menu_target_t *t) {
                                  : "(A) select   (B) back   (L)(R) page   (START) close", DCQL_MENU_TEXT, 70, 0);
 }
 const char *dcql_menu_snapshot_text(void) { return g.snap_text; }
+void dcql_menu_interlace(int on) { g.interlace = on; g.changes++; }
 
 /* ---------------------------------------------------------------------------------------------- way (b) */
 static void fb_box(int x, int y, int w, int h, uint32_t rgb, void *u) {

@@ -32,6 +32,7 @@ static const char LIVE_DEF[] = "program menu-cl.elf\nrate 60\nphase draw 8000 - 
 #endif
 
 static uint64_t now_ns(void) { return perf_cntr_timer_ns(); }
+void *volatile g_sink;   /* the heap control's allocations (kept, so the compiler cannot drop them) */
 
 /* ------------------------------------------------------------------ way (a): untextured PVR sprites */
 static pvr_sprite_hdr_t g_hdr;
@@ -46,7 +47,7 @@ static void spr_colour(uint32_t rgb) {
 }
 static void spr(float x, float y, float w, float h) {
     pvr_sprite_col_t v;
-    g_z += 0.0001f;
+    g_z += 0.01f;   /* each later box or glyph nearer: steps of 0.0001 were lost in Flycast's depth (title bar hidden, run f1) */
     v.flags = PVR_CMD_VERTEX_EOL;
     v.ax = x; v.ay = y; v.az = g_z;
     v.bx = x + w; v.by = y; v.bz = g_z;
@@ -146,7 +147,7 @@ static void shot(const char *name) {
     dcql_menu_fb_t f;
     dcql_menu_target_t t;
     if (dcql_menu_fb_displayed(&f, &t) < 0) { printf("QLSHOT %s none\n", name); return; }
-    printf("QLSHOT %s 640 480 565\n", name);
+    printf("QLSHOT %s 640 480 %s\n", name, f.rgb555 ? "1555" : "565");
     int changed = 0;
     for (int y = 0; y < 480; y++) {
         const uint16_t *row = f.pix + y * f.stride;
@@ -189,8 +190,9 @@ static void picture(uint32_t pad) {
     if (dcql_menu_is_open()) {
         pvr_sprite_cxt_t cxt;
         pvr_sprite_cxt_col(&cxt, PVR_LIST_OP_POLY);
+        cxt.depth.comparison = PVR_DEPTHCMP_GEQUAL;   /* a later draw at the same depth still wins */
         pvr_sprite_compile(&g_hdr, &cxt);
-        g_rgb = 0xffffffffu; g_z = 100.0f; g_sprites = 0;
+        g_rgb = 0xffffffffu; g_z = 10.0f; g_sprites = 0;
         dcql_menu_draw(&SPRITES);
         g_menu_way_a_ns = (int)(now_ns() - t1);
     }
@@ -231,9 +233,9 @@ static void measure(void) {
     uint64_t t1 = now_ns();
     for (int i = 0; i < N; i++) __asm__ volatile("" ::: "memory");
     uint64_t t2 = now_ns();
-    printf("QLMEAS closed_ns_per_call %llu loop_ns %llu calls %d\n", (unsigned long long)((t1 - t0) * 1000 / N),
-           (unsigned long long)((t2 - t1) * 1000 / N), N);
-    printf("QLMEAS closed_unit ns_x1000\n");
+    const unsigned long long call_ps = (t1 - t0) * 1000 / N, loop_ps = (t2 - t1) * 1000 / N;
+    printf("QLMEAS closed_ns_per_call %llu.%03llu loop_ns_per_pass %llu.%03llu calls %d\n", call_ps / 1000, call_ps % 1000,
+           loop_ps / 1000, loop_ps % 1000, N);
     /* open, way (a), each page: CPU time to submit the menu's sprites (20 pictures a page) */
     dcql_menu_open();
     static const char *const PAGES[4] = {"link", "example", "log", "snapshot"};
@@ -276,7 +278,7 @@ static void measure(void) {
     struct mallinfo m0 = mallinfo();
     for (int i = 0; i < 100; i++) { dcql_menu_open(); dcql_menu_draw(&t); dcql_menu_input(DCQL_MENU_RT); dcql_menu_input(0); dcql_menu_close(); }
     struct mallinfo m1 = mallinfo();
-    for (int i = 0; i < 100; i++) { dcql_menu_open(); dcql_menu_draw(&t); if (!malloc(64)) break; dcql_menu_close(); }
+    for (int i = 0; i < 100; i++) { dcql_menu_open(); dcql_menu_draw(&t); g_sink = malloc(64); dcql_menu_close(); }
     struct mallinfo m2 = mallinfo();
     printf("QLMEAS heap_100_open_close_delta %d control_planted_alloc_delta %d heap_in_use %d\n", m1.uordblks - m0.uordblks,
            m2.uordblks - m1.uordblks, m1.uordblks);

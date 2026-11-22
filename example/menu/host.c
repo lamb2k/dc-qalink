@@ -52,6 +52,12 @@ int main(int argc, char **argv) {
             if (DEMO_SHOTS[i].at == k && dcql_menu_is_open()) {
                 dcql_menu_draw(&t);
                 save(out, DEMO_SHOTS[i].name);
+                if (!strcmp(DEMO_SHOTS[i].name, "example")) {   /* the 480i option's still, for the owner's look check */
+                    dcql_menu_interlace(1);
+                    dcql_menu_draw(&t);
+                    save(out, "example-480i");
+                    dcql_menu_interlace(0);
+                }
                 printf("shot %s snapshot \"%s\"\n", DEMO_SHOTS[i].name, dcql_menu_snapshot_text());
             }
     }

@@ -130,6 +130,9 @@ int dcql_menu_stopped(uint32_t (*read_pad)(void *user), void *user);
    (size x size, 1 = dark) and returns size, or 0 if the text is longer than 106 bytes. */
 int dcql_menu_qr(const char *text, uint8_t *modules, int max_size);
 const char *dcql_menu_snapshot_text(void);           /* what the last Snapshot page's code holds */
+/* 480i: each glyph row is also drawn one line lower, so a one-line horizontal stroke shows in both fields of an
+   interlaced picture (less flicker on a CRT, a bolder look). Off by default: the approved design B look. */
+void dcql_menu_interlace(int on);
 
 #ifdef __cplusplus
 }

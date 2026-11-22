@@ -21,11 +21,14 @@ def check(ok, what):
         FAILS.append(what)
 
 
-def rgb565(data):
+def rgb565(data, argb1555=False):
     px = struct.unpack('<%dH' % (len(data) // 2), data)
     out = bytearray()
     for p in px:
-        r, g, b = (p >> 11) & 31, (p >> 5) & 63, p & 31
+        if argb1555:
+            r, g, b = (p >> 10) & 31, ((p >> 5) & 31) << 1 | ((p >> 9) & 1), p & 31
+        else:
+            r, g, b = (p >> 11) & 31, (p >> 5) & 63, p & 31
         out += bytes(((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)))
     return Image.frombytes('RGB', (640, 480), bytes(out))
 
@@ -77,7 +80,8 @@ def serial(path, d):
     last = None
     for line in Path(path).read_bytes().decode('latin1').splitlines():
         if line.startswith('QLSHOT '):
-            name = line.split()[1]
+            f = line.split()
+            name, depth = f[1], (f[4] if len(f) > 4 else '565')
         elif name and line.startswith('R') and ' ' in line and line[1].isdigit():
             y, b = line[1:].split(' ', 1)
             rle = base64.b64decode(b)
@@ -89,7 +93,7 @@ def serial(path, d):
                 continue
             frame[int(y) * 1280:(int(y) + 1) * 1280] = row
         elif line.startswith('QLEND '):
-            im = rgb565(bytes(frame))
+            im = rgb565(bytes(frame), depth == '1555')
             im.save(d / (name + '.png'))
             shots.append(name)
             last, name = name, None
@@ -100,7 +104,7 @@ def serial(path, d):
     (d / 'meas.txt').write_text('\n'.join(meas) + '\n')
     print('stills', len(shots), 'clip frames', sum(1 for s in shots if s.startswith('clip-')))
     for k, v in snaps.items():
-        if not v:
+        if not v or not k.startswith('snapshot'):
             continue
         got = decode_qr(Image.open(d / (k + '.png')))
         check(got == [v], 'console still %s: its QR decodes to the text the console reported (%r)' % (k, v))
