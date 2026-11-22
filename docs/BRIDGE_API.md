@@ -86,6 +86,32 @@ and the parsed **`summary`**: `exit`, `state`, `seconds`, `pictures`, `numbers[]
 (report lines of the form `@ label = value unit`, and each phase's mean and worst when the program sent records),
 `notes`, `crash`, `tier`. Crash symbols and source lines (from an ELF with symbols) are for later.
 
+## Builds (the workspace's anchor; v0.2-netdisc, additive to contract 1)
+A **build record** is made at every push (`POST /v0/runs`, `POST /v0/selftest`): `id` (`b` + 12 hex: a hash of the
+program's SHA-256, the disc manifest's SHA-256, the loader's SHA prefix, the arguments and the tier, so the same push
+again is the same build and its runs gather under it), `program` {`name`, `sha256`, `bytes`, `commit`}, `disc`
+{`manifest`, `mode` overlay/whole, `files`, `served`, `base`, `overlay`} (null without a network disc), `loader`
+{`build`, `sha8`, `protocol`}, `args`, `tier`, `created`, `last`, `by`, `runs` (run ids). Kept in `<data>/builds.json`.
+A push may name its git commit: multipart field `commit`, or `X-Build-Commit` (7 to 40 hex digits, else 400).
+
+The bridge stamps the build's id as **`build`** on every record it writes: each session record (rows, counters, logs,
+trace, grabs, disc reads, run events), every run (`build`), every still's JSON, every line of `calls.log` (control and
+run calls, MCP included); `status.build` names the current build. A program started on the console (not pushed) has
+no build.
+
+| Method and path | Level | What |
+|---|---|---|
+| `GET /v0/builds` | read | `{builds: [build], current}`, newest first |
+| `GET /v0/builds/{id}` | read | One build |
+| `GET /v0/disc` | read | The network disc: `mode` (`overlay` / `whole`, or null with a `note` when none is served), `files[]` {`path`, `size`, `sha256`, `side` (`pc` served / `disc` read from GDEMU), `source` (`base` / `overlay`), `changed`, `new`, `base_sha256`}, `sha256` (the manifest's), `count`, `served`, `base`, `overlay`, `stats` (requests, resent requests, pieces, bytes, the console's round trip `request_ms` {`n`, `mean`, `p50`, `p99`, `worst`}, `program_reads` per side {`records`, `bytes`, `ms`, `MBps`}) |
+| `GET /v0/disc/reads?limit` | read | `{reads: [disc read record], total}` |
+| `GET /v0/disc/file?path=` | read | A disc file's bytes as the console sees it with the network disc on (overlay first), for the Assets workspace |
+| `GET /v0/plugins`, `GET /v0/plugins/{name}.js` | read | Asset decoder plugins (ES modules) from `--asset-plugins DIR`, a folder outside any repository: a game's own formats |
+
+Bridge options: `--disc <folder | .gdi | .iso>` the base, `--overlay <folder>` the changed files, `--whole` serve the
+whole disc, `--asset-plugins <folder>`. `pc/dcql_loop.py run|serve` take `--disc`, `--overlay`, `--whole` too and write
+`disc-manifest.json` and `disc-reads.jsonl` in `--out`. docs/NETDISC.md has the console side and the wire.
+
 ## The live stream: `GET /v0/live` (Server-Sent Events)
 SSE, not WebSocket (one of them, as ruled; SSE needs no library on either side and resumes by itself). Each event's
 `data:` is one JSON object with **`t`** (its type) and **`s`** (seconds on the session clock).
@@ -106,6 +132,12 @@ version 1): `link` {`state`, `role` loader/program, `console_ip`, `transport`, `
 {`run`, `seq`, `text`}, `file` {`run`, `path`, `op`}, `still` {`run`, `id`, `picture`, `crc_ok`}, `back` {`run`,
 `state`, `way_back`, `seconds`, `error`}, `reset` {`run`, `rung`, `seconds`}.
 
+**Session format version 2** (v0.2-netdisc): `meta.build` is the build record and every record carries `build` (its id)
+when the session has one; `disc` records are the network disc's: `mount` {`mode`, `served`, `files`, `manifest`},
+`open` {`path`, `size`, `side`}, `read` {`path`, `off`, `bytes`, `ms` (the console's time inside its read calls),
+`calls` (sequential reads merged), `side`}. A version-1 file opens as before (no build); a reader of version 1 refuses
+version 2 by its version check, so QA Link Cloud reads both from its `netdisc` branch on.
+
 ## Sessions
 Every program that links (pushed by the bridge or started on the console) is one session, written as it arrives to
 `<data>/sessions/<yyyymmdd-hhmmss>-<run>.jsonl` in the session format: the stream written down. Stills go to
@@ -115,6 +147,8 @@ Every program that links (pushed by the bridge or started on the console) is one
 `include/dcql_loop.h` (protocol 2) and, for live data, `pc/bridge/wire.py` / `lib/dcql_live.h`: additive message types
 (REC 0x0d, LIVEDEF 0x0e, TRACE 0x0f, CMDACK 0x20 from the console; SUB 0x1c, GRAB 0x1d, CMD 0x1e from the PC; LINE with
 `b` = 1..4 for game log lines). A loader or client that does not know them ignores them; 0.1.0's modem API is unchanged.
+The network disc adds DOPEN 0x27, DREAD 0x28, DCLOSE 0x29, DLOG 0x2c (console to PC) and DINFO 0x2a, DDATA 0x2b (PC to
+console); END 0x21 / ENDACK 0x1f are the run's ending (ql-core4).
 
 ## Not yet
 Memory reads, live assets, pad scripts the program registers, crash symbols and source lines, the modem's summary mode

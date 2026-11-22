@@ -2,16 +2,22 @@
 them to a file as they arrive, and the queries the API answers from them (summary, slowest pictures, trace, log).
 
 Every record carries `t` (its type) and `s` (seconds on the session clock). Run events (push, verdict, exec, line, file,
-still, back, reset, link) are record types a session-format-1 reader may ignore, so the format version stays 1."""
+still, back, reset, link) are record types a session-format-1 reader may ignore.
+
+Version 2 (lane ql-disc, 2026-11-22): the build is the anchor. `meta.build` is the build record (program sha256, name,
+commit, disc manifest, loader, args, tier; docs/BRIDGE_API.md "Builds") and every record carries `build` (its id) when
+the session has one; `disc` records (mount, open, read: path, off, bytes, ms, side) are the network disc's. A version-1
+file is still read as before (no build)."""
 import json, os, threading, time
 
 FORMAT = 'dc-qalink.session'
-VERSION = 1
+VERSION = 2
 
 
 class Session:
-    def __init__(self, folder, sid, device, tier, label, program=None):
+    def __init__(self, folder, sid, device, tier, label, program=None, build=None):
         self.id = sid
+        self.build_id = build['id'] if build else None
         self.t0 = time.time()
         self.lock = threading.RLock()
         self.records = []          # every record but meta, in arrival order
@@ -32,6 +38,8 @@ class Session:
                      'tierDetail': 'bridge %s; numbers measured by the program on the %s' % (sid, tier),
                      'source': 'dc-qalink bridge', 'recorded': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                      'rate': 60, 'units': 'ms per picture', 'phases': [], 'counters': [], 'lanes': []}
+        if build:
+            self.meta['build'] = dict(build)
         self.path = os.path.join(folder, '%s.jsonl' % sid) if folder else None
         self.f = open(self.path, 'w', encoding='utf-8', newline='\n') if self.path else None
         self._write(self.meta)
@@ -49,6 +57,8 @@ class Session:
         """Adds a record (t set by the caller, s added here), writes it down and tells the live listeners."""
         with self.lock:
             r.setdefault('s', self.s())
+            if self.build_id:
+                r.setdefault('build', self.build_id)
             self.records.append(r)
             t = r['t']
             if t == 'row':
@@ -154,5 +164,5 @@ class Session:
             return {'id': self.id, 'label': self.meta['label'], 'device': self.device.get('name', ''),
                     'started': self.meta['recorded'], 'recorded': self.meta['recorded'],
                     'ended': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) if self.f is None else None,
-                    'pictures': self.max_n, 'tier': self.meta['tier'], 'runs': 0,
+                    'pictures': self.max_n, 'tier': self.meta['tier'], 'runs': 0, 'build': self.build_id,
                     'bytes': os.path.getsize(self.path) if self.path and os.path.exists(self.path) else 0}

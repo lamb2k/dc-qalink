@@ -68,10 +68,11 @@ class Assets:
 
     def build_id(self):
         """The bridge's current build record id when it keeps one (ql-disc's L2b item 7); None before that lands."""
-        br = getattr(self.b, 'build', None) or getattr(self.b, 'current_build', None)
-        if isinstance(br, dict):
-            return br.get('id')
-        return getattr(br, 'id', None)
+        bid = getattr(self.b, 'build_id', None)       # ql-disc c8a22d7: Bridge.build_id, Bridge.build the record
+        if bid:
+            return bid
+        br = getattr(self.b, 'build', None)
+        return br.get('id') if isinstance(br, dict) else None
 
     # ------------------------------------------------------------------ the viewer on the console
     def viewer_linked(self):

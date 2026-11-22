@@ -6,6 +6,7 @@ import hashlib, itertools, json, os, queue, random, re, socket, struct, sys, thr
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import dcql_loop as cl   # noqa: E402
+import dcql_disc         # noqa: E402  (the network disc, lane ql-disc)
 from . import wire       # noqa: E402
 from .live import Session   # noqa: E402
 
@@ -287,8 +288,10 @@ class Stills:
 class Run:
     _n = itertools.count(1)
 
-    def __init__(self, name, raw, args, deadline_s, files, reset_after_s, by):
+    def __init__(self, name, raw, args, deadline_s, files, reset_after_s, by, commit=None):
         self.sid = random.getrandbits(32) | 1
+        self.commit = commit
+        self.build = None        # the build record's id (Bridge.make_build)
         self.id = '%08x' % self.sid
         self.name, self.raw, self.args = name, raw, args
         self.sha256 = hashlib.sha256(raw).hexdigest()
@@ -315,7 +318,7 @@ class Run:
              'args': self.args, 'state': self.state, 'times': self.times, 'way_back': self.way_back, 'by': self.by,
              'queued_at': self.queued_at, 'ended_at': self.ended_at, 'device': device_name, 'tier': tier,
              'deadline_s': self.deadline_s, 'files': self.files_stats, 'stills': self.stills,
-             'serial_lines': len(self.serial), 'error': self.error, 'summary': self.summary}
+             'serial_lines': len(self.serial), 'error': self.error, 'summary': self.summary, 'build': self.build}
         if self.crash:
             j['crash'] = self.crash
         if self.transfer:
@@ -387,7 +390,8 @@ class LinkLock:
 
 class Bridge:
     def __init__(self, data_dir, bind=('0.0.0.0', cl.PORT), console='auto', device_kind=None, files_root=None,
-                 selftest=None, loader_disc=None, level='run', log=None, autoconnect=True, only_local=True):
+                 selftest=None, loader_disc=None, level='run', log=None, autoconnect=True, only_local=True,
+                 disc=None, overlay=None, whole=False):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
         self.sessions_dir = os.path.join(self.data_dir, 'sessions')
@@ -433,6 +437,24 @@ class Bridge:
         self.rx_hist = []
         self.stop_flag = threading.Event()
         self.audit = open(os.path.join(self.data_dir, 'calls.log'), 'a', encoding='utf-8')
+        # builds (lane ql-disc): the workspace's anchor; one record per distinct program + disc + loader + args + tier
+        self.builds_path = os.path.join(self.data_dir, 'builds.json')
+        self.builds = {}
+        if os.path.isfile(self.builds_path):
+            try:
+                self.builds = json.load(open(self.builds_path, encoding='utf-8'))
+            except (OSError, ValueError):
+                self.builds = {}
+        self.build_id = None         # the current build's id (the last pushed, or the linked program's)
+        self.disc_args = (disc, overlay, bool(whole))
+        self.asset_plugins = None    # a folder of decoder plugins (ES modules) for QA Link Cloud's Assets workspace
+        self.disc = None
+        if disc or overlay:
+            self.disc = dcql_disc.DiscService(disc, overlay, whole, self.log, self.record,
+                                              os.path.join(self.data_dir, 'disc-hashes.json'))
+            m = self.disc.manifest()
+            self.log('network disc: %s, %d files, %d from the PC, manifest %s' % (m['mode'], m['count'], m['served'],
+                                                                                m['sha256'][:16]))
         threading.Thread(target=self._pump, daemon=True, name='bridge-pump').start()
         threading.Thread(target=self._worker, daemon=True, name='bridge-runs').start()
         threading.Thread(target=self._ticker, daemon=True, name='bridge-status').start()
@@ -448,7 +470,8 @@ class Bridge:
             self._ext_log(line)
 
     def audit_call(self, who, level, what, result):
-        self.audit.write(json.dumps({'at': now_iso(), 'who': who, 'level': level, 'call': what, 'result': result}) + '\n')
+        self.audit.write(json.dumps({'at': now_iso(), 'who': who, 'level': level, 'call': what, 'result': result,
+                                     'build': self.build_id}) + '\n')
         self.audit.flush()
 
     def tier(self):
@@ -490,7 +513,54 @@ class Bridge:
                 'n': self.current.max_n if self.current else 0, 'level': self.level, 'tier': self.tier(),
                 'queue': [r.id for r in list(self.queue.queue)], 'active_run': self.active.id if self.active else None,
                 'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
-                'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused}
+                'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build_id,
+                'disc': self.disc.manifest()['mode'] if self.disc else None}
+
+    # ------------------------------------------------------------------ builds (lane ql-disc)
+    def rescan_disc(self):
+        """The overlay read again (a developer changed files since the bridge started); the hash cache keeps it cheap."""
+        if self.disc is None:
+            return None
+        d, o, w = self.disc_args
+        self.disc = dcql_disc.DiscService(d, o, w, self.log, self.record, os.path.join(self.data_dir, 'disc-hashes.json'))
+        return self.disc.manifest()
+
+    def make_build(self, name, sha256, nbytes, args, commit=None, by='api'):
+        """The build record of a push: its id is a hash of what makes it this build (program, disc manifest, loader,
+        arguments, tier), so the same push again is the same build and its runs gather under it."""
+        h = self.loop.hello or {}
+        m = self.rescan_disc() if self.disc else None
+        loader = {'build': h.get('build'), 'sha8': h.get('loader_sha8'), 'protocol': h.get('proto')} if h else None
+        tier = self.tier()
+        ident = '|'.join([sha256, m['sha256'] if m else '-', (loader or {}).get('sha8') or '-', args or '', tier])
+        bid = 'b' + hashlib.sha256(ident.encode('utf-8')).hexdigest()[:12]
+        b = self.builds.get(bid)
+        if b is None:
+            b = self.builds[bid] = {
+                'id': bid, 'program': {'name': name, 'sha256': sha256, 'bytes': nbytes, 'commit': commit},
+                'disc': {'manifest': m['sha256'], 'mode': m['mode'], 'files': m['count'], 'served': m['served'],
+                         'base': m['base'], 'overlay': m['overlay']} if m else None,
+                'loader': loader, 'args': args or '', 'tier': tier, 'created': now_iso(), 'by': by, 'runs': []}
+        elif commit and not b['program'].get('commit'):
+            b['program']['commit'] = commit
+        b['last'] = now_iso()
+        self.build_id = bid
+        self.save_builds()
+        return b
+
+    @property
+    def build(self):
+        """The current build record (a dict with `id`), or None: what a record is stamped with (its `id`)."""
+        return self.builds.get(self.build_id) if self.build_id else None
+
+    def save_builds(self):
+        try:
+            json.dump(self.builds, open(self.builds_path, 'w', encoding='utf-8'), indent=1)
+        except OSError:
+            pass
+
+    def build_list(self):
+        return sorted(self.builds.values(), key=lambda b: b.get('last') or b['created'], reverse=True)
 
     def set_autoconnect(self, on):
         with self.t.lock:
@@ -519,9 +589,11 @@ class Bridge:
     def new_session(self, run_sid, program):
         sid = '%s-%08x' % (time.strftime('%Y%m%d-%H%M%S'), run_sid)
         dev = self.device()
+        r = self.runs.get('%08x' % run_sid)
+        build = self.builds.get(r.build) if r is not None and r.build else None
         s = Session(self.sessions_dir, sid, {'kind': dev['kind'], 'name': dev['name'],
                                              'transport': 'bba' if dev['transport'] == 'adapter' else 'modem'},
-                    self.tier(), '%s on %s' % (program.get('name') or 'program', dev['name']), program)
+                    self.tier(), '%s on %s' % (program.get('name') or 'program', dev['name']), program, build)
         s.listeners.append(self.emit)
         if self.current is not None and self.current is not s:
             self.current.close('another program linked')
@@ -544,6 +616,9 @@ class Bridge:
         if len(self.rx_hist) > 4000:
             del self.rx_hist[:2000]
         tier = self.tier()
+        if self.disc is not None and typ in dcql_disc.DISC_TYPES_FROM_CONSOLE:
+            self.disc.handle(self.loop, typ, run, a, b, pl)
+            return
         if typ == cl.HELLO and len(pl) >= 96:
             h = cl.parse_hello(pl)
             if h['role'] == 2:
@@ -596,6 +671,7 @@ class Bridge:
         elif typ == cl.STILL:
             def held(j):
                 rr = self.runs.get(j['run'])
+                j['build'] = rr.build if rr is not None else self.build_id
                 if rr is not None:
                     rr.stills.append(j['id'])
                 self.record({'t': 'still', 'run': j['run'], 'id': j['id'], 'picture': j['picture'], 'crc_ok': j['crc_ok']}, s)
@@ -726,10 +802,14 @@ class Bridge:
                              'error': run.error})
 
     # ------------------------------------------------------------------ runs
-    def submit(self, name, raw, args='', deadline_s=0, files=None, reset_after_s=None, by='api'):
+    def submit(self, name, raw, args='', deadline_s=0, files=None, reset_after_s=None, by='api', commit=None):
         if cl.LOAD_ADDR + len(raw) + 4 > cl.IMAGE_END:
             raise ValueError('program too large: %d bytes' % len(raw))
-        r = Run(name, raw, args, int(deadline_s or 0), files, reset_after_s, by)
+        r = Run(name, raw, args, int(deadline_s or 0), files, reset_after_s, by, commit)
+        b = self.make_build(name, r.sha256, len(raw), args, commit, by)
+        r.build = b['id']
+        b['runs'].append(r.id)
+        self.save_builds()
         self.runs[r.id] = r
         self.run_order.append(r.id)
         self.queue.put(r)
@@ -801,6 +881,8 @@ class Bridge:
             self.client_left('program ended')
             run.times['run_s'] = round(time.time() - t_exec, 3)
             run.files_stats = self.file_service(run.sid).summary()
+            if self.disc is not None:
+                run.files_stats = dict(run.files_stats, disc=self.disc.summary())
             if hb is None:
                 run.state, run.error = 'lost', 'the loader did not come back within %d s' % wait_s
                 return
