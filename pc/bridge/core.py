@@ -470,7 +470,8 @@ class Bridge:
                         'stub_bytes': h['stub_bytes'], 'boot_count': h['boot_count'],
                         'pushed': bool(h['flags'] & cl.HF_PUSHED)} if h else None,
              'ident': self.t.ident(h) if h else None, **self.t.card(h or {}),
-             'program': {'run': '%08x' % self.client_run, 'linked': self.client is not None} if self.client_run else None}
+             'program': {'run': '%08x' % self.client_run, 'linked': self.client is not None,
+                         'hello_run': '%08x' % (self.client or {}).get('hello_run', 0)} if self.client_run else None}
         if self.active:
             d['state'] = 'running' if self.active.state == 'running' else self.active.state
             d['last_run'] = {'id': self.active.id, 'state': self.active.state}
@@ -545,6 +546,7 @@ class Bridge:
         if typ == cl.HELLO and len(pl) >= 96:
             h = cl.parse_hello(pl)
             if h['role'] == 2:
+                h['hello_run'] = h['run_id']   # as the program's HELLO said it (before 6465d72 a client said 0)
                 if not h['run_id'] and self.active is not None:
                     # the program on Flycast reported run 0 (its loader hand-off carries no run id: ql-core2's
                     # side); a program that links while a pushed run is on is that run (Flycast f2)

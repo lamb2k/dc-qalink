@@ -93,6 +93,9 @@ int main(int argc, char **argv) {
     int secs = (p = strstr(args, "secs=")) ? atoi(p + 5) : 60;
     const uint32_t slow = (p = strstr(args, "slow=")) ? (uint32_t)atoi(p + 5) : 0;
     const int live = !strstr(args, "nolive");
+    /* linkoff: live data declared but the link reported down to it, so every picture takes the link-off path (the
+       limits row "cost each picture, link off"); the report still goes back through the hand-off */
+    const int linkoff = strstr(args, "linkoff") != NULL;
     for (int i = 0; i < 640 * 120; ++i) vram_s[i] = 0x0841;
     bfont_draw_str_ex(vram_s + 20 * 640 + 20, 640, 0xffe0, 0x0841, 16, true, "dc-qalink live example");
     char line[96];
@@ -102,8 +105,10 @@ int main(int argc, char **argv) {
     if (live) {
         dcql_live_declare(DEF);
         dcql_live_on_command(on_cmd, NULL);
+        if (linkoff) dcql_live_link(0);
     }
-    printf("liveprog: link %s, %d s, slow %u us, live %d\n", up ? "up" : "down", secs, (unsigned)slow, live);
+    printf("liveprog: link %s, %d s, slow %u us, live %d%s\n", up ? "up" : "down", secs, (unsigned)slow, live,
+           linkoff ? " (link off to live data)" : "");
     uint64_t sum_draw = 0, sum_live = 0, sum_frame = 0, max_live = 0;
     uint32_t n = 0, measured = 0;
     const uint64_t t_end = timer_ms_gettime64() + (uint64_t)secs * 1000u;
