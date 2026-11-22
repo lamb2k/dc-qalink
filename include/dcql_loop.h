@@ -65,7 +65,10 @@ enum {
        is a game log line (payload u32 picture + text). PC -> console: SUB channels, GRAB the displayed picture as a
        STILL (its head's reserved word = the request), CMD pause / resume / step / warp / option / pad. */
     CL_REC = 0x0d, CL_LIVEDEF = 0x0e, CL_TRACE = 0x0f, CL_CMDACK = 0x20,
-    CL_SUB = 0x1c, CL_GRAB = 0x1d, CL_CMD = 0x1e
+    CL_SUB = 0x1c, CL_GRAB = 0x1d, CL_CMD = 0x1e,
+    /* v2 network disc (lane ql-disc; lib/dcql_disc.h, pc/dcql_disc.py; additive). console -> PC: DOPEN, DREAD,
+       DCLOSE, DLOG; PC -> console: DINFO, DDATA */
+    CL_DOPEN = 0x21, CL_DREAD = 0x22, CL_DCLOSE = 0x23, CL_DINFO = 0x24, CL_DDATA = 0x25, CL_DLOG = 0x26
 };
 
 /* VERDICT / ERR codes */

@@ -193,6 +193,32 @@ def make_handler(bridge, level='run'):
                                             'linked': bridge.client is not None})
                 if p == '/v0/loader':
                     return self.loader()
+                # builds and the network disc (lane ql-disc)
+                if p == '/v0/builds':
+                    return self.reply(200, {'builds': bridge.build_list(), 'current': bridge.build})
+                m = re.match(r'^/v0/builds/(b[0-9a-f]{12})$', p)
+                if m:
+                    b = bridge.builds.get(m[1])
+                    return self.reply(200, b) if b else self.err(404, 'no build %s' % m[1])
+                if p == '/v0/disc':
+                    if bridge.disc is None:
+                        return self.reply(200, {'mode': None, 'files': [], 'note': 'no network disc: start the bridge '
+                                                'with --disc <folder or .gdi/.iso> and/or --overlay <folder>'})
+                    return self.reply(200, dict(bridge.disc.manifest(), stats=bridge.disc.summary()))
+                if p == '/v0/disc/reads':
+                    if bridge.disc is None:
+                        return self.reply(200, {'reads': []})
+                    lim = max(1, min(5000, qi('limit', 500)))
+                    return self.reply(200, {'reads': bridge.disc.reads[-lim:], 'total': len(bridge.disc.reads)})
+                if p == '/v0/disc/file':
+                    if bridge.disc is None:
+                        return self.err(404, 'no network disc')
+                    path = (q.get('path') or [''])[0]
+                    try:
+                        data = bridge.disc.file_bytes(path)
+                    except FileNotFoundError:
+                        return self.err(404, 'no file %s on the served disc' % path)
+                    return self.reply(200, data, 'application/octet-stream')
                 if p == '/v0/calls':
                     return self.reply(200, {'note': 'see calls.log in the bridge data folder'})
                 return self.err(404, 'no route %s' % p)
@@ -301,10 +327,12 @@ def make_handler(bridge, level='run'):
                 sha, args = field('sha256'), field('args')
                 deadline, files, reset_after = field('deadline_s', '0'), field('files', '') or None, field('reset_after_s')
                 name = field('name') or name or 'program.elf'
+                commit = field('commit') or None   # ql-disc: the build record's git commit, when the pusher knows it
             else:   # application/octet-stream with headers (scripts)
                 raw, name = body, self.headers.get('X-Build-Name') or 'program.elf'
                 sha, args = self.headers.get('X-Build-Sha256', ''), self.headers.get('X-Args', '')
                 deadline, files, reset_after = self.headers.get('X-Deadline-S', '0'), None, None
+                commit = self.headers.get('X-Build-Commit') or None
             got = hashlib.sha256(raw).hexdigest()
             if not sha:
                 self.err(400, 'a push needs the sha256 of the program (the bridge takes builds only with a matching hash)')
@@ -315,8 +343,11 @@ def make_handler(bridge, level='run'):
             if files and ('/' in files or '\\' in files or '..' in files):
                 self.err(400, 'files names a served folder the bridge knows, never a path')
                 return None
+            if commit and not re.match(r'^[0-9a-fA-F]{7,40}$', commit):
+                self.err(400, 'commit: a git commit id (7 to 40 hex digits)')
+                return None
             return bridge.submit(name, raw, args, int(float(deadline or 0)), files,
-                                 float(reset_after) if reset_after else None, who)
+                                 float(reset_after) if reset_after else None, who, commit)
 
         def sessions(self):
             out = []
@@ -336,7 +367,8 @@ def make_handler(bridge, level='run'):
                     continue
                 out.append({'id': sid, 'label': meta.get('label'), 'device': (meta.get('device') or {}).get('name'),
                             'started': meta.get('recorded'), 'recorded': meta.get('recorded'), 'tier': meta.get('tier'),
-                            'pictures': None, 'bytes': os.path.getsize(path)})
+                            'pictures': None, 'bytes': os.path.getsize(path), 'version': meta.get('version', 1),
+                            'build': (meta.get('build') or {}).get('id')})   # ql-disc: format 2 names its build
             return out
 
         def loader(self):
