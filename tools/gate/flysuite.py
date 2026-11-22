@@ -323,6 +323,15 @@ def check_loop(r, rd, res):
     else:   # a result that came by END (the full restart, nothing kept): the PC tool writes report-<run>.txt from it
         fs = sorted(glob.glob(os.path.join(rd, 'report-*.txt')), key=os.path.getmtime)
         text = open(fs[-1], encoding='latin-1').read() if fs else ''
+    at = {}   # the program's headline lines: "@ <name> = <number> ..."
+    for line in text.splitlines():
+        if line.startswith('@ ') and '=' in line:
+            k, _, v = line[2:].partition('=')
+            try:
+                at[k.strip()] = float(v.split()[0])
+            except (ValueError, IndexError):
+                pass
+    res['at'] = at
     for k, want in must.items():
         if k == 'state':
             if rep:
@@ -347,6 +356,12 @@ def check_loop(r, rd, res):
         elif k == 'report_has':
             for w in want:
                 out.append(('report has "%s"' % w, w in text, len(text)))
+        elif k == 'report_lacks':
+            for w in want:
+                out.append(('report has no "%s"' % w, bool(text) and w not in text, len(text)))
+        elif k == 'report_exit':
+            ex = rep.get('exit') if rep else (end.get('exit') if isinstance(end, dict) else None)
+            out.append(('program exit %s' % want, ex == want, ex))
         elif k == 'report_by':
             out.append(('result came by %s' % want, want in str(rep.get('by', '')), rep.get('by')))
         elif k == 'crash_registers':
@@ -381,7 +396,8 @@ def main_run(a):
     rows, cites, notes = load_plans(a.plan)
     py = sys.executable
     loop_py = os.path.join(a.tree, 'pc', 'dcql_loop.py')
-    m = {'testprog': os.path.join(a.build, 'testprog.elf'), 'liveprog': os.path.join(a.build, 'liveprog.elf')}
+    m = {'testprog': os.path.join(a.build, 'testprog.elf'), 'liveprog': os.path.join(a.build, 'liveprog.elf'),
+         'build': a.build, 'fixtures': a.fixtures or os.path.join(out, 'fixtures'), 'disc': a.disc}
     loc = local_addresses(a.pc_ip)
     result = {'tier': 'Flycast (function check; Halo patched build)', 'flycast': a.flycast, 'disc': a.disc,
               'ports': {'loader': a.port, 'console_lport': a.lport, 'ctl': a.ctl, 'http': a.http, 'mcp_http': a.mcp_http},
@@ -627,6 +643,8 @@ def main_run(a):
                 v = row
                 for k in src[5:].split('.'):
                     v = v.get(k) if isinstance(v, dict) else None
+            elif src.startswith('at:'):
+                v = (row.get('at') or {}).get(src[3:])
             elif src.startswith('mcp:'):
                 _, pre, field = src.split(':', 2)
                 hit = [x for x in row.get('mcp', []) if x['name'].startswith(pre)]
@@ -708,6 +726,7 @@ def main():
     r.add_argument('--plan', action='append', required=True)
     r.add_argument('--boot-wait', type=float, default=20.0)
     r.add_argument('--lock')
+    r.add_argument('--fixtures', help='test data the rows name as {fixtures} (a lane plan\'s disc_prep makes it)')
     a = ap.parse_args()
     return machine(a) if a.cmd == 'machine' else main_run(a)
 

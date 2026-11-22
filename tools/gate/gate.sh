@@ -187,11 +187,17 @@ H=$W/host
 test_row() {   # name, expect (0 or fail), command...
   local name=$1 expect=$2 log=$H/$1.log rc; shift 2
   (cd "$S" && timeout 900 "$@") > "$log" 2>&1; rc=$?
+  local again=""
+  if [ $rc -ne 0 ] && grep -q 'Address already in use' "$log"; then   # a port another program held: once more
+    mv "$log" "$log.clash"
+    (cd "$S" && timeout 900 "$@") > "$log" 2>&1; rc=$?
+    again=" (run again after a port clash: $1.log.clash)"
+  fi
   local tail; tail=$(grep -E '[0-9]+ of [0-9]+|passed|^OK|^FAILED|Ran [0-9]+|PASS|FAIL' "$log" | tail -2 | tr '\n' ' ' | cut -c1-200)
   if { [ "$expect" = 0 ] && [ $rc -eq 0 ]; } || { [ "$expect" = fail ] && [ $rc -ne 0 ] && [ $rc -ne 124 ]; }; then
-    row "test $name" PASS "rc $rc${expect:+ (must: $expect)}; $tail"
+    row "test $name" PASS "rc $rc${expect:+ (must: $expect)}$again; $tail"
   else
-    row "test $name" FAIL "rc $rc (must: $expect); host/$name.log; $tail"
+    row "test $name" FAIL "rc $rc (must: $expect)$again; host/$name.log; $tail"
   fi
 }
 pyfiles=$(cd "$S" && git ls-files '*.py' | tr '\n' ' ')
@@ -287,6 +293,19 @@ else
     [ -n "${GATE_LINK_EXTRA:-}" ] && echo "$GATE_LINK_EXTRA" | tr ';' '\n'
     for p in "${PLANS[@]}"; do python3 -c 'import json,sys; [print(l) for l in json.load(open(sys.argv[1])).get("linktxt",[])]' "$p"; done
   } > "$D/LINK.TXT"
+  # a lane's test data: {"disc_prep": "<sh, run in the merged tree>"} with GATE_DISCDATA (files on the loader disc) and
+  # GATE_FIXTURES (files the PC serves; {fixtures} in the rows)
+  export GATE_DISCDATA=$D GATE_FIXTURES=$G/fly/fixtures
+  mkdir -p "$GATE_FIXTURES"
+  for p in "${PLANS[@]}"; do
+    dp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("disc_prep", ""))' "$p")
+    [ -n "$dp" ] || continue
+    if (cd "$S" && timeout 600 sh -c "$dp") >> "$G/build/disc_prep.log" 2>&1; then
+      row "test data" PASS "disc_prep of $(basename "$p"): $(du -sh "$GATE_FIXTURES" | cut -f1) served, $(du -sh "$D" | cut -f1) on the disc"
+    else
+      row "test data" FAIL "disc_prep of $(basename "$p"): build/disc_prep.log: $(tail -1 "$G/build/disc_prep.log")"
+    fi
+  done
   if TMPDIR=$W/tmp LAYOUT=legacy SECTOR=2048 PAD_1ST=1 TITLE="DC-QALINK LOADER" timeout 600 bash "$GATE_MKGDI" "$O/loader.elf" "$D" "$X" \
        > "$G/build/mkgdi.log" 2>&1; then
     cp "$X"/disc.gdi "$X"/track0* "$D/LINK.TXT" "$G/fly/disc/"
@@ -300,7 +319,8 @@ else
       timeout 3000 "$GATE_WINPY" -u "$FLYPY" run --flycast "$GATE_FLYCAST" --config "$GATE_FLYCFG" \
         --disc "$(winp "$G/fly/disc/disc.gdi")" --tree "$(winp "$G/tree")" --build "$(winp "$G/build")" \
         --pc-ip "$GATE_PC_IP" --port "$GATE_PORT" --lport "$GATE_LPORT" --ctl "$GATE_CTL" --http "$GATE_HTTP" \
-        --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} "${pargs[@]}" \
+        --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" --fixtures "$(winp "$GATE_FIXTURES")" \
+        ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} "${pargs[@]}" \
         > "$G/fly/run.out" 2>&1; rc=$?
       sum=$(python3 -c 'import json,sys
 r=json.load(open(sys.argv[1]))
@@ -316,6 +336,7 @@ print("%d of %d rows, %d of %d cited numbers reproduced%s" % (ok, len(r["rows"])
       esac
     fi
     rm -f "$G"/fly/disc/track0*
+    rm -rf "${GATE_FIXTURES:?}"   # generated test data: rebuilt by disc_prep
   else
     row "flycast disc" FAIL "build/mkgdi.log: $(tail -2 "$G/build/mkgdi.log" | tr '\n' ' ')"
   fi
