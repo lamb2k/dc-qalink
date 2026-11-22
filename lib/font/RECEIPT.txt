@@ -1,0 +1,3 @@
+input spleen-8x16.bdf (Spleen 2.3.0) sha256 3be74111b39d48647a9a944528bd0bfaf0b926817cf85ff3746658c3f7532147
+script lib/font/mkfont.py sha256 3cfc78e7f692aaab813a031a82b458331c1ad5c99edd1c7a4e14252770237e6e
+output lib/font/spleen8x16.h sha256 f0bcacf368bc7065d9f1622cf910e99df22b76851861af52bc7ad254792ef4a8

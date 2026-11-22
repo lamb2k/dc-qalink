@@ -10,10 +10,13 @@
 #   PPP), or both (the adapter if one is fitted, else the modem; dcql_config_t.net can force either).
 # DCQL_LOOP=1 adds the control loop's way back (dcql_return.c), so the RESET command returns a program the loader
 #   started to the loader.
+# DCQL_MENU=1 adds the in-game menu (dcql_menu.c, dcql_menu.h, docs/MENU.md): $(DCQL_MENU_OBJS), also in DCQL_OBJS.
+#   It links on its own too (a program with the client library instead: add $(DCQL_MENU_OBJS) to its objects).
 comma := ,
 DCQL_ENABLE ?= 0
 DCQL_NET ?= modem
 DCQL_LOOP ?= 0
+DCQL_MENU ?= 0
 DCQL_DIR ?= $(dir $(lastword $(MAKEFILE_LIST)))
 DCQL_OBJDIR ?= dcql-obj
 ifeq ($(DCQL_ENABLE),1)
@@ -25,7 +28,8 @@ DCQL_NET_DEFS_both := -DDCQL_NET_HAVE_MODEM=1 -DDCQL_NET_HAVE_BBA=1
 DCQL_PPP_DIR := $(KOS_BASE)/addons/libppp
 DCQL_PPP_OBJS := $(if $(filter bba,$(DCQL_NET)),,$(addprefix $(DCQL_OBJDIR)/,ppp.o lcp.o pap.o ipcp.o ppp_modem.o))
 DCQL_LOOP_OBJS := $(if $(filter 1,$(DCQL_LOOP)),$(DCQL_OBJDIR)/dcql_return.o $(DCQL_OBJDIR)/cl_util.o)
-DCQL_OBJS := $(DCQL_OBJDIR)/dcql.o $(DCQL_OBJDIR)/dcql_net.o $(DCQL_PPP_OBJS) $(DCQL_LOOP_OBJS)
+DCQL_MENU_OBJS := $(if $(filter 1,$(DCQL_MENU)),$(DCQL_OBJDIR)/dcql_menu.o)
+DCQL_OBJS := $(DCQL_OBJDIR)/dcql.o $(DCQL_OBJDIR)/dcql_net.o $(DCQL_PPP_OBJS) $(DCQL_LOOP_OBJS) $(DCQL_MENU_OBJS)
 DCQL_LDFLAGS := $(if $(DCQL_PPP_OBJS),-Wl$(comma)--wrap=createChainBuffer -Wl$(comma)--wrap=destroyChainBuffer -Wl$(comma)--wrap=thd_worker_create_ex)
 DCQL_PPP_DEFS := -Dthd_create=dcql_ppp_thd_create -Dthd_pass=dcql_ppp_thd_pass \
                  -Dmodem_write_data=dcql_ppp_modem_write -Dmodem_read_data=dcql_ppp_modem_read \
@@ -43,11 +47,15 @@ $(DCQL_OBJDIR)/dcql_return.o: $(DCQL_DIR)/dcql_return.c $(DCQL_QL)/include/dcql_
 $(DCQL_OBJDIR)/cl_util.o: $(DCQL_QL)/loader/cl_util.c $(DCQL_QL)/include/dcql_loop.h
 	@mkdir -p $(DCQL_OBJDIR)
 	kos-cc $(KOS_CFLAGS) -Os -I$(DCQL_QL)/include -I$(DCQL_QL)/loader -c $< -o $@
+$(DCQL_OBJDIR)/dcql_menu.o: $(DCQL_DIR)/dcql_menu.c $(DCQL_DIR)/dcql_menu.h $(DCQL_DIR)/font/spleen8x16.h $(DCQL_DIR)/dcql_net.h
+	@mkdir -p $(DCQL_OBJDIR)
+	kos-cc $(KOS_CFLAGS) -Os -I$(DCQL_DIR) -c $< -o $@
 $(DCQL_OBJDIR)/%.o: $(DCQL_PPP_DIR)/%.c
 	@mkdir -p $(DCQL_OBJDIR)
 	kos-cc $(KOS_CFLAGS) -Os -I$(DCQL_PPP_DIR) -I$(KOS_BASE)/kernel/net $(DCQL_PPP_DEFS) -c $< -o $@
 else
 DCQL_CFLAGS :=
 DCQL_OBJS :=
+DCQL_MENU_OBJS :=
 DCQL_LDFLAGS :=
 endif
