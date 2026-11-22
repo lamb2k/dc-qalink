@@ -64,10 +64,16 @@ def make_handler(bridge, level='run'):
             self.reply(code, dict({'error': msg}, **kw))
 
         def body(self):
-            n = int(self.headers.get('Content-Length') or 0)
-            if n > MAX_BODY:
-                raise ValueError('body over %d bytes' % MAX_BODY)
-            return self.rfile.read(n) if n else b''
+            """The request body, read once. Every POST reads it (do_POST drains it first): an unread body on a
+            keep-alive connection became the start of the next request, so the app's CORS preflight after
+            POST /v0/selftest got a 400 with no CORS headers (Flycast run f4, 2026-11-22)."""
+            if getattr(self, '_body', None) is None:
+                n = int(self.headers.get('Content-Length') or 0)
+                if n > MAX_BODY:
+                    self.close_connection = True
+                    raise ValueError('body over %d bytes' % MAX_BODY)
+                self._body = self.rfile.read(n) if n else b''
+            return self._body
 
         def jbody(self):
             b = self.body()
@@ -200,6 +206,11 @@ def make_handler(bridge, level='run'):
                     pass
 
         def do_POST(self):
+            self._body = None
+            try:
+                self.body()
+            except ValueError as e:
+                return self.err(413, str(e))
             u = urlparse(self.path)
             q = parse_qs(u.query)
             p = u.path.rstrip('/')
@@ -250,8 +261,19 @@ def make_handler(bridge, level='run'):
                         bridge.t.choose(ip)
                     except KeyError:
                         return self.err(404, 'no loader heard at %s' % ip)
+                    except PermissionError as e:
+                        bridge.audit_call(who, 'control', 'POST /v0/link %s' % ip, 'refused: only local')
+                        return self.err(403, str(e))
                     bridge.audit_call(who, 'control', 'POST /v0/link %s' % ip, 'ok')
                     return self.reply(200, bridge.status())
+                if p == '/v0/settings':
+                    if not self.allowed('control'):
+                        return
+                    b = self.jbody()
+                    if not isinstance(b.get('autoconnect'), bool):
+                        return self.err(400, 'settings: {"autoconnect": true|false}')
+                    bridge.audit_call(who, 'control', 'POST /v0/settings autoconnect=%s' % b['autoconnect'], 'ok')
+                    return self.reply(200, bridge.set_autoconnect(b['autoconnect']))
                 if p == '/v0/memory/read':
                     return self.err(501, 'memory reads are not in this loader yet')
                 if p == '/v0/assets':

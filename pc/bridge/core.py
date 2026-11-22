@@ -35,7 +35,9 @@ class BridgeUdp:
     port-unreachable stops passing datagrams in Flycast, so it is never closed between runs). Every well-formed beacon
     is recorded for discovery; only datagrams from the chosen console reach the loop."""
 
-    def __init__(self, bind_host, bind_port, console=None):
+    STALE_S = 4.0   # a chosen loader silent this long may be replaced by its own beacons from a new address
+
+    def __init__(self, bind_host, bind_port, console=None, autoconnect=True, remember=None, only_local=False):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -51,18 +53,81 @@ class BridgeUdp:
         self.seen = {}           # ip -> discovery row
         self.echoes = 0          # our own datagrams looped back (dropped)
         self.log = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.locals = local_addresses()
+        # autoconnect (owner, 2026-11-22): link without a click to a console linked before (or the only one heard when
+        # none is remembered), and relink by itself when it comes back from a run or a reboot, on a new address too.
+        # Consoles are remembered by the loader's identity, not by address (DHCP may change it).
+        self.autoconnect = autoconnect
+        # only_local: talk only to a loader at one of this PC's own addresses (Flycast, the simulated console); a real
+        # console on the LAN is listed in discovery and never linked or sent to (lane and test runs; 2026-11-22 a lane
+        # run linked the owner's console because it beaconed before Flycast booted)
+        self.only_local = only_local
+        self.remote_refused = 0
+        self.remember_path = remember
+        self.remembered = {}
+        self.chosen_ident = None
+        if remember and os.path.isfile(remember):
+            try:
+                self.remembered = json.load(open(remember, encoding='utf-8'))
+            except (OSError, ValueError):
+                self.remembered = {}
 
-    def choose(self, ip):
+    @staticmethod
+    def ident(h):
+        """The loader's identity. HELLO carries no adapter MAC today (that needs a field in the loader's HELLO: a protocol
+        change, asked of the loader's lane); until then the loader's build and the first bytes of its SHA-256."""
+        mac = h.get('mac')
+        return 'mac:%s' % mac if mac else 'loader:%s:%s' % (h.get('loader_sha8', ''), h.get('build', ''))
+
+    def is_local(self, ip):
+        return ip.startswith('127.') or ip in self.locals
+
+    def choose(self, ip, why='link'):
         with self.lock:
             if ip not in self.seen and not self.fixed:
                 raise KeyError(ip)
+            if self.only_local and not self.is_local(ip):
+                self.remote_refused += 1
+                raise PermissionError('this bridge talks only to this PC (--only-local): %s is not' % ip)
             self.chosen_ip = ip
             self.peer = self.seen[ip]['addr'] if ip in self.seen else self.fixed
+            h = (self.seen.get(ip) or {}).get('hello')
+            if h:
+                self.chosen_ident = self.ident(h)
+                self.remembered[self.chosen_ident] = {'last_ip': h['console_ip'], 'source': ip, 'build': h['build'],
+                                                      'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+                if self.remember_path:
+                    try:
+                        json.dump(self.remembered, open(self.remember_path, 'w', encoding='utf-8'), indent=1)
+                    except OSError:
+                        pass
+                if self.log:
+                    self.log('console %s (%s): beacons from %s:%d, the loader says its address is %s (%s)' % (
+                        'linked' if why == 'link' else why, self.chosen_ident, ip, self.peer[1], h['console_ip'], h['build']))
+
+    def _auto(self, ip, h):
+        """On a loader's HELLO from `ip`: link to it if autoconnect says so (called with the lock held)."""
+        if self.fixed or not self.autoconnect or ip == self.chosen_ip:
+            return
+        if self.only_local and not self.is_local(ip):
+            self.remote_refused += 1
+            return
+        idt = self.ident(h)
+        now = time.time()
+        if self.chosen_ip is None:
+            loaders = [r for r in self.seen.values() if r.get('hello') and now - r['last'] < self.STALE_S]
+            # a console linked before; else, when none is remembered, the only loader heard. Two unknown loaders, or an
+            # unknown one beside remembered ones: wait for a click (then it is remembered).
+            if idt in self.remembered or (not self.remembered and len(loaders) == 1):
+                self.choose(ip, 'autoconnected')
+            return
+        cur = self.seen.get(self.chosen_ip)
+        if (cur is None or now - cur['last'] > self.STALE_S) and (idt == self.chosen_ident or idt in self.remembered):
+            self.choose(ip, 'relinked at a new address')
 
     def send(self, d):
-        if self.peer:
+        if self.peer and not (self.only_local and not self.is_local(self.peer[0])):   # never a send off this PC
             try:
                 self.s.sendto(d, self.peer)
             except OSError:
@@ -98,12 +163,9 @@ class BridgeUdp:
                     if h['role'] != 2:
                         row['beacons'] += 1
                         row['hello'] = h
-                    if self.chosen_ip is None and h['role'] != 2:   # the peer is learnt only from a loader's HELLO
-                        self.chosen_ip = a[0]
-                        if self.log:
-                            self.log('console chosen: beacons from %s:%d, the loader says its address is %s (%s)' % (
-                                a[0], a[1], h['console_ip'], h['build']))
-        if a[0] != self.chosen_ip:
+                    if h['role'] != 2:   # the peer is learnt only from a loader's HELLO
+                        self._auto(a[0], h)
+        if a[0] != self.chosen_ip or (self.only_local and not self.is_local(a[0])):
             return None
         if self.peer is None or self.peer[0] == a[0]:
             self.peer = a        # the reply goes where the console speaks from (Flycast maps the port)
@@ -119,6 +181,7 @@ class BridgeUdp:
                             'transport': h.get('net', '-'), 'loader': h.get('build', ''), 'protocol': r.get('proto'),
                             'beacons': r['beacons'], 'first_s_ago': round(time.time() - r['first'], 1),
                             'last_s_ago': round(time.time() - r['last'], 1), 'chosen': ip == self.chosen_ip,
+                            'ident': self.ident(h) if h else None, 'remembered': bool(h) and self.ident(h) in self.remembered,
                             'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['last']))})
             return out
 
@@ -272,19 +335,57 @@ def parse_summary(text, state, exit_code, seconds, tier, session):
 
 
 # ------------------------------------------------------------------------------------------------ the bridge
+class LinkLock:
+    """The link's lock: re-entrant, and it counts who waits so the idle pump steps aside. A plain lock is not fair:
+    the pump re-took it at once and a run queued behind it waited 46 s in a host test (2026-11-22)."""
+    def __init__(self):
+        self._l = threading.RLock()
+        self._w = 0
+        self._m = threading.Lock()
+
+    @property
+    def waiting(self):
+        return self._w > 0
+
+    def acquire(self, timeout=-1):
+        return self._l.acquire(timeout=timeout)
+
+    def release(self):
+        self._l.release()
+
+    def __enter__(self):
+        with self._m:
+            self._w += 1
+        try:
+            self._l.acquire()
+        finally:
+            with self._m:
+                self._w -= 1
+        return self
+
+    def __exit__(self, *exc):
+        self._l.release()
+
+
 class Bridge:
     def __init__(self, data_dir, bind=('0.0.0.0', cl.PORT), console='auto', device_kind=None, files_root=None,
-                 selftest=None, loader_disc=None, level='run', log=None):
+                 selftest=None, loader_disc=None, level='run', log=None, autoconnect=True, only_local=True):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
         self.sessions_dir = os.path.join(self.data_dir, 'sessions')
         os.makedirs(self.sessions_dir, exist_ok=True)
         self.logf = open(os.path.join(self.data_dir, 'bridge.log'), 'a', encoding='utf-8')
         self._ext_log = log
-        self.t = BridgeUdp(bind[0], bind[1], console)
+        self.t = BridgeUdp(bind[0], bind[1], console, autoconnect, os.path.join(self.data_dir, 'consoles.json'),
+                           only_local)
+        if self.t.fixed and only_local and not self.t.is_local(self.t.fixed[0]):
+            self.t.close()
+            self.logf.close()
+            raise PermissionError('--console %s is not this PC; a real console needs --allow-lan (a person\'s choice)'
+                                  % self.t.fixed[0])
         self.t.log = self.log
         self.loop = TapLoop(self.t, self.log, self.tap)
-        self.link_lock = threading.RLock()
+        self.link_lock = LinkLock()
         self.device_kind = device_kind
         self.files_root = files_root
         self.selftest_path = selftest
@@ -366,7 +467,15 @@ class Bridge:
                 'session': self.current.id if self.current else None, 'rate_bps': round(rate, 1),
                 'mode': 'summary' if (self.loop.hello or {}).get('net') == 'modem' else 'full', 'paused': self.paused,
                 'n': self.current.max_n if self.current else 0, 'level': self.level, 'tier': self.tier(),
-                'queue': [r.id for r in list(self.queue.queue)], 'active_run': self.active.id if self.active else None}
+                'queue': [r.id for r in list(self.queue.queue)], 'active_run': self.active.id if self.active else None,
+                'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
+                'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused}
+
+    def set_autoconnect(self, on):
+        with self.t.lock:
+            self.t.autoconnect = bool(on)
+        self.log('autoconnect %s' % ('on' if on else 'off'))
+        return self.status()
 
     def emit(self, r):
         """A record or event to every live listener (and into the current session when it belongs there)."""
@@ -417,6 +526,10 @@ class Bridge:
         if typ == cl.HELLO and len(pl) >= 96:
             h = cl.parse_hello(pl)
             if h['role'] == 2:
+                if not h['run_id'] and self.active is not None:
+                    # the program on Flycast reported run 0 (its loader hand-off carries no run id: ql-core2's
+                    # side); a program that links while a pushed run is on is that run (Flycast f2)
+                    h['run_id'] = self.active.sid
                 fresh = self.client is None or self.client_run != h['run_id']
                 self.client, self.client_run = h, h['run_id']
                 if fresh:
@@ -534,6 +647,9 @@ class Bridge:
     # ------------------------------------------------------------------ threads
     def _pump(self):
         while not self.stop_flag.is_set():
+            if self.link_lock.waiting:
+                time.sleep(0.01)   # a run, a reset or a command wants the link: let it in (the lock is not fair)
+                continue
             if self.link_lock.acquire(timeout=0.5):
                 try:
                     self.loop.recv(0.2)
@@ -748,6 +864,10 @@ class Bridge:
             run.done.wait(40.0)
             return 200, {'ok': run.way_back in ('stub', 'watchdog'), 'id': 'reset', 'rung': run.way_back or 'none',
                          'run': run.id}
+        h = self.loop.hello or {}
+        if self.client is None and h and time.time() - h.get('at', 0) < 3.0 and h.get('state') in (0, 2, 3):
+            # nothing running and the loader beaconing: already back at the loader (Flycast run f2 waited 30 s here)
+            return 200, {'ok': True, 'id': 'reset', 'rung': 'none needed', 'seconds': 0.0}
         with self.link_lock:
             b0 = (self.loop.hello or {}).get('boot_count')
             rung, secs, hb, ack = cl.ladder(self.loop, 0, 20.0, self.log, b0)

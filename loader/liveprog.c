@@ -67,15 +67,17 @@ static int on_cmd(int code, const char *arg, unsigned len, char *why, void *user
 }
 
 static void draw(uint32_t n) {
-    /* a 640 x 200 band of moving bars (or a checker board), the top rows keep the text */
+    /* a 640 x 200 band of moving bars (or a checker board), the top rows keep the text. Each distinct row is built
+       once and copied (the first cut divided per pixel: 37 ms a picture on Flycast, every picture late) */
+    static uint16_t rows[2][640] __attribute__((aligned(32)));
     const int w = 640 / g_bars;
-    for (int y = 120; y < 320; ++y) {
-        uint16_t *row = vram_s + y * 640;
-        for (int x = 0; x < 640; ++x) {
-            const int k = ((x + (int)n * g_speed) / w) & 7;
-            row[x] = g_scene == 0 ? COL[k] : COL[(k + (y / 25)) & 1 ? 0 : 7];
-        }
+    for (int x = 0; x < 640; ++x) {
+        const int k = ((x + (int)n * g_speed) / w) & 7;
+        rows[0][x] = g_scene == 0 ? COL[k] : COL[k & 1 ? 0 : 7];
+        rows[1][x] = g_scene == 0 ? COL[k] : COL[(k + 1) & 1 ? 0 : 7];
     }
+    for (int y = 120; y < 320; ++y)
+        memcpy(vram_s + y * 640, rows[g_scene == 0 ? 0 : (y / 25) & 1], sizeof(rows[0]));
 }
 
 static void spin_us(uint32_t us) {

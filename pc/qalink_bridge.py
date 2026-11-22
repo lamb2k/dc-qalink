@@ -27,6 +27,13 @@ def main(argv=None):
     ap.add_argument('--selftest', help='the self-test program (dc-qalink\'s testprog.elf)')
     ap.add_argument('--loader-disc', help='folder of the loader disc image served by /v0/loader')
     ap.add_argument('--level', choices=('read', 'control', 'run'), default='run', help='the most this bridge accepts')
+    ap.add_argument('--allow-lan', action='store_true',
+                    help='talk to a real console on the network. Off by default: the bridge then talks only to a loader '
+                         'at this PC\'s own addresses (Flycast, the simulated console). A person turns it on in QA Link '
+                         'Cloud; tests, scripts and agents leave it off')
+    ap.add_argument('--no-autoconnect', action='store_true',
+                    help='link only on POST /v0/link (default: link by itself to a console linked before, or the only '
+                         'one heard, and relink when it comes back; POST /v0/settings {"autoconnect": false} at run time)')
     ap.add_argument('--mcp', choices=('stdio',), help='serve the MCP tools over stdio as a client of --bridge')
     ap.add_argument('--mcp-http', type=int, help='also serve the MCP tools over HTTP on 127.0.0.1:<port>')
     ap.add_argument('--mcp-level', choices=('read', 'control', 'run'), default='run')
@@ -39,7 +46,8 @@ def main(argv=None):
     from bridge.core import Bridge
     from bridge.api import serve
     log = None if a.quiet else (lambda s: print(s, flush=True))
-    b = Bridge(a.data, (a.udp_host, a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log)
+    b = Bridge(a.data, (a.udp_host, a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
+               autoconnect=not a.no_autoconnect, only_local=not a.allow_lan)
     serve(b, '127.0.0.1', a.port, a.level)
     if a.mcp_http:
         from bridge import mcp_server
