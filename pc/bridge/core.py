@@ -418,6 +418,7 @@ class Bridge:
         self.current = None          # the session of the linked program (or the last one)
         self.client = None           # the program's HELLO
         self.client_run = None
+        self.client_hello_run = 0
         self.def_ver = None
         self.def_parts = {}
         self.declaration = None
@@ -471,7 +472,7 @@ class Bridge:
                         'pushed': bool(h['flags'] & cl.HF_PUSHED)} if h else None,
              'ident': self.t.ident(h) if h else None, **self.t.card(h or {}),
              'program': {'run': '%08x' % self.client_run, 'linked': self.client is not None,
-                         'hello_run': '%08x' % (self.client or {}).get('hello_run', 0)} if self.client_run else None}
+                         'hello_run': '%08x' % self.client_hello_run} if self.client_run else None}
         if self.active:
             d['state'] = 'running' if self.active.state == 'running' else self.active.state
             d['last_run'] = {'id': self.active.id, 'state': self.active.state}
@@ -553,6 +554,7 @@ class Bridge:
                     h['run_id'] = self.active.sid
                 fresh = self.client is None or self.client_run != h['run_id']
                 self.client, self.client_run = h, h['run_id']
+                self.client_hello_run = h['hello_run']   # kept after the program leaves (self.client goes None)
                 if fresh:
                     s = self.session_for(h['run_id'])
                     self.record({'t': 'link', 'state': 'up', 'role': 'program', 'run': '%08x' % h['run_id'],
