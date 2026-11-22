@@ -250,6 +250,24 @@ def main():
     calls = open(os.path.join(R.dir, 'calls.log')).read().splitlines()
     record('every call logged with who made it and its level', len(calls) >= 10 and all('"who"' in x and '"level"' in x
                                                                                         for x in calls), calls=len(calls))
+    # keep-alive: a POST whose body the route does not use, then a CORS preflight on the same connection (the app's
+    # self-test after POST /v0/selftest, Flycast run f4). An unread body turns the preflight into a 400 without CORS.
+    import http.client
+    hc = http.client.HTTPConnection('127.0.0.1', int(R.base.rsplit(':', 1)[1]), timeout=10)
+    hc.request('POST', '/v0/reset?x=1', body=b'{"level": "return", "pad": "' + b'x' * 300 + b'"}',
+               headers={'Content-Type': 'application/json'})
+    r1 = hc.getresponse(); r1.read()
+    hc.request('OPTIONS', '/v0/runs/abcd1234', headers={'Origin': 'app://studio', 'Access-Control-Request-Method': 'GET',
+                                                        'Access-Control-Request-Headers': 'x-contract'})
+    r2 = hc.getresponse(); r2.read()
+    hc.request('POST', '/v0/memory/read', body=b'{"unused": true}', headers={'Content-Type': 'application/json'})
+    r3 = hc.getresponse(); r3.read()
+    hc.request('GET', '/v0/status', headers={'X-Contract': '1'})
+    r4 = hc.getresponse(); r4.read()
+    hc.close()
+    record('keep-alive: a POST body never bleeds into the next request (preflight 204 with CORS)',
+           r2.status == 204 and r2.getheader('Access-Control-Allow-Origin') == '*' and r4.status == 200,
+           post=r1.status, preflight=r2.status, memory=r3.status, status=r4.status)
     R.close()
 
     # 4. gaps and the planted delay --------------------------------------------------------------------------

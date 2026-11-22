@@ -67,15 +67,17 @@ static int on_cmd(int code, const char *arg, unsigned len, char *why, void *user
 }
 
 static void draw(uint32_t n) {
-    /* a 640 x 200 band of moving bars (or a checker board), the top rows keep the text */
+    /* a 640 x 200 band of moving bars (or a checker board), the top rows keep the text. Each distinct row is built
+       once and copied (the first cut divided per pixel: 37 ms a picture on Flycast, every picture late) */
+    static uint16_t rows[2][640] __attribute__((aligned(32)));
     const int w = 640 / g_bars;
-    for (int y = 120; y < 320; ++y) {
-        uint16_t *row = vram_s + y * 640;
-        for (int x = 0; x < 640; ++x) {
-            const int k = ((x + (int)n * g_speed) / w) & 7;
-            row[x] = g_scene == 0 ? COL[k] : COL[(k + (y / 25)) & 1 ? 0 : 7];
-        }
+    for (int x = 0; x < 640; ++x) {
+        const int k = ((x + (int)n * g_speed) / w) & 7;
+        rows[0][x] = g_scene == 0 ? COL[k] : COL[k & 1 ? 0 : 7];
+        rows[1][x] = g_scene == 0 ? COL[k] : COL[(k + 1) & 1 ? 0 : 7];
     }
+    for (int y = 120; y < 320; ++y)
+        memcpy(vram_s + y * 640, rows[g_scene == 0 ? 0 : (y / 25) & 1], sizeof(rows[0]));
 }
 
 static void spin_us(uint32_t us) {
@@ -91,6 +93,9 @@ int main(int argc, char **argv) {
     int secs = (p = strstr(args, "secs=")) ? atoi(p + 5) : 60;
     const uint32_t slow = (p = strstr(args, "slow=")) ? (uint32_t)atoi(p + 5) : 0;
     const int live = !strstr(args, "nolive");
+    /* linkoff: live data declared but the link reported down to it, so every picture takes the link-off path (the
+       limits row "cost each picture, link off"); the report still goes back through the hand-off */
+    const int linkoff = strstr(args, "linkoff") != NULL;
     for (int i = 0; i < 640 * 120; ++i) vram_s[i] = 0x0841;
     bfont_draw_str_ex(vram_s + 20 * 640 + 20, 640, 0xffe0, 0x0841, 16, true, "dc-qalink live example");
     char line[96];
@@ -100,8 +105,10 @@ int main(int argc, char **argv) {
     if (live) {
         dcql_live_declare(DEF);
         dcql_live_on_command(on_cmd, NULL);
+        if (linkoff) dcql_live_link(0);
     }
-    printf("liveprog: link %s, %d s, slow %u us, live %d\n", up ? "up" : "down", secs, (unsigned)slow, live);
+    printf("liveprog: link %s, %d s, slow %u us, live %d%s\n", up ? "up" : "down", secs, (unsigned)slow, live,
+           linkoff ? " (link off to live data)" : "");
     uint64_t sum_draw = 0, sum_live = 0, sum_frame = 0, max_live = 0;
     uint32_t n = 0, measured = 0;
     const uint64_t t_end = timer_ms_gettime64() + (uint64_t)secs * 1000u;

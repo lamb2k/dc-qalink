@@ -34,7 +34,7 @@ STEP_NAME = {1: 'entered', 2: 'quiet', 3: 'GD init', 4: 'read', 5: 'checked', 6:
 
 def way_back(console, port, wait_s):
     """Listen (send nothing) for the loader's HELLO from `console` and decode the last way back's record it carries
-    (include/dcql_loop.h CL_HELLO_WB, ql-core3). None when no such beacon came in wait_s."""
+    (include/dcql_loop.h CL_HELLO_STUB and CL_HELLO_WB). None when no such beacon came in wait_s."""
     import socket, struct
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -50,12 +50,14 @@ def way_back(console, port, wait_s):
                 d, src = s.recvfrom(2048)
             except socket.timeout:
                 continue
-            if src[0] != console or len(d) < 16 + 156 + 4 or d[:2] != b'CL' or d[3] != 0x01:
+            if src[0] != console or len(d) < 16 + 164 + 4 or d[:2] != b'CL' or d[3] != 0x01:
                 continue
-            pl = d[16:16 + 156]
+            pl = d[16:16 + 164]
             if struct.unpack_from('<I', pl, 100)[0] != 1:   # role LOADER only
                 continue
-            where, stp, err, aux, run = struct.unpack_from('<5I', pl, 136)
+            # 136 step, 137 entries, 138 GDEMU result, 140 error word, 144 GDEMU version (ql-data); 148 where, 152 the
+            # BIOS's answer, 156 run, 160 the drive's sense (ql-core3)
+            stp, _entries, _gd, err, _ver, where, aux, run, sense = struct.unpack_from('<BBHIIIIII', pl, 136)
             kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM'),
                                    (16, 'hand-off put back from main RAM copy'),
                                    (32, 'hand-off put back from sound RAM copy')) if where & b]
@@ -69,6 +71,7 @@ def way_back(console, port, wait_s):
                     % (run, stp, STEP_NAME.get(stp, '?'), '; '.join(rungs) or 'no rung failed',
                        'not tried' if not sel else 'taken' if sel == 0x10 else 'refused code %d' % (sel & 15),
                        aux & 255, (aux >> 8) & 255, aux >> 24, ', '.join(kept) or 'nothing (no record survived)'))
+            text += '; drive sense key %d ASC %02x' % (sense & 15, (sense >> 8) & 255)
             if not where & 15:
                 text = 'no record: the loader found none in any place (a cold boot, or nothing survived)'
             return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}

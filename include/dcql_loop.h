@@ -117,16 +117,28 @@ typedef struct {
     uint8_t mac[6];           /* offset 128: the adapter's MAC address (all zero on the modem): one console across
                                  DHCP address changes */
     uint16_t gdemu_slot;      /* offset 134: the GDEMU image the loader returns to (0 = none known) */
-    /* v2, additive (ql-core3): the last way back's record as this loader found it at boot (CL_WB_*) */
-    uint32_t wb_where;        /* offset 136: bit 0 hand-off header, 1 main RAM at 8 MiB, 2 sound RAM, 3 video RAM held
-                                 it (0 = no record anywhere); 4 / 5: the hand-off area was lost on a reboot and put
-                                 back from its copy in main / sound RAM (dcql_hw.h); bits 8..15 the stub's entries */
-    uint32_t wb_step, wb_err, wb_aux, wb_run;   /* offsets 140, 144, 148, 152 */
+    /* v2, additive (ql-data, 2026-11-22): the stub's record of the last way back as the loader read it at boot, so
+       the PC can say where a way back stopped without the TV; all zero from a client or when there was no record
+       (ql-core3: also from a copy of the record that outlived a BIOS reboot; stub_gdemu is then 0) */
+    uint8_t stub_step;        /* offset 136: CL_STUB_STEP_* the last way back reached (0 = no record this boot) */
+    uint8_t stub_entries;     /* offset 137: times the stub was entered (low 8 bits) */
+    uint16_t stub_gdemu;      /* offset 138: tramp[CL_STUBW_GDEMU]: the GDEMU select's result + 0x100 (0 = none) */
+    uint32_t stub_err;        /* offset 140: tramp[CL_STUBW_ERR] (one byte per rung, ql-core3) */
+    uint32_t gdemu_ver;       /* offset 144: GDEMU's version, major << 16 | minor << 8 | patch (0 = none answered) */
+    /* v2, additive (ql-core3, 2026-11-22): where the record came through and the rest of it */
+    uint32_t wb_where;        /* offset 148: bit 0 the hand-off header, 1 main RAM at 8 MiB, 2 sound RAM, 3 video RAM
+                                 held the record; 4 / 5: the hand-off area was lost on a reboot and put back from its
+                                 copy in main / sound RAM (dcql_hw.h); 0 = no record anywhere */
+    uint32_t wb_aux;          /* offset 152: tramp[CL_STUBW_GDST]: the BIOS's last answer */
+    uint32_t wb_run;          /* offset 156: the run the record belongs to */
+    uint32_t wb_sense;        /* offset 160: tramp[CL_STUBW_SENSE]: the drive's last sense (0 from a copy) */
 } cl_hello_t;
-#define CL_HELLO_LEN 156
+#define CL_HELLO_LEN 164
 #define CL_HELLO_MAC 128
 #define CL_HELLO_SLOT 134
-#define CL_HELLO_WB 136
+#define CL_HELLO_STUB 136
+#define CL_HELLO_GDEMU_VER 144
+#define CL_HELLO_WB 148
 #define CL_HF_PUSHED_LOADER 1u   /* this loader was pushed by the PC (self-update), not read from the disc */
 #define CL_HF_STUB_ARMED 2u
 

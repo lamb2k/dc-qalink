@@ -367,6 +367,10 @@ int main(int argc, char **argv) {
                 g_stub_w0 = c->w0; g_stub_run = c->run_id;
             }
     }
+    if (g_stub_seen) {   /* and in every HELLO of this boot (cl_core_init copies g_plat) */
+        g_plat.stub_rec[0] = g_stub_step; g_plat.stub_rec[1] = g_stub_err;
+        g_plat.stub_rec[2] = g_stub_gdemu; g_plat.stub_rec[3] = g_stub_entries;
+    }
     if (g_stub_seen) {
         loader_log("way back of run %08x: step %u rung %u err %08x aux %08x", (unsigned)g_stub_run,
                    (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux);
@@ -376,7 +380,7 @@ int main(int argc, char **argv) {
                    g_crumb_ok & 1 ? "yes" : "no", g_crumb_ok & 2 ? "yes" : "no", g_crumb_ok & 4 ? "yes" : "no",
                    (unsigned)g_stub_w0, (unsigned)g_stub_gdemu);
     }
-    const uint32_t wb[5] = {g_wb_where | ((g_stub_entries & 255u) << 8), g_stub_step, g_stub_err, g_stub_aux, g_stub_run};
+    const uint32_t wb[4] = {g_wb_where, g_stub_aux, g_stub_run, g_stub_sense};
     memcpy(g_plat.wb, wb, sizeof(wb));
     cl_core_init(&g_core, &g_plat);   /* reads the last run's hand-off before anything grows */
     g_pushed = cl_handoff_valid(H) && H->h.reserved[3] == PUSH_MAGIC;

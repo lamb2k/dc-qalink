@@ -30,14 +30,33 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
   (push and run code). A bridge started at a level answers 403 above it. Every control and run call is written to
   `calls.log` in the data folder with who made it (`X-By`, else the client address) and its level.
 - The UDP port of the loader (52060) stays bound while the bridge runs; discovery records every loader that beacons.
+  The console is learnt only from a loader's HELLO; a PC-to-console datagram (our own broadcast looped back) is dropped.
+- **Only local by default.** The bridge talks only to a loader at this PC's own addresses (Flycast, the simulated
+  console): a console on the network is listed in discovery and never linked or sent anything, `POST /v0/link` to it is
+  403, and `--console <LAN address>` refuses to start. `--allow-lan` lifts it; QA Link Cloud passes it when a person
+  turns on "Dreamcast on the network". Tests, scripts and agents leave it off (ruling 2026-11-22: no lane run sends
+  anything to a real console).
+- **Autoconnect** (on unless `--no-autoconnect` or `POST /v0/settings {"autoconnect": false}`): when a loader beacons,
+  the bridge links to it without a call if it is a console linked before, or, when none is remembered, the only loader
+  heard; two unknown loaders wait for a click. When the linked console falls silent for 4 s (a run that reboots, a
+  power cycle) and comes back, on a new address too, it is relinked. Consoles are remembered in `consoles.json` by
+  identity, not address: the adapter's MAC from HELLO (offset 128, loaders from 456ac57 on; `mac:<mac>`), so one
+  console stays one across address changes and loader updates; a loader without it (older, or the modem) by its build
+  and the first bytes of its SHA-256 (`loader:<sha8>:<build>`; two consoles on the same loader then look alike: a click
+  picks). A console remembered by its loader is found that way once and then kept by its MAC.
+- **What HELLO says beyond the address** (additive, protocol 2): `mac`, `gdemu_slot` (offset 134), and from 148 bytes
+  the stub's record of the last way back (`stub` {`step`, `step_name`, `err`, `gdemu`, `entries`}, null when the loader
+  read none this boot; offsets 136 to 143) and `gdemu_version` (offset 144, null when GDEMU did not answer). The device
+  and every discovery row carry them, with `stub_text`, one line naming where the last way back stopped.
 
 ## Resources
 | Method and path | Level | What |
 |---|---|---|
-| `GET /v0/status` | read | `bridge`, `link`, `device` (below), `session` (being recorded, or null), `rate_bps`, `mode` (`full` adapter / `summary` modem), `paused`, `n` (newest picture), `level`, `tier`, `queue`, `active_run` |
-| `GET /v0/device` | read | `id`, `kind` (`flycast`/`console`), `tier`, `name`, `transport` (`adapter`/`modem`), `address`, `console_ip`, `link`, `state` (the loader's: `idle`/`receiving`/`verified`/`failed`/`exec`, or the run's), `loader` {`build`, `sha8`, `protocol`, `stub_bytes`, `boot_count`, `pushed`}, `program` {`run`, `linked`}, `last_run` |
+| `GET /v0/status` | read | `bridge`, `link`, `device` (below), `session` (being recorded, or null), `rate_bps`, `mode` (`full` adapter / `summary` modem), `paused`, `n` (newest picture), `level`, `tier`, `queue`, `active_run`, `autoconnect`, `remembered`, `only_local`, `remote_refused` |
+| `POST /v0/settings` | control | `{autoconnect: true|false}`; answers the status |
+| `GET /v0/device` | read | `id`, `kind` (`flycast`/`console`), `tier`, `name`, `transport` (`adapter`/`modem`), `address`, `console_ip`, `link`, `state` (the loader's: `idle`/`receiving`/`verified`/`failed`/`exec`, or the run's), `loader` {`build`, `sha8`, `protocol`, `stub_bytes`, `boot_count`, `pushed`}, `ident`, `mac`, `gdemu_slot`, `gdemu_version`, `stub`, `stub_text`, `program` {`run`, `linked`}, `last_run` |
 | `GET /v0/devices` | read | `{devices: [device]}` (one device per bridge) |
-| `GET /v0/discovery` | read | `listening`, `port`, `seen[]`: `id`, `console_ip`, `address`, `port`, `kind` (flycast when the beacon comes from this PC), `transport`, `loader`, `protocol`, `beacons`, `last_s_ago`, `chosen`, `at` |
+| `GET /v0/discovery` | read | `listening`, `port`, `seen[]`: `id`, `console_ip`, `address`, `port`, `kind` (flycast when the beacon comes from this PC), `transport`, `loader`, `protocol`, `beacons`, `last_s_ago`, `chosen`, `ident`, `remembered`, `at`, `mac`, `gdemu_slot`, `gdemu_version`, `stub`, `stub_text` |
 | `POST /v0/link` | control | `{console_ip}` (or `device` id): talk to that loader; answers the status. 404 if none was heard there |
 | `POST /v0/runs` | run | Push and run. **multipart/form-data**: `program` (file: ELF or raw image), `sha256` (required; a mismatch is 400 and nothing is queued), `name`, `args`, `deadline_s`, `files` (a folder name below the bridge's `--files`, never a path), `reset_after_s`. Scripts may send `application/octet-stream` with `X-Build-Sha256`, `X-Build-Name`, `X-Args`. Answers **202** with the run |
 | `GET /v0/runs` | read | `{runs: [run]}`, newest first |

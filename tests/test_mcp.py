@@ -91,10 +91,15 @@ def main():
     def st():
         with urllib.request.urlopen(url + '/v0/status', timeout=10) as f:
             return json.loads(f.read())
+    # wait for THIS push to run, link and send 30 pictures (Flycast f2: the previous program's session satisfied an
+    # older check and the grab went to no program)
     end = time.time() + 120
+    pid = '%08x' % int(pr.get('id', '0'), 16) if pr.get('id') else None
     while time.time() < end:
-        d = st()['device']
-        if d.get('program') and d['program'].get('linked') and st()['n'] > 30:
+        s = st()
+        d = s['device']
+        if s.get('active_run') == pr.get('id') and d.get('program') and d['program'].get('linked') and \
+                d['program'].get('run') == pid and (s.get('session') or '').endswith(pr.get('id', '-')) and s['n'] > 30:
             break
         time.sleep(0.5)
     later = {}

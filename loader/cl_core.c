@@ -94,7 +94,12 @@ void cl_core_hello(cl_core_t *c) {
     cl_wr32(pl + 124, c->p.hello_flags | (cl_stub_armed(c->p.handoff) ? CL_HF_STUB_ARMED : 0));
     memcpy(pl + CL_HELLO_MAC, c->p.mac, 6);   /* additive: a PC that reads 128 bytes ignores the rest */
     cl_wr16(pl + CL_HELLO_SLOT, (uint16_t)h->reserved[CL_RSV_GDEMU_SLOT]);
-    for (int i = 0; i < 5; ++i) cl_wr32(pl + CL_HELLO_WB + 4 * i, c->p.wb[i]);   /* additive (ql-core3) */
+    pl[CL_HELLO_STUB] = (uint8_t)c->p.stub_rec[0];
+    pl[CL_HELLO_STUB + 1] = (uint8_t)c->p.stub_rec[3];
+    cl_wr16(pl + CL_HELLO_STUB + 2, (uint16_t)c->p.stub_rec[2]);
+    cl_wr32(pl + CL_HELLO_STUB + 4, c->p.stub_rec[1]);
+    cl_wr32(pl + CL_HELLO_GDEMU_VER, h->reserved[CL_RSV_GDEMU_VER]);
+    for (int i = 0; i < 4; ++i) cl_wr32(pl + CL_HELLO_WB + 4 * i, c->p.wb[i]);   /* additive (ql-core3) */
     out(c, CL_HELLO, c->session, c->rx_pkts, 0, pl, sizeof(pl));
     c->last_hello_ms = c->p.now_ms(c->p.ctx);
 }

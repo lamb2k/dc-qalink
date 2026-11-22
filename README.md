@@ -23,8 +23,11 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
 - **A loader disc** (`loader/`): boots, brings the link up, and runs programs the PC pushes (deflated, CRC per chunk,
   SHA-256 checked before it runs). `LINK.TXT` on the disc: `net bba|modem`, `host` (the PC, or `peer`: the first PC
   that answers), `port`, `lport`, `number` (modem); the adapter asks DHCP first, and `ip`/`mask`/`gw` are used only
-  when no DHCP server answers (`dhcp no`: those alone). Its screen shows three large lines you can read off a TV: the
-  console's address, the PC it looks for, beacons sent and answers heard.
+  when no DHCP server answers (`dhcp no`: those alone); `slot` is the loader disc's GDEMU image number, selected
+  before every way back so a return lands on the loader and not on openMenu. Its screen shows three large lines you
+  can read off a TV: the console's address, the PC it looks for, beacons sent and answers heard. Its HELLO carries the
+  adapter's MAC (a PC keeps one console by it across address changes), the GDEMU slot and version, and the stub's
+  record of the last way back.
 - **The first run on a console:** `python tools/first_console.py --program build/testprog.elf` waits for the beacon,
   pushes the test program, reads its report, grabs the console's screen 3 times, sends RESET and prints a pass/fail
   table. The PC tool learns the console's address from its beacon (`--udp auto`).
