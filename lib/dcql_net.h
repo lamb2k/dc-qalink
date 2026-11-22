@@ -52,6 +52,12 @@ int dcql_net_send(const void *p, unsigned n);      /* 1 queued, 0 refused (not u
 int dcql_net_recv(void *p, unsigned max);          /* bytes, -1 empty, -2 a datagram too large (dropped) */
 int dcql_net_recv_wait(void *p, unsigned max, int timeout_ms);   /* as recv, sleeping until one comes (adapter) */
 unsigned dcql_net_tx_queued(void);
+/* autoconnect (ql-core2): accept the next PC that sends to our port as the peer, and until one does send every
+   datagram to the whole network as well as to the last peer (adapter). The loader calls it when no PC has answered
+   for a while. */
+void dcql_net_relearn(void);
+int dcql_net_learning(void);
+int dcql_net_mac(unsigned char out[6]);            /* the adapter's MAC address; -1 (all zero) on the modem */
 void dcql_net_text(char *out, unsigned n);          /* "UP 192.168.1.5 TO 192.168.1.10 ADAPTER", "DIALLING 1/3" */
 void dcql_net_counters(unsigned *tx, unsigned *rx, unsigned *txd, unsigned *rxd);
 unsigned dcql_net_ip(void), dcql_net_host(void), dcql_net_mask(void), dcql_net_gw(void);

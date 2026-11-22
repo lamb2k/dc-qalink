@@ -12,11 +12,19 @@
 #include <dc/wdt.h>
 #include <string.h>
 #include "dcql_loop.h"
+#include "dcql_hw.h"
 
 #define H ((cl_handoff_t *)CL_HANDOFF_ADDR)
 
+/* the last rung: a BIOS reboot. With the loader's GDEMU image in the hand-off area it is selected first, as openMenu
+   switches discs, so the BIOS boots the loader's image (ql-core2; whether GDEMU's reset_goto overrides it is a console
+   question). Harmless without GDEMU (dcql_hw.h). */
 void __attribute__((noreturn)) dcql_bios_reboot(void) {
     irq_disable();   /* as arch_reboot */
+    if (cl_handoff_valid(H)) {
+        const uint32_t slot = H->h.reserved[CL_RSV_GDEMU_SLOT];
+        if (slot && slot <= 999) dcql_gdemu_select((uint16_t)slot);
+    }
     ((void (*)(void))0xa0000000u)();
     for (;;) {}
 }

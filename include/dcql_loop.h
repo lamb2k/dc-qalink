@@ -113,8 +113,14 @@ typedef struct {
     uint32_t proto, role, net, stub_bytes;
     uint8_t loader_sha8[8];   /* first 8 bytes of the SHA-256 of the loader this console returns to */
     uint32_t run_id, flags;   /* role CLIENT: the run; flags: CL_HF_* */
+    /* v2, additive (ql-core2, 2026-11-22): a PC that reads only 128 bytes ignores these */
+    uint8_t mac[6];           /* offset 128: the adapter's MAC address (all zero on the modem): one console across
+                                 DHCP address changes */
+    uint16_t gdemu_slot;      /* offset 134: the GDEMU image the loader returns to (0 = none known) */
 } cl_hello_t;
-#define CL_HELLO_LEN 128
+#define CL_HELLO_LEN 136
+#define CL_HELLO_MAC 128
+#define CL_HELLO_SLOT 134
 #define CL_HF_PUSHED_LOADER 1u   /* this loader was pushed by the PC (self-update), not read from the disc */
 #define CL_HF_STUB_ARMED 2u
 
@@ -155,6 +161,7 @@ enum { CL_RUN_NONE = 0, CL_RUN_RUNNING = 1, CL_RUN_DONE = 2, CL_RUN_CRASHED = 3,
 /* header flags */
 #define CL_F_WDT_ARMED 1u      /* the client armed the SH-4 watchdog (reset mode) */
 #define CL_F_STUB_USED 2u      /* the way back went through the return stub */
+#define CL_F_DIAG 4u           /* args diag=1: the client and the stub hold each step on screen about a second */
 
 #define CL_TRAMP_WORDS 32
 typedef struct {
@@ -186,7 +193,9 @@ typedef struct {
     uint32_t tramp_stack[8];
 } cl_handoff_hdr_t;
 
-enum { CL_RSV_BIOS_SR = 0, CL_RSV_BIOS_VBR = 1, CL_RSV_BIOS_FPSCR = 2 };
+enum { CL_RSV_BIOS_SR = 0, CL_RSV_BIOS_VBR = 1, CL_RSV_BIOS_FPSCR = 2,
+       CL_RSV_GDEMU_SLOT = 6,  /* the loader's GDEMU image (LINK.TXT "slot"; 0 = none): every way back selects it */
+       CL_RSV_GDEMU_VER = 7 }; /* GDEMU's firmware version as the loader read it (dcql_hw.h), 0 = no GDEMU answered */
 #define CL_HANDOFF_HDR_CRC_FROM 12u
 #define CL_HANDOFF_HDR_CRC_TO ((uint32_t)__builtin_offsetof(cl_handoff_hdr_t, tramp))
 /* the report bytes a client may write: the launcher's cap when it set one */
@@ -203,7 +212,13 @@ typedef struct {
 enum { CL_STUBW_MAGIC = 0, CL_STUBW_STEP = 1, CL_STUBW_ERR = 2, CL_STUBW_ENTRIES = 3 };
 #define CL_STUB_MAGIC 0x42545353u   /* "SSTB" */
 enum { CL_STUB_STEP_ENTERED = 1, CL_STUB_STEP_QUIET = 2, CL_STUB_STEP_GDINIT = 3, CL_STUB_STEP_READ = 4,
-       CL_STUB_STEP_SHA = 5, CL_STUB_STEP_JUMP = 6, CL_STUB_STEP_REBOOT = 7 };
+       CL_STUB_STEP_SHA = 5, CL_STUB_STEP_JUMP = 6, CL_STUB_STEP_REBOOT = 7,
+       CL_STUB_STEP_GDEMU = 8 /* v2 (ql-core2): the loader's GDEMU image selected before the disc is read */ };
+/* tramp[CL_STUBW_ERR]: 0x1nn GD init, 0x200 no way back recorded, 0x3nn read, 0x400 SHA-256; | 0x8000 when the
+   GDEMU image select was refused (its code in bits 16..23); tramp[CL_STUBW_GDEMU]: the select's result + 0x100 */
+enum { CL_STUBW_GDEMU = 4 };
+/* the screen colour of each stub step (dcql_hw.h dcql_screen_colour): the stub has no text */
+#define CL_STUB_COLOURS {0x000000, 0x0000ff /* 1 entered: blue */, 0x00ffff /* 2 quiet: cyan */,     0xffff00 /* 3 GD init: yellow */, 0xff8000 /* 4 read: orange */, 0x00ff00 /* 5 SHA ok: green */,     0xffffff /* 6 jump: white */, 0xff0000 /* 7 reboot: red */, 0xff00ff /* 8 GDEMU select: magenta */}
 
 /* ------------------------------------------------------------------------------------------------ helpers */
 uint32_t cl_crc32(uint32_t crc, const void *buf, size_t n);  /* zlib-compatible: start with 0 */

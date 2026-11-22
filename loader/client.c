@@ -28,7 +28,9 @@
 #include "cl_core.h"
 #include "dcql_net.h"
 #include "dcql_live.h"
+#include "dcql_hw.h"
 #include <dc/video.h>
+#include <dc/biosfont.h>
 
 /* the program's stack and heap end below the hand-off area (dcql_loop.h) */
 uintptr_t arch_stack_16m = CL_HANDOFF_ADDR;
@@ -113,7 +115,8 @@ static void wdt_stop(void) {
 
 /* ---------------------------------------------------------------- the in-game link (adapter) */
 static int g_link;                  /* the link was started */
-static volatile int g_link_up;
+static volatile int g_link_up, g_link_failed;
+static volatile uint32_t g_link_up_ms;   /* ms from cl_init to the link up (adapter, address) */
 /* rx: one file-service answer (CL_FREAD_MAX in 1 KiB datagrams) with room to spare; tx: lines and still blocks */
 static unsigned char g_rx_mem[24 * 1024], g_tx_mem[16 * 1024];
 static mutex_t g_req_mx = MUTEX_INITIALIZER;
@@ -176,18 +179,56 @@ static void client_hello(void) {
     cl_wr32(pl + 100, CL_ROLE_CLIENT);
     cl_wr32(pl + 104, CL_NET_BBA);
     cl_wr32(pl + 116, H->h.run_id);
+    dcql_net_mac(pl + CL_HELLO_MAC);
+    cl_wr16(pl + CL_HELLO_SLOT, (uint16_t)H->h.reserved[CL_RSV_GDEMU_SLOT]);
     link_out(CL_HELLO, 0, 0, pl, sizeof(pl));
 }
 static void __attribute__((noreturn)) finish(uint32_t state, int code);
 static void summary(void);
 
 static int g_diag;                  /* args "diag=1": the link's first datagrams and a heartbeat on the serial line */
+/* args "diag=1" (ql-core2): every step of the client in large text on the lower part of the screen (the BIOS font at
+   twice its size, 26 characters, 5 rows that wrap), held about a second so a TV or a photo can read it; and on the
+   serial line ("cl-step"). Only on a 640-wide RGB565 screen; never from an exception handler. */
+static unsigned g_diag_row;
+static uint64_t g_t0_ms;
+static void diag_text(uint16_t colour, const char *b) {
+    if (!vid_mode || vid_mode->pm != PM_RGB565 || vid_mode->width != 640 || vid_mode->height < 480) return;
+    static uint16_t g[BFONT_HEIGHT * BFONT_THIN_WIDTH];
+    const unsigned row = g_diag_row++ % 5;
+    uint16_t *base = vram_s + (250 + row * 46) * 640;
+    for (int y = 0; y < 2 * BFONT_HEIGHT + 2; ++y)
+        for (int x = 0; x < 640; ++x) base[y * 640 + x] = 0x0008;   /* the row cleared (dark blue) */
+    for (int k = 0; k < 26 && b[k]; ++k) {
+        bfont_draw_ex(g, BFONT_THIN_WIDTH, colour, 0x0008, 16, true, (uint8_t)b[k], false, false);
+        uint16_t *dst = base + 8 + k * 24;
+        for (int y = 0; y < BFONT_HEIGHT; ++y)
+            for (int x = 0; x < BFONT_THIN_WIDTH; ++x) {
+                const uint16_t p = g[y * BFONT_THIN_WIDTH + x];
+                dst[(2 * y) * 640 + 2 * x] = dst[(2 * y) * 640 + 2 * x + 1] = p;
+                dst[(2 * y + 1) * 640 + 2 * x] = dst[(2 * y + 1) * 640 + 2 * x + 1] = p;
+            }
+    }
+}
+static void diag_step(uint16_t colour, const char *fmt, ...) {
+    if (!g_diag) return;
+    char b[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    dbgio_printf("cl-step %u ms: %s\n", (unsigned)(timer_ms_gettime64() - g_t0_ms), b);
+    diag_text(colour, b);
+    if (irq_inside_int()) return;
+    thd_sleep(1000);
+}
 static volatile uint32_t g_rx_seen, g_rx_bad;
 static void on_datagram(const uint8_t *d, int n) {
     const int len = cl_unframe(d, (size_t)n);
     ++g_rx_seen;
     if (g_diag && g_rx_seen <= 6)
         dbgio_printf("cl: from the PC: %d bytes type %02x frame %d\n", n, n > 3 ? d[3] : 0, len);
+    if (g_rx_seen == 1) diag_step(0x07e0, "CL 5 PC ANSWERED %u MS", (unsigned)(timer_ms_gettime64() - g_t0_ms));
     if (len < 0) { ++g_rx_bad; return; }
     const uint8_t type = d[3];
     const uint32_t session = cl_rd32(d + 4), a = cl_rd32(d + 8);
@@ -253,13 +294,25 @@ static void *link_thread(void *arg) {
     (void)arg;
     static uint8_t d[CL_DGRAM_MAX + 8];
     while (dcql_net_state() != DCQL_LINK_UP) {
-        if (dcql_net_state() == DCQL_LINK_FAILED) { cl_report("cl-link: adapter failed %d\n", dcql_net_err()); return NULL; }
+        if (dcql_net_state() == DCQL_LINK_FAILED) {
+            cl_report("cl-link: adapter failed %d after %u ms\n", dcql_net_err(), (unsigned)(timer_ms_gettime64() - g_t0_ms));
+            g_link_failed = 1;
+            sem_signal(&g_up_sem);   /* a waiter learns at once, not at its deadline */
+            diag_step(0xf800, "CL LINK FAILED %d", dcql_net_err());
+            return NULL;
+        }
         thd_sleep(20);
     }
     g_link_up = 1;
+    g_link_up_ms = (uint32_t)(timer_ms_gettime64() - g_t0_ms);
     dcql_live_link(1);
     sem_signal(&g_up_sem);
+    {
+        const unsigned char *ip = (const unsigned char *)&(unsigned){dcql_net_ip()};
+        diag_step(0x07e0, "CL 3 UP %u.%u.%u.%u %u MS", ip[0], ip[1], ip[2], ip[3], (unsigned)g_link_up_ms);
+    }
     client_hello();
+    diag_step(0xffff, "CL 4 HELLO SENT");
     uint64_t last = 0;
     for (;;) {   /* answers at once; live data out every 20 ms (a batch of about one picture) */
         const int n = dcql_net_recv_wait(d, sizeof(d), 20);
@@ -271,7 +324,7 @@ static void *link_thread(void *arg) {
 }
 int cl_link_up(void) { return g_link_up; }
 int cl_link_wait(int timeout_ms) {
-    if (!g_link) return 0;
+    if (!g_link || g_link_failed) return 0;
     if (g_link_up) return 1;
     sem_wait_timed(&g_up_sem, timeout_ms > 0 ? timeout_ms : 1);
     if (g_link_up) sem_signal(&g_up_sem);
@@ -466,7 +519,10 @@ static int still_send(const void *pix, unsigned w, unsigned hgt, unsigned stride
     return rc;
 }
 
-static void net_log(const char *line) { dbgio_printf("cl: %s\n", line); }
+static void net_log(const char *line) {
+    dbgio_printf("cl: %s\n", line);
+    if (g_diag && !strncmp(line, "dcql: ", 6)) diag_text(0xffe0, line + 6);   /* the link layer's steps, not held */
+}
 /* args "diag=1": once a second for a minute, what the link has seen (a stop in these lines is a dead scheduler) */
 static void *diag_thread(void *arg) {
     (void)arg;
@@ -495,10 +551,14 @@ static void link_start(void) {
     }
     c.rx_mem = g_rx_mem; c.rx_size = sizeof(g_rx_mem);
     c.tx_mem = g_tx_mem; c.tx_size = sizeof(g_tx_mem);
-    g_diag = has_arg("diag=1");
     c.log = net_log;
     dcql_net_config(&c);
-    if (dcql_net_start() < 0) return;
+    {
+        const unsigned char *ip = (const unsigned char *)&c.ip;
+        diag_step(0xffff, "CL 2 LINK %s %u.%u.%u.%u", c.dhcp_first ? "DHCP" : c.ip ? "STATIC" : "DHCP ANY", ip[0], ip[1],
+                  ip[2], ip[3]);
+    }
+    if (dcql_net_start() < 0) { diag_step(0xf800, "CL LINK START FAILED"); return; }
     nmmgr_handler_add(&g_pc_vfs.nmmgr);
     if (g_diag) {
         kthread_attr_t d;
@@ -566,8 +626,12 @@ static void __attribute__((noreturn)) finish(uint32_t state, int code) {
         seal(state, code);
     }
     wdt_disable();
-    dbgio_printf("\ncl: way out: %s, state %u exit %d\n", cl_stub_armed(H) ? "return stub" : "preloaded loader",
-                 (unsigned)H->h.state, H->h.exit_code);
+    dbgio_printf("\ncl: way out: %s, state %u exit %d\n", cl_stub_armed(H) ? "return stub" : g_loader ? "preloaded loader"
+                 : "BIOS reboot (GDEMU image selected first)", (unsigned)H->h.state, H->h.exit_code);
+    if (g_diag && state != CL_RUN_CRASHED) {   /* no font calls from a crash handler */
+        diag_text(0xffe0, cl_stub_armed(H) ? "CL 7 BACK: STUB" : g_loader ? "CL 7 BACK: PRELOADED" : "CL 7 BACK: REBOOT");
+        dcql_wait_vbl(60);
+    }
     if (cl_stub_armed(H)) dcql_jump_stub();
     jump_preloaded();
 }
@@ -577,6 +641,7 @@ static void summary(void) {
     if (g_leaving) return;
     cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us (the watchdog resets after about 20970 us)\n",
               g_wdt_armed ? "armed" : "measured only", (unsigned)g_wdt_feeds, (unsigned)g_wdt_gap_us);
+    if (g_link_up) cl_report("cl-link: up %u ms after start\n", (unsigned)g_link_up_ms);
     if (g_link)
         cl_report("cl-link: %s, files opened %u refused %u, reads %u, %u bytes in %u ms, lines %u dropped %u, stills %u\n",
                   g_link_up ? "up" : "never up", g_st.files_opened, g_st.files_refused, g_st.reads, g_st.read_bytes,
@@ -595,6 +660,7 @@ static void summary(void) {
 
 void cl_exit(int code) {
     if (!g_active) exit(code);
+    diag_step(0xffff, "CL 6 EXIT %d", code);
     summary();
     finish(CL_RUN_DONE, code);
 }
@@ -670,8 +736,12 @@ int cl_init(unsigned flags) {
     if (g_active) return 1;
     g_active = cl_handoff_valid(H) && H->h.state == CL_RUN_RUNNING;
     if (!g_active) return 0;
+    g_t0_ms = timer_ms_gettime64();
+    g_diag = has_arg("diag=1");
     H->h.report_len = 0;
+    if (g_diag) H->h.flags |= CL_F_DIAG;   /* the stub holds its colours too */
     cl_handoff_seal(H);
+    diag_step(0xffff, "CL 1 START RUN %08X", (unsigned)H->h.run_id);
     if (!cl_stub_armed(H) && !(flags & CL_NO_PRELOAD)) preload();
     irq_set_handler(EXC_UNHANDLED_EXC, crash_handler, NULL);
     irq_set_handler(EXC_DOUBLE_FAULT, crash_handler, NULL);
@@ -687,5 +757,6 @@ int cl_init(unsigned flags) {
     }
     wdt_start(has_arg("wdt=1"));
     if (H->h.net_kind == CL_NET_BBA && !(flags & CL_NO_LINK) && !has_arg("net=0")) link_start();
+    else diag_step(0x8410, "CL 2 NO LINK (NOT ASKED)");
     return 1;
 }
