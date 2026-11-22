@@ -1,0 +1,319 @@
+#!/bin/bash
+# tools/gate/gate.sh <branch> <head> [--lane NAME] [--plan FILE]... [--no-flycast] [--no-push]
+#
+# The integration gate of dc-qalink 0.2: the only way work reaches the integration branch (v0.2 unless GATE_BASE says
+# otherwise). One run:
+#   1. merge <head> into a scratch worktree at the integration branch's tip with --no-ff --no-commit (a conflict aborts
+#      the merge and fails the gate: a lane's conflict is never resolved here); a head already in the branch is gated
+#      as the baseline. The gate's own files (tools/gate/, docs/RELEASE_0.2.md) must not be changed by the head.
+#   2. build every image with make -j2 (GATE_JOBS), objects in /dev/shm: the loader (adapter and modem), its return
+#      stub, the test program, liveprog, the host build of the protocol core, the example program in four forms
+#      (0.1's modem build, both transports, adapter with the way back, link off), and any other folder with a Makefile;
+#   3. run every host test (tests/test_*.py; an unknown new one is run too), the syntax of every Python file, and the
+#      controls: test_echo against the 0.2 work-in-progress PC tool (be1edc1e4) must fail;
+#   4. the size rows of plan section 3 from liveprog's link map (sizes.py; never loosened: fixed memory is listed as
+#      OVER while it is over), the blob check of what the head adds (blobcheck.py);
+#   5. one Flycast suite (flysuite.py: guard, loop rows, bridge rows, MCP, the planted 2 ms control, the lane's own
+#      controls and its two cited numbers from --plan);
+#   6. PASS: commit the merge ("Merge <lane> <head> (gate PASS)"), fast-forward the integration branch, push it.
+#      FAIL: the merge is thrown away; the report names the step and the file.
+# The gate's own copy of tools/gate (the integration branch's worktree) runs, never the head's.
+#
+# Machine settings come from the file named by GATE_ENV (shell assignments; nothing of this PC is in the repository):
+#   GATE_REPO     worktree of the integration branch (the gate's own files; fast-forwarded and pushed on PASS)
+#   GATE_SCRATCH  worktree used only for gate merges (reset at every run)
+#   GATE_OUT      evidence root: <GATE_OUT>/<lane>-<head9>/ gets gate.md, steps.tsv, build/, host/, sizes/, blob/, fly/
+#   GATE_KOS_ENV  a script that sets up KallistiOS when sourced (KOS_BASE, kos-cc on PATH)
+#   GATE_MKGDI    a GDI builder: [LAYOUT= SECTOR= PAD_1ST= TITLE=] mkgdi <elf> <datadir> <outdir>
+#   GATE_WINPY    Windows Python (3.10+, with the mcp package) that runs flysuite.py and the MCP host test
+#   GATE_FLYCAST  flycast.exe (Windows path) with a working broadband adapter;  GATE_FLYCFG its -config transients
+#   GATE_PC_IP    this PC's address (the loader's host line; Flycast's adapter speaks from it)
+#   GATE_PORT GATE_LPORT GATE_CTL GATE_HTTP GATE_MCP   the gate's own ports (never 52060)
+#   optional: GATE_BASE (v0.2), GATE_JOBS (2), GATE_MINFREE ("C:=28 E:=20"), GATE_CPU_MAX (85), GATE_LINK_EXTRA
+#             (LINK.TXT lines, ';'-separated), GATE_TRAILER (lines ending the merge commit), GATE_FLYLOCK (lock file)
+set -u
+usage() { echo "usage: GATE_ENV=<file> $0 <branch> <head> [--lane NAME] [--plan FILE]... [--no-flycast] [--no-push]" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+BRANCH=$1 HEAD_REF=$2; shift 2
+LANE=$BRANCH PLANS=() NOFLY=0 NOPUSH=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --lane) LANE=$2; shift 2 ;;
+    --plan) PLANS+=("$2"); shift 2 ;;
+    --no-flycast) NOFLY=1; shift ;;
+    --no-push) NOPUSH=1; shift ;;
+    *) usage ;;
+  esac
+done
+: "${GATE_ENV:?GATE_ENV names the machine settings file}"
+. "$GATE_ENV"
+for v in GATE_REPO GATE_SCRATCH GATE_OUT GATE_KOS_ENV GATE_MKGDI GATE_WINPY GATE_FLYCAST GATE_FLYCFG GATE_PC_IP \
+         GATE_PORT GATE_LPORT GATE_CTL GATE_HTTP GATE_MCP; do
+  [ -n "${!v:-}" ] || { echo "gate: $v is not set in $GATE_ENV" >&2; exit 2; }
+done
+for p in $GATE_PORT $GATE_LPORT $GATE_CTL $GATE_HTTP $GATE_MCP; do
+  [ "$p" != 52060 ] || { echo "gate: port 52060 is the real console's loader port" >&2; exit 2; }
+done
+BASE=${GATE_BASE:-v0.2} J=${GATE_JOBS:-2} MINFREE=${GATE_MINFREE:-C:=28 E:=20} CPUMAX=${GATE_CPU_MAX:-85}
+GR=$GATE_REPO S=$GATE_SCRATCH
+export PYTHONDONTWRITEBYTECODE=1
+winp() { wslpath -w "$1"; }
+FLYPY=$(winp "$GR/tools/gate/flysuite.py")
+
+git -C "$GR" fetch -q origin 2>/dev/null
+HEADSHA=$(git -C "$GR" rev-parse --verify -q "$HEAD_REF^{commit}") || { echo "gate: no commit $HEAD_REF" >&2; exit 2; }
+BASESHA=$(git -C "$GR" rev-parse --verify -q "$BASE^{commit}") || { echo "gate: no branch $BASE" >&2; exit 2; }
+ID=$LANE-${HEADSHA:0:9}
+G=$GATE_OUT/$ID; k=2
+while [ -e "$G" ]; do G=$GATE_OUT/$ID-run$k; k=$((k + 1)); done
+mkdir -p "$G"/build
+W=/dev/shm/dcql-gate/$ID
+rm -rf "${W:?}"; mkdir -p "$W"/host
+STEPS=$G/steps.tsv; : > "$STEPS"
+row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STEPS"; printf '[%s] %s: %s\n' "$2" "$1" "$3"; }
+started=$(date '+%Y-%m-%d %H:%M:%S %z')
+echo "gate: $LANE $BRANCH $HEADSHA into $BASE $BASESHA; evidence $G"
+
+finish() {   # $1 verdict
+  local verdict=$1 ended
+  ended=$(date '+%Y-%m-%d %H:%M:%S %z')
+  [ -d "$W/host" ] && cp -r "$W/host" "$G/" 2>/dev/null
+  {
+    echo "# Gate: $LANE $BRANCH ${HEADSHA:0:9} into $BASE"
+    echo
+    echo "**Verdict: $verdict** (mode: ${MODE:-?}; $started to $ended)"
+    echo
+    echo "- head: \`$HEADSHA\` ($BRANCH); base: \`$BASESHA\` ($BASE)${NEWSHA:+; merge commit \`$NEWSHA\`}"
+    echo "- tiers: builds and host tests on this PC; Flycast rows are function checks (Flycast tier, never console numbers);"
+    echo "  sizes from the link map (exact bytes)"
+    echo "- tables: steps.tsv, build/, host/, sizes/sizes.md, blob/blob.md, fly/fly.md"
+    echo
+    echo "| step | verdict | detail |"
+    echo "|---|---|---|"
+    awk -F'\t' '{ gsub(/\|/, "/", $3); printf "| %s | %s | %s |\n", $1, $2, $3 }' "$STEPS"
+    [ -f "$G/sizes/sizes.md" ] && { echo; sed -n '1,12p' "$G/sizes/sizes.md" | sed 's/^# /## /'; }
+    [ -f "$G/fly/fly.md" ] && { echo; sed 's/^# /## /' "$G/fly/fly.md"; }
+  } > "$G/gate.md"
+  rm -rf "${W:?}"
+  echo "gate: $verdict ($G/gate.md)"
+  case $verdict in PASS*) exit 0 ;; *) exit 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------------------------------- 0. machine
+m=$("$GATE_WINPY" "$FLYPY" machine --cpu-max "$CPUMAX" --min-free $MINFREE 2>/dev/null); rc=$?
+if [ $rc -ne 0 ]; then row machine STOPPED "$m"; MODE=none; finish "STOPPED (machine, not the lane)"; fi
+row machine PASS "$m"
+
+# ------------------------------------------------------------------------------------------------------ 1. merge
+cd "$S" || exit 2
+git merge --abort -q 2>/dev/null
+git reset -q --hard && git clean -fdxq
+git checkout -q --detach "$BASESHA" || { row merge FAIL "scratch worktree would not check out $BASESHA"; finish FAIL; }
+if git merge-base --is-ancestor "$HEADSHA" "$BASESHA"; then
+  MODE=baseline
+  RANGE=origin/main..$BASESHA
+  row merge PASS "baseline: $HEADSHA is already in $BASE ($BASESHA); nothing merged"
+else
+  MODE=merge
+  RANGE=$BASESHA..$HEADSHA
+  if ! git merge --no-ff --no-commit "$HEADSHA" > "$G/merge.log" 2>&1; then
+    c=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+    git merge --abort -q 2>/dev/null; git reset -q --hard
+    row merge FAIL "conflict, merge aborted (not resolved here): ${c:-see merge.log}"
+    finish FAIL
+  fi
+  row merge PASS "$(git diff --cached --shortstat | sed 's/^ //')"
+  own=$(git diff --name-only "$BASESHA"..."$HEADSHA" | grep -E '^(tools/gate/|docs/RELEASE_0\.2\.md$)' | tr '\n' ' ')
+  [ -z "$own" ] && row "gate files untouched" PASS "tools/gate/ and docs/RELEASE_0.2.md not changed by the head" \
+                || row "gate files untouched" FAIL "the head changes the gate's own files: $own"
+fi
+git log -1 --format='%H %s' "$HEADSHA" > "$G/head.txt"
+mkdir -p "$G/tree"
+for d in pc tests tools relay; do [ -d "$S/$d" ] && cp -r "$S/$d" "$G/tree/"; done
+find "$G/tree" -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null
+
+# ----------------------------------------------------------------------------------------------------- 2. builds
+pushd "$(dirname "$GATE_KOS_ENV")" > /dev/null && . "./$(basename "$GATE_KOS_ENV")" > /dev/null 2>&1; popd > /dev/null
+command -v kos-cc > /dev/null || { row "KallistiOS" FAIL "kos-cc not on PATH after $GATE_KOS_ENV"; finish FAIL; }
+BID="gate-${HEADSHA:0:9}"
+build_row() {   # name, outputs (space-separated, must exist after), command...
+  local name=$1 outs=$2 log=$G/build/$1.log; shift 2
+  if timeout 1200 "$@" > "$log" 2>&1; then
+    local miss="" f
+    for f in $outs; do [ -s "$f" ] || miss="$miss $(basename "$f")"; done
+    if [ -n "$miss" ]; then row "build $name" FAIL "built, but missing:$miss (build/$name.log)"; return 1; fi
+    local w; w=$(grep -c 'warning:' "$log")
+    row "build $name" PASS "$(for f in $outs; do printf '%s %s B; ' "$(basename "$f")" "$(stat -c %s "$f")"; done)warnings $w"
+  else
+    row "build $name" FAIL "build/$name.log: $(grep -m2 -E 'error|Error|No rule' "$log" | tr '\n' ' ' | cut -c1-240)"
+    return 1
+  fi
+}
+O=$W/both
+build_row loader "$O/loader.elf $O/LOADER.BIN $O/testprog.elf $O/testprog.bin $O/stub.bin $O/liveprog.elf $O/liveprog.map" \
+  make -C "$S/loader" -j"$J" OUT="$O" BUILD="$BID" all
+build_row loader-modem-only "$W/modem/loader.elf" make -C "$S/loader" -j"$J" OUT="$W/modem" LOADER_NET=modem BUILD="$BID" "$W/modem/loader.elf"
+build_row host-core "$W/hostb/cl_host" make -C "$S/loader" OUT="$W/hostb" host
+for v in "modem-0.1:DCQL_ENABLE=1 DCQL_NET=modem" "both:DCQL_ENABLE=1 DCQL_NET=both" \
+         "bba-loop:DCQL_ENABLE=1 DCQL_NET=bba DCQL_LOOP=1" "link-off:DCQL_ENABLE=0"; do
+  n=${v%%:*} vars=${v#*:} d=$W/ex-${v%%:*}
+  rm -rf "${d:?}"; cp -r "$S/example" "$d"
+  # shellcheck disable=SC2086
+  build_row "example-$n" "$d/dcql-example.elf" make -C "$d" -j"$J" DCQL_DIR="$S/lib" DCQL_OBJDIR="$d/obj" $vars
+done
+for mk in "$S"/*/Makefile "$S"/example/*/Makefile; do   # any other program (example/netdisc/ and the like)
+  [ -f "$mk" ] || continue
+  rel=${mk#"$S"/}; rel=${rel%/Makefile}
+  case $rel in loader|example) continue ;; esac
+  dn=$(echo "$rel" | tr / -) d=$W/extra-$(echo "$rel" | tr / -)
+  rm -rf "${d:?}"; mkdir -p "$d"; cp -r "$S/$rel" "$d/src"
+  build_row "extra-$dn" "" make -C "$d/src" -j"$J" OUT="$d/out" DCQL_DIR="$S/lib" DCQL_OBJDIR="$d/obj" DCQL_ENABLE=1
+done
+{ for f in "$O"/*.elf "$W"/modem/loader.elf "$W"/ex-*/dcql-example.elf; do [ -f "$f" ] && sh-elf-size "$f" | tail -1 | sed "s#$W/##"; done; } \
+  > "$G/build/elf-sizes.txt" 2>/dev/null
+for f in testprog.elf liveprog.elf loader.elf LOADER.BIN stub.bin liveprog.map; do [ -f "$O/$f" ] && cp "$O/$f" "$G/build/"; done
+
+# ------------------------------------------------------------------------------------------------- 3. host tests
+H=$W/host
+test_row() {   # name, expect (0 or fail), command...
+  local name=$1 expect=$2 log=$H/$1.log rc; shift 2
+  (cd "$S" && timeout 900 "$@") > "$log" 2>&1; rc=$?
+  local tail; tail=$(grep -E '[0-9]+ of [0-9]+|passed|^OK|^FAILED|Ran [0-9]+|PASS|FAIL' "$log" | tail -2 | tr '\n' ' ' | cut -c1-200)
+  if { [ "$expect" = 0 ] && [ $rc -eq 0 ]; } || { [ "$expect" = fail ] && [ $rc -ne 0 ] && [ $rc -ne 124 ]; }; then
+    row "test $name" PASS "rc $rc${expect:+ (must: $expect)}; $tail"
+  else
+    row "test $name" FAIL "rc $rc (must: $expect); host/$name.log; $tail"
+  fi
+}
+pyfiles=$(cd "$S" && git ls-files '*.py' | tr '\n' ' ')
+# shellcheck disable=SC2086
+test_row python-syntax 0 python3 -c 'import ast,sys; [ast.parse(open(f,encoding="utf-8").read(),f) for f in sys.argv[1:]]; print(len(sys.argv)-1,"files parse")' $pyfiles
+test_row test_loop 0 python3 tests/test_loop.py --quick --host "$W/hostb/cl_host" --out "$H/loop"
+test_row test_bridge 0 python3 tests/test_bridge.py --out "$H/bridge"
+test_row test_autoconnect 0 python3 tests/test_autoconnect.py --out "$H/autoconnect"
+test_row test_echo 0 python3 tests/test_echo.py
+if git -C "$S" show be1edc1e4:pc/dcql_loop.py > "$W/dcql_loop_be1edc1e4.py" 2>/dev/null; then
+  # test_echo --old runs its control row itself: be1edc1e4's PC tool must take its own echo, and the row says so
+  test_row control-test_echo-old 0 python3 tests/test_echo.py --old "$W/dcql_loop_be1edc1e4.py"
+  grep -qE "^control: be1edc1e4.*must fail\) +PASS" "$H/control-test_echo-old.log" \
+    && row "control be1edc1e4 takes its own echo" PASS "the old PC tool fails as it must (test_echo's control row)" \
+    || row "control be1edc1e4 takes its own echo" FAIL "test_echo's control row did not show the old tool failing"
+else
+  row "test control-test_echo-old" FAIL "be1edc1e4's pc/dcql_loop.py not found"
+fi
+test_row test_link 0 sh -c 'cd tests && python3 -m unittest -v test_link'
+mkdir -p "$G/host-mcp"
+log=$G/host-mcp/test_mcp-host.log
+(cd "$G/tree" && timeout 600 "$GATE_WINPY" -u tests/test_mcp.py --out "$(winp "$G/host-mcp")") > "$log" 2>&1; rc=$?
+t=$(grep -E 'of [0-9]+ passed' "$log" | tail -1)
+[ $rc -eq 0 ] && row "test test_mcp (host, simulated console)" PASS "$t" || row "test test_mcp (host, simulated console)" FAIL "rc $rc; host-mcp/test_mcp-host.log; $t"
+for t in "$S"/tests/test_*.py; do
+  n=$(basename "$t" .py)
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp) continue ;; esac
+  if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
+  else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
+done
+
+# ---------------------------------------------------------------------------------------------- 4. sizes, blobs
+mkdir -p "$G/sizes"
+python3 "$GR/tools/gate/sizes.py" --map "$O/liveprog.map" --objs client.o,cl_util.o,dcql_return.o,dcql_net_bba.o,dcql_live.o \
+  --nm sh-elf-nm --objdir "$O/cl" --stub "$O/stub.bin" --baseline "$GATE_OUT/sizes-$BASE.json" --out "$G/sizes" > "$G/sizes/run.log" 2>&1 \
+  || [ -f "$G/sizes/sizes.json" ]
+if [ -f "$G/sizes/sizes.json" ]; then
+  while IFS=$'\t' read -r r lim val ver d; do
+    case $ver in FAIL*) vv=FAIL ;; OVER*) vv=OVER ;; *) vv=PASS ;; esac
+    row "size $r" "$vv" "$val B against $lim B; $ver; change $d"
+  done < <(python3 -c 'import json,sys; [print("\t".join(str(x) for x in (r["row"],r["limit"],r["measured"],r["verdict"],r["delta_vs_baseline"]))) for r in json.load(open(sys.argv[1]))["rows"]]' "$G/sizes/sizes.json")
+else
+  row "size rows" FAIL "sizes.py: $(tail -2 "$G/sizes/run.log" | tr '\n' ' ')"
+fi
+mkdir -p "$G/blob"
+if python3 "$GR/tools/gate/blobcheck.py" --repo "$S" --range "$RANGE" --out "$G/blob" > "$G/blob/run.log" 2>&1; then
+  row "blob check" PASS "$RANGE: $(sed -n 3p "$G/blob/blob.md")"
+else
+  row "blob check" FAIL "$RANGE: $(grep -E '^\| [a-z]' "$G/blob/blob.md" | grep -v '^| rule' | head -4 | tr '\n' ' ' | cut -c1-300)"
+fi
+
+# ----------------------------------------------------------------------------------------------------- 5. Flycast
+if [ $NOFLY = 1 ]; then
+  row flycast SKIPPED "--no-flycast (a gate without its Flycast suite cannot PASS)"
+elif grep -q $'\tFAIL\t' "$STEPS"; then
+  row flycast SKIPPED "an earlier step failed"
+else
+  D=$W/discdata X=$W/disc
+  mkdir -p "$D" "$G/fly/disc" "$W/tmp"
+  cp "$O/LOADER.BIN" "$D/"
+  {
+    echo "# dc-qalink gate disc (Flycast only): the broadband adapter, this PC as the host, the gate's own port pair"
+    printf 'net bba\nhost %s\nport %s\nlport %s\nslot 1\n' "$GATE_PC_IP" "$GATE_PORT" "$GATE_LPORT"
+    [ -n "${GATE_LINK_EXTRA:-}" ] && echo "$GATE_LINK_EXTRA" | tr ';' '\n'
+    for p in "${PLANS[@]}"; do python3 -c 'import json,sys; [print(l) for l in json.load(open(sys.argv[1])).get("linktxt",[])]' "$p"; done
+  } > "$D/LINK.TXT"
+  if TMPDIR=$W/tmp LAYOUT=legacy SECTOR=2048 PAD_1ST=1 TITLE="DC-QALINK LOADER" timeout 600 bash "$GATE_MKGDI" "$O/loader.elf" "$D" "$X" \
+       > "$G/build/mkgdi.log" 2>&1; then
+    cp "$X"/disc.gdi "$X"/track0* "$D/LINK.TXT" "$G/fly/disc/"
+    row "flycast disc" PASS "$(grep -v '^#' "$D/LINK.TXT" | tr '\n' ' ')"
+    m=$("$GATE_WINPY" "$FLYPY" machine --cpu-max "$CPUMAX" --min-free $MINFREE 2>/dev/null); rc=$?
+    if [ $rc -ne 0 ]; then
+      row flycast STOPPED "machine before Flycast: $m"
+    else
+      pargs=(--plan "$(winp "$GR/tools/gate/suite.json")")
+      for p in "${PLANS[@]}"; do pargs+=(--plan "$(winp "$p")"); done
+      timeout 3000 "$GATE_WINPY" -u "$FLYPY" run --flycast "$GATE_FLYCAST" --config "$GATE_FLYCFG" \
+        --disc "$(winp "$G/fly/disc/disc.gdi")" --tree "$(winp "$G/tree")" --build "$(winp "$G/build")" \
+        --pc-ip "$GATE_PC_IP" --port "$GATE_PORT" --lport "$GATE_LPORT" --ctl "$GATE_CTL" --http "$GATE_HTTP" \
+        --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} "${pargs[@]}" \
+        > "$G/fly/run.out" 2>&1; rc=$?
+      sum=$(python3 -c 'import json,sys
+r=json.load(open(sys.argv[1]))
+ok=sum(1 for x in r["rows"] if x["ok"]); c=sum(1 for x in r["cites"] if x["ok"])
+bad=[x["name"] for x in r["rows"] if not x["ok"]]+[x["what"] for x in r["cites"] if not x["ok"]]
+print("%d of %d rows, %d of %d cited numbers reproduced%s" % (ok, len(r["rows"]), c, len(r["cites"]), ("; failed: "+", ".join(bad)) if bad else ""))' \
+        "$G/fly/fly.json" 2>/dev/null)
+      case $rc in
+        0) row flycast PASS "$sum" ;;
+        9) row flycast FAIL "the guard refused: another loader was heard (nothing sent to it); $sum" ;;
+        20|21|22) row flycast STOPPED "machine or lock (rc $rc); $(tail -1 "$G/fly/run.out")" ;;
+        *) row flycast FAIL "rc $rc; $sum; fly/fly.md" ;;
+      esac
+    fi
+    rm -f "$G"/fly/disc/track0*
+  else
+    row "flycast disc" FAIL "build/mkgdi.log: $(tail -2 "$G/build/mkgdi.log" | tr '\n' ' ')"
+  fi
+fi
+
+# ----------------------------------------------------------------------------------------------------- 6. verdict
+if grep -qE $'\t(FAIL|SKIPPED|STOPPED)\t' "$STEPS"; then
+  if grep -q $'\tSTOPPED\t' "$STEPS" && ! grep -q $'\tFAIL\t' "$STEPS"; then V="STOPPED (machine, not the lane)"; else V=FAIL; fi
+  git -C "$S" merge --abort -q 2>/dev/null; git -C "$S" reset -q --hard
+  finish "$V"
+fi
+NEWSHA=""
+if [ $MODE = merge ]; then
+  fixed=$(grep -P '^size fixed\t' "$STEPS" | cut -f3)
+  {
+    echo "Merge $LANE ${HEADSHA:0:9} (gate PASS)"
+    echo
+    echo "$BRANCH at $HEADSHA, gated into $BASE: $(grep -c $'\tPASS\t' "$STEPS") steps pass (builds, host tests and"
+    echo "controls, size rows, blob check, the Flycast suite). Fixed memory: $fixed."
+    [ -n "${GATE_TRAILER:-}" ] && { echo; echo "$GATE_TRAILER"; }
+  } > "$W/msg.txt"
+  git -C "$S" commit -q -F "$W/msg.txt" || { row commit FAIL "git commit failed"; finish FAIL; }
+  NEWSHA=$(git -C "$S" rev-parse HEAD)
+  [ "$(git -C "$GR" rev-parse "$BASE")" = "$BASESHA" ] || { row commit FAIL "$BASE moved during the gate"; finish FAIL; }
+  git -C "$GR" merge -q --ff-only "$NEWSHA" || { row commit FAIL "fast-forward of $BASE failed"; finish FAIL; }
+  row commit PASS "$NEWSHA on $BASE"
+fi
+if [ $NOPUSH = 1 ]; then
+  row push SKIPPED "--no-push: $BASE is $(git -C "$GR" rev-parse "$BASE") here, not pushed"
+  finish "PASS (not pushed)"
+fi
+if git -C "$GR" push -q origin "refs/heads/$BASE:refs/heads/$BASE" > "$G/push.log" 2>&1; then
+  row push PASS "origin/$BASE at $(git -C "$GR" rev-parse "$BASE")"
+else
+  row push FAIL "push.log: $(tail -2 "$G/push.log" | tr '\n' ' ')"
+  finish "FAIL (push)"
+fi
+cp "$G/sizes/sizes.json" "$GATE_OUT/sizes-$BASE.json"
+finish PASS
