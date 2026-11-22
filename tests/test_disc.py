@@ -214,6 +214,31 @@ def main():
         check('builds persist in builds.json', r1.build in json.load(open(b.builds_path)))
         st = b.status()
         check('status names the current build and the disc mode', st['build'] == r3.build and st['disc'] == 'overlay')
+        # the HTTP side: builds, the disc, a disc file, plugins from a folder outside the repository
+        import urllib.request, urllib.error
+        from bridge.api import serve
+        plug = os.path.join(out, 'plugins')
+        os.makedirs(plug, exist_ok=True)
+        open(os.path.join(plug, 'toy.js'), 'w').write('export default { id: "toy", label: "Toy", exts: [".toy"], '
+                                                      'async decode() { return null; } };\n')
+        b.asset_plugins = plug
+        srv = serve(b, '127.0.0.1', 0)
+        url = 'http://127.0.0.1:%d' % srv.server_address[1]
+        get = lambda p: urllib.request.urlopen(url + p, timeout=10).read()
+        bl2 = json.loads(get('/v0/builds'))
+        dj = json.loads(get('/v0/disc'))
+        fb = get('/v0/disc/file?path=NETDISC/BIG.BIN')
+        pj = json.loads(get('/v0/plugins'))
+        check('HTTP: builds listed, the disc manifest, a file as the console sees it (overlay first), plugins',
+              len(bl2['builds']) == 2 and dj['sha256'] == m['sha256'] and
+              hashlib.sha256(fb).hexdigest() == exp['BIG.BIN']['sha256'] and pj['plugins'][0]['name'] == 'toy.js' and
+              b'export default' in get('/v0/plugins/toy.js'))
+        try:
+            get('/v0/plugins/..%2Fexpect.json')
+            check('CONTROL a plugin path outside the folder is refused', False)
+        except urllib.error.HTTPError as e:
+            check('CONTROL a plugin path outside the folder is refused', e.code == 404)
+        srv.shutdown()
         # CONTROL: a session without a build carries none (the stamp is the build's, not a constant)
         s0 = live.Session(None, 'x', {'name': 'x'}, 'mock', 'x')
         r0 = s0.add({'t': 'log', 'n': 1, 'lv': 'info', 'ph': 'play', 'msg': 'x'})

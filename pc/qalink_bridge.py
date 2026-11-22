@@ -31,6 +31,8 @@ def main(argv=None):
     ap.add_argument('--overlay', help='the network disc\'s overlay folder: its changed files are served, the rest read '
                                       'from the console\'s own disc (GDEMU)')
     ap.add_argument('--whole', action='store_true', help='serve the whole disc (base + overlay) from the PC')
+    ap.add_argument('--asset-plugins', help='a folder of asset decoder plugins (ES modules) for QA Link Cloud\'s Assets '
+                                            'workspace: a game\'s own formats, kept outside any public repository')
     ap.add_argument('--level', choices=('read', 'control', 'run'), default='run', help='the most this bridge accepts')
     ap.add_argument('--allow-lan', action='store_true',
                     help='talk to a real console on the network. Off by default: the bridge then talks only to a loader '
@@ -54,6 +56,7 @@ def main(argv=None):
     b = Bridge(a.data, (a.udp_host, a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
                autoconnect=not a.no_autoconnect, only_local=not a.allow_lan, disc=a.disc, overlay=a.overlay,
                whole=a.whole)
+    b.asset_plugins = a.asset_plugins
     serve(b, '127.0.0.1', a.port, a.level)
     if a.mcp_http:
         from bridge import mcp_server

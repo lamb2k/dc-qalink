@@ -447,6 +447,7 @@ class Bridge:
                 self.builds = {}
         self.build = None            # the current build's id (the last pushed, or the linked program's)
         self.disc_args = (disc, overlay, bool(whole))
+        self.asset_plugins = None    # a folder of decoder plugins (ES modules) for QA Link Cloud's Assets workspace
         self.disc = None
         if disc or overlay:
             self.disc = dcql_disc.DiscService(disc, overlay, whole, self.log, self.record,

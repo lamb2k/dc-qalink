@@ -250,7 +250,14 @@ static int slot_take(void) {   /* an empty block, else the least recently used o
         if (!g_slot[i].valid) return (int)i;
         if (g_slot[i].req < 0 && (best < 0 || g_slot[i].used < g_slot[best].used)) best = (int)i;
     }
-    if (best >= 0) g_slot[best].valid = 0;
+    if (best < 0)   /* every block is being filled by a read-ahead nobody used (seeks): take the oldest one back */
+        for (uint32_t i = 0; i < g_slots; ++i)
+            if (best < 0 || g_slot[i].used < g_slot[best].used) best = (int)i;
+    if (best >= 0) {
+        if (g_slot[best].req >= 0) req_cancel(&g_req[g_slot[best].req]);
+        g_slot[best].valid = 0;
+        g_slot[best].req = -1;
+    }
     return best;
 }
 /* starts filling a cache block of the file at `off` (a block boundary); NULL when no block or request is free */
@@ -335,7 +342,7 @@ static ssize_t pc_read_locked(df_t *f, uint8_t *buf, size_t cnt) {
         memcpy(buf + done, g_cache + (uint32_t)(s - g_slot) * g_block + (f->pos - s->off), n);
         f->pos += n;
         done += n;
-        readahead(f, boff + g_block);
+        for (uint32_t k = 1; k <= g_cfg.window; ++k) readahead(f, boff + k * g_block);   /* `window` blocks ahead */
     }
     return (ssize_t)done;
 }
@@ -552,11 +559,15 @@ int dcql_disc_mount(const dcql_disc_config_t *c) {
     dcql_disc_config_t d = {0};
     if (c) d = *c;
     if (!d.mount) d.mount = "/cd";
+    /* defaults from the Flycast round f1 (ql-disc): more than about 8 KiB arriving at once overran the receive path
+       (KallistiOS's adapter ring is 16 KiB with frame headers; the PC sends a request's pieces back to back), each loss
+       costing a 250 ms resend; 2 x 4 KiB kept every piece. window * block is held to 16 KiB, the ring's size. */
     if (!d.window) d.window = 2;
-    if (!d.block) d.block = 8 * 1024;
+    if (!d.block) d.block = 4 * 1024;
     if (!d.timeout_ms) d.timeout_ms = 3000;
     if (!d.link_wait_ms) d.link_wait_ms = 20000;
     if (d.window > 4 || d.block % 1024 || d.block > 32 * 1024 || d.block > DCQL_DISC_CACHE ||
+        d.window * d.block > 16u * 1024u ||
         strlen(d.mount) >= sizeof(g_vfs.nmmgr.pathname))
         return -5;
     g_cfg = d;

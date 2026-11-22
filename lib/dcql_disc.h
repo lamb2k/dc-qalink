@@ -75,9 +75,10 @@ enum { DCQL_SIDE_DISC = 0, DCQL_SIDE_PC = 1 };
 typedef struct {
     const char *mount;       /* default "/cd" */
     int mode;                /* DCQL_DISC_* (default AUTO) */
-    unsigned window;         /* requests in flight at once, 1..4 (default 2) */
-    unsigned block;          /* bytes a request asks for, 1..32 KiB in whole KiB (default 8 KiB); the cache holds
-                                DCQL_DISC_CACHE / block blocks */
+    unsigned window;         /* requests in flight at once, 1..4 (default 2); also how many blocks are read ahead */
+    unsigned block;          /* bytes a request asks for, 1..32 KiB in whole KiB (default 4 KiB); the cache holds
+                                DCQL_DISC_CACHE / block blocks. window * block must be at most 16 KiB (the adapter's
+                                receive ring: more arriving at once is lost and resent; docs/NETDISC.md) */
     unsigned timeout_ms;     /* one request's time limit (default 3000) */
     unsigned link_wait_ms;   /* how long mount waits for the link (default 20000) */
     int no_log;              /* 1: no DLOG records */

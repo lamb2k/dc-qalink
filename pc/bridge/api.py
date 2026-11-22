@@ -205,6 +205,18 @@ def make_handler(bridge, level='run'):
                         return self.reply(200, {'mode': None, 'files': [], 'note': 'no network disc: start the bridge '
                                                 'with --disc <folder or .gdi/.iso> and/or --overlay <folder>'})
                     return self.reply(200, dict(bridge.disc.manifest(), stats=bridge.disc.summary()))
+                if p == '/v0/plugins':
+                    d = bridge.asset_plugins
+                    names = sorted(n for n in os.listdir(d) if n.endswith(('.js', '.mjs'))) if d and os.path.isdir(d) else []
+                    return self.reply(200, {'plugins': [{'name': n, 'url': '/v0/plugins/' + n} for n in names],
+                                            'folder': bool(d)})
+                m = re.match(r'^/v0/plugins/([\w.-]+\.m?js)$', p)
+                if m:
+                    d = bridge.asset_plugins
+                    path = os.path.join(d, m[1]) if d else None
+                    if not path or not os.path.isfile(path):
+                        return self.err(404, 'no plugin %s' % m[1])
+                    return self.reply(200, open(path, 'rb').read(), 'text/javascript; charset=utf-8')
                 if p == '/v0/disc/reads':
                     if bridge.disc is None:
                         return self.reply(200, {'reads': []})
