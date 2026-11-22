@@ -227,6 +227,10 @@ class Assets:
                 st, secs, why = self.send(aid)
                 if st != 'ready':
                     return 200, {'id': vid, 'asset': aid, 'state': rec['state'], 'why': why, 'console': rec['console']}
+            else:   # already on the console (the same id is the same converted file): a re-upload reset the record to
+                rec['state'] = 'live'                       # 'checked'; what the console holds is still this asset
+                rec['console'] = rec.get('console') or {'state': 'ready', 'send_s': 0.0, 'why': None,
+                                                        'tier': self.b.tier(), 'seq': self.loaded[1]}
             times['send_s'] = round(time.time() - t, 3)
             t = time.time()
             vseq, n0 = self.set_view(cam, light, bg, filt, view, cull)
