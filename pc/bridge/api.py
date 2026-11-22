@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .core import CONTRACT, BRIDGE_VERSION
+from . import assets
 
 LEVELS = {'read': 0, 'control': 1, 'run': 2}
 CORS = {'Access-Control-Allow-Origin': '*',
@@ -195,6 +196,8 @@ def make_handler(bridge, level='run'):
                     return self.loader()
                 if p == '/v0/calls':
                     return self.reply(200, {'note': 'see calls.log in the bridge data folder'})
+                if p.startswith('/v0/assets') and assets.handle(self, bridge, 'GET', p, q):   # docs/ASSETS.md
+                    return
                 return self.err(404, 'no route %s' % p)
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -276,8 +279,8 @@ def make_handler(bridge, level='run'):
                     return self.reply(200, bridge.set_autoconnect(b['autoconnect']))
                 if p == '/v0/memory/read':
                     return self.err(501, 'memory reads are not in this loader yet')
-                if p == '/v0/assets':
-                    return self.err(501, 'live assets are not in this loader yet (plan L5b)')
+                if p.startswith('/v0/assets') and assets.handle(self, bridge, 'POST', p, q):   # docs/ASSETS.md
+                    return
                 return self.err(404, 'no route %s' % p)
             except (BrokenPipeError, ConnectionResetError):
                 pass

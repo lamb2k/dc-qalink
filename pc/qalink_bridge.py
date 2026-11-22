@@ -26,6 +26,7 @@ def main(argv=None):
     ap.add_argument('--files', help='folder served to programs as /pc/ (a run may name a subfolder)')
     ap.add_argument('--selftest', help='the self-test program (dc-qalink\'s testprog.elf)')
     ap.add_argument('--loader-disc', help='folder of the loader disc image served by /v0/loader')
+    ap.add_argument('--viewer', help='the console asset viewer (example/viewer\'s viewer.elf) for /v0/assets')
     ap.add_argument('--level', choices=('read', 'control', 'run'), default='run', help='the most this bridge accepts')
     ap.add_argument('--allow-lan', action='store_true',
                     help='talk to a real console on the network. Off by default: the bridge then talks only to a loader '
@@ -48,6 +49,7 @@ def main(argv=None):
     log = None if a.quiet else (lambda s: print(s, flush=True))
     b = Bridge(a.data, (a.udp_host, a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
                autoconnect=not a.no_autoconnect, only_local=not a.allow_lan)
+    b.viewer_elf = a.viewer
     serve(b, '127.0.0.1', a.port, a.level)
     if a.mcp_http:
         from bridge import mcp_server
