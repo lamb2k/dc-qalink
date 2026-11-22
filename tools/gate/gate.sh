@@ -69,6 +69,7 @@ while [ -e "$G" ]; do G=$GATE_OUT/$ID-run$k; k=$((k + 1)); done
 mkdir -p "$G"/build
 W=/dev/shm/dcql-gate/$ID
 rm -rf "${W:?}"; mkdir -p "$W"/host
+export GATE_W=$W   # plan host rows may name it ($GATE_W/host/...)
 STEPS=$G/steps.tsv; : > "$STEPS"
 row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STEPS"; printf '[%s] %s: %s\n' "$2" "$1" "$3"; }
 started=$(date '+%Y-%m-%d %H:%M:%S %z')
@@ -127,6 +128,11 @@ else
   [ -z "$own" ] && row "gate files untouched" PASS "tools/gate/ and docs/RELEASE_0.2.md not changed by the head" \
                 || row "gate files untouched" FAIL "the head changes the gate's own files: $own"
 fi
+# the owner's direction (2026-11-22, "we can get rid of dialo"): no mascot in the tree, by text or by path
+hits=$( { git grep -n -i -w -I -E 'mascots?|dialo' -- . ':(exclude)tools/gate/*'
+          git ls-files | grep -i -E '(^|[/_.-])(mascots?|dialo)([/_.-]|$)'; } | head -5 | cut -c1-120 | tr '\n' ' ')
+[ -z "$hits" ] && row "no mascot" PASS "no mascot or Dialo in the tree (text or path)" \
+               || row "no mascot" FAIL "the owner removed the mascot (2026-11-22); found: $hits"
 git log -1 --format='%H %s' "$HEADSHA" > "$G/head.txt"
 mkdir -p "$G/tree"
 for d in pc tests tools relay; do [ -d "$S/$d" ] && cp -r "$S/$d" "$G/tree/"; done
@@ -166,8 +172,11 @@ for mk in "$S"/*/Makefile "$S"/example/*/Makefile; do   # any other program (exa
   rel=${mk#"$S"/}; rel=${rel%/Makefile}
   case $rel in loader|example) continue ;; esac
   dn=$(echo "$rel" | tr / -) d=$W/extra-$(echo "$rel" | tr / -)
-  rm -rf "${d:?}"; mkdir -p "$d"; cp -r "$S/$rel" "$d/src"
-  build_row "extra-$dn" "" make -C "$d/src" -j"$J" OUT="$d/out" DCQL_DIR="$S/lib" DCQL_OBJDIR="$d/obj" DCQL_ENABLE=1
+  rm -rf "${d:?}"; mkdir -p "$d"
+  # in place (its Makefile finds the library by its own path), outputs in OUT; the scratch tree is reset every run
+  build_row "extra-$dn" "" make -C "$S/$rel" -j"$J" OUT="$d/out" DCQL_DIR="$S/lib" DCQL_OBJDIR="$d/obj" DCQL_ENABLE=1 \
+    && for f in "$d"/out/*.elf; do [ -f "$f" ] && cp "$f" "$G/build/"; done
+  ls "$d"/out/*.elf > /dev/null 2>&1 || row "build extra-$dn outputs" FAIL "no ELF in OUT (build/extra-$dn.log)"
 done
 { for f in "$O"/*.elf "$W"/modem/loader.elf "$W"/ex-*/dcql-example.elf; do [ -f "$f" ] && sh-elf-size "$f" | tail -1 | sed "s#$W/##"; done; } \
   > "$G/build/elf-sizes.txt" 2>/dev/null
@@ -207,6 +216,19 @@ log=$G/host-mcp/test_mcp-host.log
 (cd "$G/tree" && timeout 600 "$GATE_WINPY" -u tests/test_mcp.py --out "$(winp "$G/host-mcp")") > "$log" 2>&1; rc=$?
 t=$(grep -E 'of [0-9]+ passed' "$log" | tail -1)
 [ $rc -eq 0 ] && row "test test_mcp (host, simulated console)" PASS "$t" || row "test test_mcp (host, simulated console)" FAIL "rc $rc; host-mcp/test_mcp-host.log; $t"
+# the lane's own host controls, from its plan: {"host": [{"name", "cmd" (sh, run in the merged tree), "expect": 0|"fail",
+# "grep": a line the log must hold}]}
+for p in "${PLANS[@]}"; do
+  while IFS=$'\t' read -r hn hcmd hexp hgrep; do
+    [ -n "$hn" ] || continue
+    test_row "$hn" "$hexp" sh -c "$hcmd"
+    if [ -n "$hgrep" ]; then
+      grep -qE -- "$hgrep" "$H/$hn.log" && row "control $hn" PASS "log holds: $hgrep" || row "control $hn" FAIL "log lacks: $hgrep"
+    fi
+  done < <(python3 -c 'import json,sys
+for h in json.load(open(sys.argv[1])).get("host", []):
+    print("\t".join([h["name"], h["cmd"], str(h.get("expect", 0)), h.get("grep", "")]))' "$p")
+done
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
   case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp) continue ;; esac
@@ -227,6 +249,22 @@ if [ -f "$G/sizes/sizes.json" ]; then
 else
   row "size rows" FAIL "sizes.py: $(tail -2 "$G/sizes/run.log" | tr '\n' ' ')"
 fi
+# a lane's own program's sizes (listed, not judged against the link rows): plan {"sizes": [{"name", "map", "objs",
+# "objdir"}]}, map and objdir relative to the build folder of that program (extra-<dir>/out)
+for p in "${PLANS[@]}"; do
+  while IFS=$'\t' read -r sn smap sobjs sdir; do
+    [ -n "$sn" ] || continue
+    python3 "$GR/tools/gate/sizes.py" --report-only --map "$W/$smap" --objs "$sobjs" --nm sh-elf-nm --objdir "$W/$sdir" \
+      --out "$G/sizes/$sn" > "$G/sizes/$sn.log" 2>&1
+    if [ -f "$G/sizes/$sn/sizes.json" ]; then
+      row "size $sn (own program)" PASS "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["rows"]; print("; ".join("%s %s B" % (x["row"], format(x["measured"], ",")) for x in r))' "$G/sizes/$sn/sizes.json") (reported, not against the link rows)"
+    else
+      row "size $sn (own program)" FAIL "sizes.py: $(tail -1 "$G/sizes/$sn.log")"
+    fi
+  done < <(python3 -c 'import json,sys
+for s in json.load(open(sys.argv[1])).get("sizes", []):
+    print("\t".join([s["name"], s["map"], s["objs"], s["objdir"]]))' "$p")
+done
 mkdir -p "$G/blob"
 if python3 "$GR/tools/gate/blobcheck.py" --repo "$S" --range "$RANGE" --out "$G/blob" > "$G/blob/run.log" 2>&1; then
   row "blob check" PASS "$RANGE: $(sed -n 3p "$G/blob/blob.md")"

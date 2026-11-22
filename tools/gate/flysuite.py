@@ -38,9 +38,10 @@ Extra plans add rows, replace rows by name ("replace": true) or drop them ("drop
 Flycast is a function check: every time here is tier "Flycast", never a console number.
 """
 import argparse, ctypes as C, glob, hashlib, json, os, selectors, shutil, socket, subprocess, sys, threading, time
-import urllib.request, uuid
+import urllib.error, urllib.request, uuid
 
 LOADER_PORT = 52060   # the real console's loader port: never used by the suite
+BRIDGE_ARGS = []      # extra bridge arguments from the plans ({build} = the build folder), e.g. --viewer {build}/viewer.elf
 
 
 # ----------------------------------------------------------------------------------------------------------- machine
@@ -244,6 +245,20 @@ class BridgeClient:
         with urllib.request.urlopen(self.url + path, timeout=timeout) as f:
             return json.loads(f.read())
 
+    def call(self, method, path, body=None, timeout=180):
+        req = urllib.request.Request(self.url + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={'Content-Type': 'application/json', 'X-By': 'dc-qalink gate flysuite.py'})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as f:
+                return f.status, json.loads(f.read())
+        except urllib.error.HTTPError as e:
+            b = e.read()
+            try:
+                return e.code, json.loads(b)
+            except ValueError:
+                return e.code, {'error': b[:300].decode('latin-1')}
+
     def push(self, path, args):
         raw = open(path, 'rb').read()
         b = uuid.uuid4().hex
@@ -261,8 +276,10 @@ class BridgeClient:
 # ------------------------------------------------------------------------------------------------------------- plans
 def load_plans(paths):
     rows, cites, notes = [], [], []
+    global BRIDGE_ARGS
     for p in paths:
         plan = json.load(open(p, encoding='utf-8'))
+        BRIDGE_ARGS += plan.get('bridge_args', [])
         drop = set(plan.get('drop', []))
         rows = [r for r in rows if r['name'] not in drop]
         for r in plan.get('rows', []):
@@ -431,7 +448,8 @@ def main_run(a):
             bc = BridgeClient(url)
             bargs = [py, '-u', os.path.join(a.tree, 'pc', 'qalink_bridge.py'), '--port', str(a.http), '--udp-port',
                      str(a.port), '--data', os.path.join(out, 'bridge'), '--device', 'flycast', '--console',
-                     '%s:%d' % (a.pc_ip, a.lport), '--selftest', m['testprog'], '--mcp-http', str(a.mcp_http)]
+                     '%s:%d' % (a.pc_ip, a.lport), '--selftest', m['testprog'], '--mcp-http', str(a.mcp_http)] + \
+                [subst(x, {'build': a.build}) for x in BRIDGE_ARGS]
             bridge = subprocess.Popen(bargs, stdout=open(os.path.join(out, 'bridge.out'), 'w'), stderr=subprocess.STDOUT,
                                       cwd=os.path.join(a.tree, 'pc'), creationflags=0x08000000)
             say('bridge pid %d on http %d, udp %d, console pinned to %s:%d' % (bridge.pid, a.http, a.port, a.pc_ip, a.lport))
@@ -503,6 +521,46 @@ def main_run(a):
                         want = r.get('must', {}).get('passed', 9)
                         checks.append(('MCP %d of %d' % (want, want), code == 0 and res['passed'] == want == res['total'],
                                        '%d of %d, rc %s' % (res['passed'], res['total'], code)))
+                    elif r['kind'] == 'assets':
+                        # live assets (docs/ASSETS.md): push the viewer, or send a generated asset, view it on the
+                        # console, grab, and compare with the PC render; "then" is a second view (no resend)
+                        if r['op'] == 'viewer':
+                            t1 = time.time()   # an earlier row's program (MCP's 60 s liveprog) ends first
+                            while time.time() - t1 < 180:
+                                try:
+                                    if not bc.get('/v0/status').get('active_run'):
+                                        break
+                                except OSError:
+                                    pass
+                                time.sleep(1.0)
+                            code, v = bc.call('POST', '/v0/assets/viewer', {'timeout_s': 90, 'secs': 300})
+                            res.update(code=code, viewer={k: v.get(k) for k in ('linked', 'run', 'state', 'vfree', 'seconds')})
+                            checks.append(('viewer pushed and linked', code == 200 and v.get('linked') is True,
+                                           '%s %s' % (code, v.get('error') or v.get('linked'))))
+                        else:
+                            gdir = os.path.join(out, 'gen')
+                            if not os.path.isdir(gdir):
+                                sys.path.insert(0, os.path.join(a.tree, 'pc'))
+                                from assets import gen as agen   # the merged tree's generator: generated assets only
+                                agen.write_all(gdir)
+                            spec = dict(r['asset'])
+                            spec['path'] = os.path.join(gdir, spec.pop('gen'))
+                            code, ar = bc.call('POST', '/v0/assets', spec)
+                            res.update(asset={k: ar.get(k) for k in ('id', 'state', 'bytes', 'psnr', 'reason')})
+                            checks.append(('asset converted', code == 200 and bool(ar.get('id')), '%s %s' % (code, ar.get('state'))))
+                            for key, body in (('view', r.get('view_args', {})), ('then', r.get('then'))):
+                                if body is None or not ar.get('id'):
+                                    continue
+                                code, vr = bc.call('POST', '/v0/assets/%s/view' % ar['id'], body)
+                                res[key] = {'code': code, 'state': vr.get('state'), 'times': vr.get('times'),
+                                            'diff': {k: (vr.get('diff') or {}).get(k) for k in ('pixels', 'differ', 'over', 'max', 'psnr')},
+                                            'error': vr.get('error')}
+                                checks.append(('%s: on the console (live)' % key, code == 200 and vr.get('state') == 'live',
+                                               '%s %s' % (code, vr.get('state') or vr.get('error'))))
+                                for mk, lim in (r.get('must', {}).get(key) or {}).items():
+                                    seen = (vr.get('diff') or {}).get(mk.replace('_max', ''))
+                                    checks.append(('%s: %s at most %s' % (key, mk.replace('_max', ''), lim),
+                                                   seen is not None and seen <= lim, seen))
                     elif r['kind'] == 'delta':
                         ra, rb = rowres.get(r['a'], {}), rowres.get(r['b'], {})
                         va, vb = (ra.get('numbers') or {}).get(r['number']), (rb.get('numbers') or {}).get(r['number'])
@@ -522,6 +580,20 @@ def main_run(a):
         # Flycast has no watchdog reset), run last through a new pinned relay
         if any(r.get('phase') == 'tail' for r in rows):
             if bridge:
+                # the last bridge row may have left a program running (MCP's push_build runs liveprog for 60 s): wait
+                # until the bridge has no run and the loader beacons again, so the tail starts on an idle loader
+                t0, idle = time.time(), False
+                while time.time() - t0 < 180:
+                    try:
+                        st = bc.get('/v0/status')
+                        if not st.get('active_run') and st.get('link') == 'up' and \
+                                not ((st.get('device') or {}).get('program') or {}).get('linked'):
+                            idle = True
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(1.0)
+                say('tail: the loader is %s after %.0f s' % ('idle' if idle else 'NOT idle', time.time() - t0))
                 subprocess.run(['taskkill', '/PID', str(bridge.pid), '/T', '/F'], capture_output=True, creationflags=0x08000000)
                 try:
                     bridge.wait(10)
@@ -529,8 +601,15 @@ def main_run(a):
                     bridge.kill()
                 bridge = None
                 time.sleep(1.0)
+            # a fresh boot for the tail (the first ql-core4 gates: after the bridge phase the loader beaconed but did
+            # not answer LOAD): each tail row starts on a loader that only this relay has spoken to
+            stop_flycast(fly)
+            fly = None
             relay = Relay(a.port, a.ctl, loc, say)
             relay.start()
+            fly = launch_flycast(a.flycast, a.config, a.disc, out, 'dcql-gate-tail-%d' % os.getpid())
+            say('tail: flycast restarted, pid %d' % fly[3].pid)
+            time.sleep(a.boot_wait)
             loop_rows('tail')
             relay.stop()
             if relay.tripped:
@@ -553,7 +632,11 @@ def main_run(a):
                 hit = [x for x in row.get('mcp', []) if x['name'].startswith(pre)]
                 v = hit[0].get(field) if hit else None
             tol = c.get('tol', 0.25)
-            ok = isinstance(v, (int, float)) and abs(v - c['cited']) <= tol * abs(c['cited'])
+            if 'range' in c:   # a cited range (lo, hi), widened by tol on each side
+                lo, hi = c['range']
+                ok = isinstance(v, (int, float)) and lo * (1 - tol) <= v <= hi * (1 + tol)
+            else:
+                ok = isinstance(v, (int, float)) and abs(v - c['cited']) <= tol * abs(c['cited'])
             result['cites'].append(dict(c, measured=v, ok=ok))
             say('cite %-40s cited %s %s, measured %s: %s' % (c['what'][:40], c['cited'], c.get('unit', ''), v,
                                                              'ok' if ok else 'NOT REPRODUCED'))

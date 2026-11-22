@@ -62,6 +62,8 @@ def main():
     ap.add_argument('--stub')
     ap.add_argument('--baseline')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--report-only', action='store_true',
+                    help='a separate program (not the link a game carries): its sizes are listed, not judged against the rows')
     a = ap.parse_args()
     want = a.objs.split(',')
     per = parse_map(a.map, set(want))
@@ -88,7 +90,9 @@ def main():
     fail = False
     for key, val, limit in (('code', tc, ROWS['code']), ('fixed', tf, ROWS['fixed'])):
         over = val > limit
-        if key == 'code':
+        if a.report_only:
+            verdict = 'reported (its own program, not the link row)'
+        elif key == 'code':
             verdict = 'FAIL (over the row)' if over else 'PASS'
             fail |= over
         else:
