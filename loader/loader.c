@@ -329,26 +329,23 @@ static int pad_a(void) {
 /* The SH-4 watchdog in reset mode (as the client's: 256 counts of Pck/4096, about 21 ms), fed from the vertical blank
    only while the guard's time is not spent: a start that stops with interrupts off (no vertical blank) or that never
    gets its link up (the time runs out) restarts the console through the BIOS, like any way back. */
-#define WTCNT (*(volatile uint16_t *)0xffc00008)
-#define WTCSR (*(volatile uint16_t *)0xffc00004)
+/* ql-core5: the registers from dcql_hw.h (WTCSR is 0xffc0000c; this guard wrote 0xffc00004, STBCR, until then) */
 static volatile uint64_t g_guard_until;
 static volatile int g_guard_on;
 static void guard_feed(uint32_t code, void *data) {
     (void)code; (void)data;
-    if (g_guard_on && timer_ms_gettime64() < g_guard_until) WTCNT = 0x5a00;
+    if (g_guard_on && timer_ms_gettime64() < g_guard_until) dcql_wdt_feed();
 }
 static void guard_start(unsigned seconds) {
     if (vblank_handler_add(guard_feed, NULL) < 0) return;
     g_guard_until = timer_ms_gettime64() + seconds * 1000ull;
-    WTCSR = 0xa500 | 0x40 | 7;
-    WTCNT = 0x5a00;
     g_guard_on = 1;
-    WTCSR = 0xa500 | 0x80 | 0x40 | 7;
-    loader_log("start guard: the watchdog for %u s", seconds);
+    dcql_wdt_arm();
+    loader_log("start guard: the watchdog for %u s (WTCSR %02x)", seconds, dcql_wdt_csr());
 }
 static void guard_stop(const char *why) {
     if (!g_guard_on) return;
-    WTCSR = 0xa500;
+    dcql_wdt_off();
     g_guard_on = 0;
     loader_log("start guard off: %s", why);
 }

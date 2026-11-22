@@ -214,7 +214,7 @@ static void quiet(void) {
     REG32(0xa0702c00) |= 1;            /* the sound CPU held in reset (spu_disable) */
     REG32(0xffa00040) = 0;             /* SH-4 DMA controller off (DMAOR) */
     *(vu8 *)0xffd80004 = 0;            /* timers stopped (TSTR) */
-    *(vu16 *)0xffc00004 = 0xa500;      /* watchdog off (WTCSR, TME = 0) */
+    dcql_wdt_off();                    /* watchdog off (WTCSR 0xffc0000c, TME = 0; ql-core5: was STBCR) */
     static const uint32_t masks[9] = {0xa05f6910, 0xa05f6914, 0xa05f6918, 0xa05f6920, 0xa05f6924, 0xa05f6928,
                                       0xa05f6930, 0xa05f6934, 0xa05f6938};
     for (int i = 0; i < 9; ++i) REG32(masks[i]) = 0;   /* no ASIC interrupt routed anywhere */
