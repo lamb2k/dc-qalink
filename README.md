@@ -15,6 +15,28 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
 <p align="center"><sub>Flycast captures of example/ through Flycast's emulated modem: connected after a remote
 <code>GOTO level1-boss</code>, and dialling.</sub></p>
 
+## Desktop companion: QA Link Cloud
+
+[QA Link Cloud](https://github.com/lamb2k/dc-qalink-cloud) is the desktop app for dc-qalink: live timings against
+your budget, screen grabs, push and run, commands and a virtual pad, recorded sessions, and an MCP server so agents
+(Claude Code, Codex) can drive the console. Preview release:
+[0.1.0 preview](https://github.com/lamb2k/dc-qalink-cloud/releases/tag/v0.1.0-preview) (Windows x64).
+
+<p align="center"><a href="https://github.com/lamb2k/dc-qalink-cloud"><img
+src="https://raw.githubusercontent.com/lamb2k/dc-qalink-cloud/main/docs/images/hero-link-live.png" width="80%"
+alt="QA Link Cloud, the Link workspace (demo data)"></a></p>
+<p align="center"><sub>QA Link Cloud's Link workspace. Synthetic demo data, not a measurement.</sub></p>
+
+## Coming in 0.2 (preview on branch `v0.2-bridge`)
+
+- **Broadband adapter** besides the modem, on the same library.
+- **A loader disc:** boot it once from GDEMU or a CD-R; it connects to the PC by itself, then the PC pushes builds
+  (about 0.6 s for 280 KB on a real console) and runs them, with no SD card copying.
+- **Screen grabs** from the running program (0.64 s each on a real console), reports and exit codes.
+- **The bridge:** a local service the desktop app and agents talk to (HTTP and MCP), only-local by default.
+- Not finished: the quick way back to the loader after a program ends still fails on real hardware (it falls back to
+  a full restart). 0.1.0 stays the release until 0.2.0 ships.
+
 ## Hardware
 
 - A Dreamcast with its modem, and a PPP peer on a phone line: a **DreamPi** (Raspberry Pi + USB modem + line
