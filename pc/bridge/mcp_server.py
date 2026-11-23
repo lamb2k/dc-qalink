@@ -11,6 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import qlsafe   # noqa: E402  (pc/qlsafe.py: roots and limits, audit 2026-11-23)
 
+ASSET_B64_MAX = (16 << 20) - (64 << 10)   # an upload_asset's base64: the bridge's body limit less the JSON around it
 PROGRAM_MAX = 16 << 20   # a pushed program, at most (the bridge's HTTP body limit); checked before reading or decoding
 TOOLS_JSON = os.path.join(HERE, 'mcp-tools.json')
 LEVEL_RANK = {'read': 0, 'control': 1, 'run': 2}
@@ -207,7 +208,14 @@ def handle(bc, name, a):
     elif name == 'read_memory':
         c, r = bc.call('POST', '/v0/memory/read', {'addr': int(a['addr'], 16), 'len': a['len']})
     elif name == 'upload_asset':
-        c, r = bc.call('POST', '/v0/assets', {k: a[k] for k in ('path', 'base64', 'name') if k in a})
+        b64 = a.get('base64')
+        if b64 is not None and (not isinstance(b64, str) or len(b64) > ASSET_B64_MAX):
+            # audit round 2: checked before the JSON body is built (the bridge's 16 MiB body limit would only see it
+            # after the whole request was serialized here)
+            c, r = 413, {'error': 'base64 of %s characters is over the %d an upload may carry' % (
+                len(b64) if isinstance(b64, str) else '?', ASSET_B64_MAX)}
+        else:
+            c, r = bc.call('POST', '/v0/assets', {k: a[k] for k in ('path', 'base64', 'name') if k in a})
     elif name == 'list_sessions':
         c, r = bc.call('GET', '/v0/sessions')
     elif name == 'export_session':

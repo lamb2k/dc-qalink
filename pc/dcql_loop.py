@@ -44,6 +44,7 @@ LOAD_ADDR = 0x8C010000
 HANDOFF_ADDR = 0x8CFE0000
 IMAGE_END = HANDOFF_ADDR - 0x11000   # the loader's stack (arch_exec_at's trampoline) sits below the hand-off area
 FREAD_MAX = 8 * 1024
+REPORT_MAX = 0x20000 - 0x3000        # include/dcql_loop.h CL_REPORT_MAX (CL_HANDOFF_SIZE - CL_REPORT_OFF): 118784
 
 HELLO, ACK, VERDICT, REPORT, EXEC, ERR = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 LINE, STILL, FOPEN, FREAD, FCLOSE, RESETACK = 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C
@@ -174,21 +175,33 @@ def stub_text(s):
 
 
 # ------------------------------------------------------------------------------------------------ program images
-def elf_image(data):
-    """Flat image of an SH-4 ELF's PT_LOAD file bytes (BSS excluded: KallistiOS clears it): (load address, bytes)."""
-    if data[:4] != b'\x7fELF' or data[4] != 1 or data[5] != 1:
+def elf_image(data, span_max=None):
+    """Flat image of an SH-4 ELF's PT_LOAD file bytes (BSS excluded: KallistiOS clears it): (load address, bytes).
+    The load span is checked before the image is allocated (audit round 2): at most `span_max` bytes (default: what
+    fits between LOAD_ADDR and IMAGE_END), each segment's file bytes inside the file. ValueError otherwise."""
+    if span_max is None:
+        span_max = IMAGE_END - LOAD_ADDR
+    if len(data) < 52 or data[:4] != b'\x7fELF' or data[4] != 1 or data[5] != 1:
         raise ValueError('not a 32-bit little-endian ELF')
     phoff, = struct.unpack_from('<I', data, 28)
     phentsize, phnum = struct.unpack_from('<HH', data, 42)
+    if phentsize < 32 or phoff + phnum * phentsize > len(data):
+        raise ValueError('ELF program headers outside the file')
     segs = []
     for i in range(phnum):
         t, off, va, pa, fs, ms, fl, al = struct.unpack_from('<8I', data, phoff + i * phentsize)
         if t == 1 and fs:
-            segs.append((pa & 0x1FFFFFFF | 0x80000000 if pa else va, data[off:off + fs]))
+            if off + fs > len(data):
+                raise ValueError('ELF segment %d: bytes outside the file' % i)
+            segs.append((pa & 0x1FFFFFFF | 0x80000000 if pa else va, off, fs))
     if not segs:
         raise ValueError('no loadable segment')
     lo = min(s[0] for s in segs)
-    hi = max(s[0] + len(s[1]) for s in segs)
+    hi = max(s[0] + s[2] for s in segs)
+    if hi - lo > span_max:
+        raise ValueError('ELF load span %d bytes (%08x..%08x) is over the %d bytes a program may take' % (
+            hi - lo, lo, hi, span_max))
+    segs = [(va, data[off:off + fs]) for va, off, fs in segs]
     img = bytearray(hi - lo)
     for va, b in segs:
         img[va - lo:va - lo + len(b)] = b
@@ -463,6 +476,7 @@ class FileService:
         self.log = log
         self.handles = {}
         self.next = 1
+        self.closed = False
         self.stats = {'opened': 0, 'refused': 0, 'reads': 0, 'bytes': 0, 'first_at': None, 'last_at': None, 'files': {}}
 
     OPEN_MAX = 32    # open files a program may hold at once (each is a descriptor on this PC)
@@ -475,6 +489,8 @@ class FileService:
         rel = payload.decode('latin-1', 'replace')
         p = self.path(rel)
         now = time.time()
+        if self.closed:
+            p = None
         if self.log and (rel not in self.stats['files'] or p is None):
             self.log('file service: %s %s' % (rel, 'refused' if p is None else 'open'))
         if p is None:
@@ -489,10 +505,15 @@ class FileService:
             loop.send(FINFO, run, req, 0, struct.pack('<iIII', -24, 0, 0, 0))
             return
         if h is None:   # a repeated FOPEN (lost answer) keeps its handle
+            try:   # opened, then checked on the opened object (audit round 2: no check-then-reopen)
+                f = qlsafe.open_confined(self.root, rel)
+            except qlsafe.Refused:
+                self.stats['refused'] += 1
+                loop.send(FINFO, run, req, 0, struct.pack('<iIII', -2, 0, 0, 0))
+                return
             h = self.next
             self.next += 1
-            f = open(p, 'rb')
-            self.handles[h] = (f, os.path.getsize(p), key, req)
+            self.handles[h] = (f, os.fstat(f.fileno()).st_size, key, req)
             self.stats['opened'] += 1
             self.stats['files'].setdefault(rel, 0)
             self.stats['first_at'] = self.stats['first_at'] or now
@@ -517,6 +538,13 @@ class FileService:
         v = self.handles.pop(h, None)
         if v:
             v[0].close()
+
+    def close(self):
+        """Retire the service: every descriptor it holds is closed, and it answers no more opens (run end, the
+        program's link lost, the bridge stopping)."""
+        self.closed = True
+        for h in list(self.handles):
+            self.on_close(h)
 
     def summary(self):
         s = dict(self.stats)
@@ -552,31 +580,91 @@ def still_room(cur, nbytes, replacing=None):
     return len(live) < STILL_PENDING and sum(s['bytes'] for s in live) + nbytes <= STILL_PENDING_BYTES
 
 
+STILL_STALE_S = 20.0     # an unfinished still with no block, head or END this long is abandoned (its slot freed)
+STILL_RECEIPTS = 64      # completed stills remembered (key -> bytes) so a repeated head / END after a lost ACK is
+                         # answered as complete without reopening the picture
+
+
+def still_block_ok(st, a, payload):
+    """A data block is present only at its exact expected place and length: an aligned offset inside the picture and
+    CHUNK bytes (the last block: the rest of the picture)."""
+    return a % CHUNK == 0 and a < st['bytes'] and len(payload) == min(CHUNK, st['bytes'] - a)
+
+
+def still_expire(cur, now=None):
+    """Drop unfinished stills idle over STILL_STALE_S (abandoned transfers). Returns how many were dropped."""
+    now = time.time() if now is None else now
+    old = [k for k, s in cur.items() if not s['done'] and now - s.get('t_last', s['t0']) > STILL_STALE_S]
+    for k in old:
+        cur.pop(k, None)
+    return len(old)
+
+
+def still_full_ack(nbytes):
+    """The STILLACK bitmap of a complete still (every block held)."""
+    n = (nbytes + CHUNK - 1) // CHUNK
+    bits = bytearray((n + 7) // 8)
+    for k in range(n):
+        bits[k >> 3] |= 1 << (k & 7)
+    return bytes(bits[:DGRAM_MAX - HDR - 4])
+
+
+class StillReceipts:
+    """Completed stills, bounded (STILL_RECEIPTS, oldest forgotten first): key -> bytes."""
+
+    def __init__(self, n=STILL_RECEIPTS):
+        self.n = n
+        self.d = {}
+
+    def add(self, key, nbytes):
+        self.d.pop(key, None)
+        self.d[key] = nbytes
+        while len(self.d) > self.n:
+            self.d.pop(next(iter(self.d)))
+
+    def get(self, key):
+        return self.d.get(key)
+
+    def __len__(self):
+        return len(self.d)
+
+
 class StillSink:
     def __init__(self, out, run, log):
         self.out, self.run, self.log = out, run, log
         self.cur = {}
+        self.receipts = StillReceipts()
         self.saved = []
         self.refused = 0
+        self.expired = 0
 
     def on_still(self, loop, a, b, payload):
         idx = b
+        now = time.time()
         st = self.cur.get(idx)
         if a == STILL_HEAD:
             hd = still_head(payload)
             if hd is None:
                 self.refused += 1
                 return
+            if st is None and self.receipts.get(idx) == hd['bytes']:
+                return   # a repeated head of a still already held: not reopened (its END is answered from the receipt)
             if st is None or st['bytes'] != hd['bytes']:
+                self.expired += still_expire(self.cur, now)
                 if not still_room(self.cur, hd['bytes'], idx):
                     self.refused += 1
                     return
                 self.cur[idx] = st = {'picture': hd['picture'], 'w': hd['w'], 'h': hd['h'], 'bytes': hd['bytes'],
                                       'crc': hd['crc'], 'data': bytearray(hd['bytes']), 'have': set(),
-                                      't0': time.time(), 'done': False}
+                                      't0': now, 't_last': now, 'done': False}
+            st['t_last'] = now
             return
         if st is None:
+            nb = self.receipts.get(idx)
+            if a == STILL_END and nb is not None:   # the ACK of a completed still was lost: complete again
+                loop.send(STILLACK, self.run, idx, 0, still_full_ack(nb))
             return
+        st['t_last'] = now
         if a == STILL_END:
             nblocks = (st['bytes'] + CHUNK - 1) // CHUNK
             bits = bytearray((nblocks + 7) // 8)
@@ -590,17 +678,17 @@ class StillSink:
                     os.makedirs(self.out, exist_ok=True)
                     png_rgb565(os.path.join(self.out, name), st['w'], st['h'], bytes(st['data']))
                 st['done'] = True
-                st['data'] = None   # held as a PNG now: only its block set stays, for a repeated END
+                self.cur.pop(idx, None)            # held as a PNG now: only a bounded receipt stays
+                self.receipts.add(idx, st['bytes'])
                 self.saved.append({'index': idx, 'picture': st['picture'], 'crc_ok': ok, 'file': name if ok else None,
-                                   'seconds': round(time.time() - st['t0'], 3), 'bytes': st['bytes']})
+                                   'seconds': round(now - st['t0'], 3), 'bytes': st['bytes']})
                 self.log('still %d (picture %d) %s, %d bytes in %.2f s' % (idx, st['picture'], 'saved' if ok else
-                                                                           'CRC MISMATCH', st['bytes'], time.time() - st['t0']))
+                                                                           'CRC MISMATCH', st['bytes'], now - st['t0']))
             loop.send(STILLACK, self.run, idx, min(missing, 0xFFFF), bytes(bits[:DGRAM_MAX - HDR - 4]))
             return
-        k = a // CHUNK
-        if not st['done'] and a % CHUNK == 0 and a + len(payload) <= st['bytes']:
+        if not st['done'] and still_block_ok(st, a, payload):
             st['data'][a:a + len(payload)] = payload
-            st['have'].add(k)
+            st['have'].add(a // CHUNK)
 
 
 # ------------------------------------------------------------------------------------------------ the session
@@ -831,8 +919,12 @@ class Loop:
 
     def fetch_report(self, h, out_dir):
         run, length, crc = h['report_run'], h['report_len'], h['report_crc']
+        if length > REPORT_MAX:   # HELLO's word checked against the console's maximum before any list is built
+            raise RuntimeError('report length %d in HELLO is over the console\'s maximum %d (CL_REPORT_MAX)' % (
+                length, REPORT_MAX))
         blocks = {}
         need = [o for o in range(0, max(length, 1), CHUNK)] if length else []
+        want = set(need)
         tries = 0
         t0 = time.time()
         while need and tries < 30:
@@ -844,7 +936,8 @@ class Loop:
             last = None
             while time.time() < end:
                 m = self.recv(0.2)
-                if m and m[0] == REPORT and m[1] == run:
+                if m and m[0] == REPORT and m[1] == run and m[2] in want and \
+                        len(m[4]) == min(CHUNK, length - m[2]):   # only a requested offset at its exact length
                     blocks[m[2]] = m[4]
                     last = time.time()
                     if all(o in blocks for o in need[:count]):
@@ -1043,6 +1136,19 @@ def serve(a, loop, stamp):
     return 0 if not a.until or seen['hit'] else 1
 
 
+STUB_JUMP = 6   # CL_STUB_STEP_* "jump": the return stub read the loader and jumped to it
+
+
+def way_back_of(hb):
+    """How the console came back to the loader, from evidence only (audit round 2): 'stub' when the loader's HELLO
+    carries the stub's record of this boot with its jump step; otherwise the default way back, the BIOS restart
+    ('full restart'). None with no HELLO (the loader is not back)."""
+    if not hb:
+        return None
+    s = hb.get('stub')
+    return 'stub' if s and s.get('step') == STUB_JUMP else 'full restart'
+
+
 def ladder(loop, run, wait_s, stamp, b0=None):
     """RESET, then the next rungs. Returns (rung that worked or None, seconds, the loader's HELLO or None)."""
     t0 = time.time()
@@ -1167,6 +1273,22 @@ def end_report(asm, session, out):
     return r
 
 
+def ending_state(er):
+    """How much of the run's END arrived: 'none', 'head only', 'tail incomplete', 'complete', 'whole crc ok'."""
+    if not er:
+        return 'none'
+    if er['crc_ok']:
+        return 'whole crc ok'
+    if er['complete']:
+        return 'complete'
+    return 'tail incomplete' if er['end']['sent_len'] else 'head only'
+
+
+def end_rank(er):
+    """The END as evidence: 2 a whole report whose CRC agrees, 1 a complete declared tail, 0 less."""
+    return 0 if not er else 2 if er['crc_ok'] else 1 if er['complete'] else 0
+
+
 def collect(a, loop, stamp, session, result, h):
     """After EXEC: serve the program (files, lines, stills), RESET it if asked, wait for the loader, take the report."""
     b0 = (loop.hello or {}).get('boot_count')
@@ -1235,6 +1357,7 @@ def collect(a, loop, stamp, session, result, h):
             result['reset'] = {'rung': rung, 'seconds': secs, 'acknowledged_s': ack}
     if hb is None and rung is None and a.reset_after is None:
         hb = loop.wait(back, a.wait, every=None)
+    result['way_back'] = way_back_of(hb)   # from the loader's own record, never from the rung that was tried
     loop.on_other = None
     if serial:
         serial.close()
@@ -1270,7 +1393,22 @@ def collect(a, loop, stamp, session, result, h):
         result['lost'] = RUN_STATES.get(hb['report_state'], hb['report_state']) if hb['report_run'] == session else None
         return 4
     stamp('loader back after %.2f s: %s' % (time.time() - t0, describe(hb)))
-    rep = loop.fetch_report(hb, a.out)
+    try:
+        rep = loop.fetch_report(hb, a.out)
+    except RuntimeError as e:
+        rep = {'error': str(e), 'crc_ok': False}
+    result['evidence'] = {'end': ending_state(er), 'loader_report': 'crc ok' if rep.get('crc_ok') else
+                          rep.get('error') and 'failed: %s' % rep['error'] or 'bad crc'}
+    if not rep.get('crc_ok') and er and er['complete']:
+        # audit round 2: the loader's saved report failed (unreadable or bad CRC); the run's END is the best evidence
+        stamp('the loader\'s report %s; the run\'s result from its END (%s exit %d)' % (
+            result['evidence']['loader_report'], er['state'], er['exit']))
+        result['report'] = er
+        return 0 if er['state'] in ('DONE', 'RESET') and er['crc_ok'] else 5
+    if 'error' in rep:
+        stamp('report: %s' % rep['error'])
+        result['report'] = None
+        return 5
     result['report'] = rep
     stamp('report %s %s exit %d, %d bytes, crc %s -> %s' % (rep['run'], rep['state'], rep['exit'], rep['bytes'],
                                                          rep['crc_ok'], rep['path']))

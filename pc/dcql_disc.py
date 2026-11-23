@@ -89,10 +89,11 @@ class FolderSource:
         return self.files[k][1]
 
     def read(self, k, off, n):
-        real = qlsafe.inside(self.root, self.files[k][2])   # again at the open: a link swapped in since the index
-        if real is None:
-            raise PermissionError('%s is no longer a file below %s' % (self.files[k][0], self.root))
-        with open(real, 'rb') as f:
+        try:   # opened, then checked on the opened object: a link swapped in since the index is refused
+            f = qlsafe.open_inside(self.root, self.files[k][2])
+        except qlsafe.Refused as e:
+            raise PermissionError('%s is no longer a file below %s (%s)' % (self.files[k][0], self.root, e))
+        with f:
             f.seek(off)
             return f.read(n)
 
@@ -121,7 +122,13 @@ class ImageSource:
                     if tp is None:
                         raise ValueError('%s: track %s is not beside the descriptor' % (path, name))
                     if os.path.isfile(tp):
-                        self.tracks.append((lba, ss, 16 if ss == 2352 else 0, tp))
+                        # opened once here and checked on the opened object (audit round 2): every later read uses
+                        # this descriptor, so a track or folder changed while the disc is served cannot change it
+                        try:
+                            f = qlsafe.open_inside(base, tp)
+                        except qlsafe.Refused as e:
+                            raise ValueError('%s: track %s refused (%s)' % (path, name, e))
+                        self.tracks.append((lba, ss, 16 if ss == 2352 else 0, tp, f))
             hd = [t for t in self.tracks if t[0] >= 45000]
             self.fs_lba = (hd or self.tracks)[0][0]
         elif low.endswith('.iso') or low.endswith('.bin'):
@@ -130,13 +137,14 @@ class ImageSource:
                 f.seek(16 * 2352 + 16 + 1)
                 if f.read(5) == b'CD001':
                     ss = 2352
-            self.tracks.append((0, ss, 16 if ss == 2352 else 0, self.path))
+            self.tracks.append((0, ss, 16 if ss == 2352 else 0, self.path, open(self.path, 'rb')))
             self.fs_lba = 0
         elif low.endswith('.cdi'):
             raise NotImplementedError('.cdi images are not read yet: convert it to .gdi or .iso, or serve its folder')
         else:
             raise ValueError('not a disc image: %s (.gdi, .iso)' % path)
-        self.tracks.sort()
+        self.tracks.sort(key=lambda t: t[0])
+        self._lock = threading.Lock()
         pvd = self.sector(self.fs_lba + 16)
         if pvd[1:6] != b'CD001' or pvd[0] != 1:
             raise ValueError('no ISO 9660 volume in %s' % path)
@@ -155,9 +163,9 @@ class ImageSource:
                 t = tr
         if t is None:
             raise ValueError('LBA %d before the first data track' % lba)
-        with open(t[3], 'rb') as f:
-            f.seek((lba - t[0]) * t[1] + t[2])
-            return f.read(2048).ljust(2048, b'\0')
+        with self._lock:   # the track's own descriptor, opened and checked once (never reopened by name)
+            t[4].seek((lba - t[0]) * t[1] + t[2])
+            return t[4].read(2048).ljust(2048, b'\0')
 
     def _records(self, lba, size):
         out = []
@@ -219,7 +227,7 @@ class DiscService:
         self.log = log or (lambda s: None)
         self.record = record or (lambda r: None)
         self.lock = threading.RLock()
-        self.handles = {}       # handle -> dict(kind, key, src, size, data(for virtual))
+        self.handles = {}       # handle -> dict(kind, key, src, size, run, data(for virtual)); at most HANDLES_MAX
         self.by_req = {}        # (run, req) -> handle (a repeated DOPEN keeps its handle)
         self.next = 1
         self.fds = {}           # (run, fd) -> path (from DLOG opens)
@@ -345,6 +353,17 @@ class DiscService:
                 self._log(run, pl)
         return True
 
+    HANDLES_MAX = 64            # open disc handles for the bridge's lifetime (virtual listings are held in memory)
+    DS_MFILE = -24              # too many open (as the /pc service answers)
+
+    def retire(self, run):
+        """A run's handles and request ids dropped (run end, the program's link lost)."""
+        with self.lock:
+            for h in [h for h, v in self.handles.items() if v.get('run') == run]:
+                self.handles.pop(h, None)
+            self.by_req = {k: v for k, v in self.by_req.items() if k[0] != run}
+            self.fds = {k: v for k, v in self.fds.items() if k[0] != run}
+
     def _info(self, loop, run, req, status, h=0, size=0, flags=0):
         loop.send(DINFO, run, req, 0, struct.pack('<iIII', status, h, size, flags))
 
@@ -357,6 +376,10 @@ class DiscService:
         if h is not None and h in self.handles:   # a repeated DOPEN (its answer lost)
             v = self.handles[h]
             return self._info(loop, run, req, DS_OK, h, v['size'], v['flags'])
+        if len(self.handles) >= self.HANDLES_MAX:   # a cap before one more is made
+            self.stats['refused'] += 1
+            self.stats['too_many'] = self.stats.get('too_many', 0) + 1
+            return self._info(loop, run, req, self.DS_MFILE)
         if flags & DO_MOUNT:
             data = self.table()
             v = {'kind': 'virtual', 'data': data, 'size': len(data), 'flags': 0, 'path': '(mount table)'}
@@ -390,6 +413,7 @@ class DiscService:
             self.stats['opens'] += 1
         h = self.next
         self.next += 1
+        v['run'] = run
         self.handles[h] = v
         self.by_req[(run, req)] = h
         if len(self.by_req) > 4096:

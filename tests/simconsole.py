@@ -54,6 +54,9 @@ class SimConsole:
         self.prog = None
         self.drop_rec = drop_rec       # the share of REC datagrams lost on the way (a gap test)
         self.slow_ms = slow_ms         # added to every drawing phase (the planted-delay control)
+        self.stub_step = 0             # the stub's record in the loader's HELLO (6: it jumped back, after a RESET)
+        self.bad_crc = False           # 'badcrc' runs: the saved report's CRC is wrong
+        self.repq_err = False          # 'fetchfail' runs: REPQ answered with ERR (no report)
         self.stop = False
         self.lock = threading.Lock()
         threading.Thread(target=self.loop, daemon=True).start()
@@ -67,8 +70,13 @@ class SimConsole:
                         self.report_state, len(self.report), zlib.crc32(self.report) & 0xFFFFFFFF,
                         self.report_exit & 0xFFFFFFFF, struct.unpack('<I', socket.inet_aton('127.0.0.1'))[0],
                         8 << 20, 0)
+        if self.bad_crc and role == 1:   # 'badcrc': the saved report's CRC word does not match its bytes
+            p = p[:44] + struct.pack('<I', struct.unpack_from('<I', p, 44)[0] ^ 1) + p[48:]
         p += (b'sim loader 0.2' if role == 1 else b'client').ljust(32, b'\0')
         p += struct.pack('<4I', 2, role, 2, 2120) + bytes(8) + struct.pack('<II', run, 2)
+        # 148 bytes (ql-data): no MAC, no slot, then the stub's record of this boot: step 6 (jump) after a RESET that
+        # came back by the quick way (lane ql-fix-pc round 2: the bridge names the way back from this evidence only)
+        p += bytes(8) + struct.pack('<BBHII', self.stub_step if role == 1 else 0, 1 if self.stub_step else 0, 0, 0, 0)
         return p
 
     # ---------------------------------------------------------------- loader
@@ -120,6 +128,8 @@ class SimConsole:
             self.send(cl.EXEC, sess)
             self.state = 4
             self.prog = Program(self, sess, self.load['args'], self.load.get('raw', b''))
+        elif typ == cl.REPQ and sess == self.report_run and self.repq_err:
+            self.send(cl.ERR, sess, 12)
         elif typ == cl.REPQ and sess == self.report_run:
             for k in range(b):
                 off = a + k * cl.CHUNK
@@ -198,6 +208,7 @@ class Program:
         self.line_seq = 0
         self.stop = False
         self.reset = False
+        self.dead = False
         self.grabs = []
         self.cubes = 24
         threading.Thread(target=self.main, daemon=True).start()
@@ -207,6 +218,8 @@ class Program:
 
     def on(self, m):
         typ, sess, a, b, pl, _ = m
+        if self.dead:
+            return
         if typ == cl.PING:
             self.hello()
         elif typ == cl.RESET:
@@ -337,6 +350,28 @@ class Program:
         else:
             state, code = 2, 0
         self.report.append(b'cl-link: up, lines %d\n' % self.line_seq)
+        words = self.args.split()
+        if any(w in words for w in ('badcrc', 'fetchfail', 'noreturn')):
+            # lane ql-fix-pc round 2: the END arrives whole, then the loader's saved report fails (bad CRC, or REPQ
+            # answered ERR), or the loader never comes back at all (the reset ladder runs out)
+            rep = b''.join(self.report)
+            head = struct.pack('<IiIIIIIIIIIIIIII', state, code, 0, 0, 0, 0, len(rep), zlib.crc32(rep) & 0xFFFFFFFF,
+                               0, len(rep), 0, int((time.time() - t0) * 1000), 0, 0, 200, 1)
+            for _ in range(2):
+                self.send(cl.END, 0, len(rep), rep)
+                self.send(cl.END, 0xFFFFFFFF, len(rep), head)
+                time.sleep(0.2)
+            if 'noreturn' in words:
+                self.dead = True   # nothing more from this console: no beacon, no RESETACK
+                return
+            time.sleep(0.3)
+            with self.con.lock:
+                self.con.bad_crc = 'badcrc' in words
+                self.con.repq_err = 'fetchfail' in words
+                self.con.stub_step = 0
+                self.con.back(state, code, rep)
+                self.con.send(cl.HELLO, 0, payload=self.con.hello_payload(1))
+            return
         if 'endonly' in self.args:
             # ql-fix-pc: the run's END over the link (tail in two pieces, then the head), then a full restart whose
             # BIOS reboot cleared the saved report: the loader comes back with no report (include/dcql_loop.h CL_END)
@@ -356,7 +391,9 @@ class Program:
             return
         time.sleep(0.3)
         with self.con.lock:
-            self.con.back(state, code, b''.join(self.report))
+            self.con.bad_crc = self.con.repq_err = False
+            self.con.stub_step = 6 if self.reset else 0   # a RESET comes back by the stub's jump; an ending by the
+            self.con.back(state, code, b''.join(self.report))   # BIOS restart (no stub record)
             self.con.send(cl.HELLO, 0, payload=self.con.hello_payload(1))
 
 
