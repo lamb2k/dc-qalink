@@ -49,6 +49,25 @@ def make_handler(bridge, level='run'):
             pass
 
         # ------------------------------------------------------------ replies
+        def reply_file(self, f, ctype, chunk=1 << 16):
+            """200 with an open file's bytes as they are now (its size at the start), copied in chunks."""
+            n = os.fstat(f.fileno()).st_size
+            self.send_response(200)
+            for k, v in CORS.items():
+                self.send_header(k, v)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(n))
+            self.end_headers()
+            left = n
+            while left > 0:
+                b = f.read(min(chunk, left))
+                if not b:
+                    break
+                self.wfile.write(b)
+                left -= len(b)
+            if left:   # the file shrank under us: the length sent can no longer be met
+                self.close_connection = True
+
         def reply(self, code, body, ctype='application/json', extra=None):
             if ctype == 'application/json':
                 if isinstance(body, dict):
@@ -175,11 +194,11 @@ def make_handler(bridge, level='run'):
                     if s is not None:
                         s.flush()
                     try:   # round 3, blocker 1: opened, then checked on the descriptor (a linked file is refused)
-                        with qlsafe.open_confined(bridge.sessions_dir, m[1] + '.jsonl') as f:
-                            data = f.read()
+                        f = qlsafe.open_confined(bridge.sessions_dir, m[1] + '.jsonl')
                     except qlsafe.Refused:
                         return self.err(404, 'no session %s' % m[1])
-                    return self.reply(200, data, 'application/x-ndjson')
+                    with f:   # round 4, item 3: streamed from the checked descriptor, never read whole into memory
+                        return self.reply_file(f, 'application/x-ndjson')
                 s = bridge.current
                 if p == '/v0/summary':
                     if s is None:
@@ -422,15 +441,15 @@ def make_handler(bridge, level='run'):
                 if s is not None:
                     out.append(s.info())
                     continue
-                path = os.path.join(bridge.sessions_dir, fn)
-                try:
-                    with open(path, encoding='utf-8') as fh:
-                        meta = json.loads(fh.readline())
-                except (OSError, ValueError):
+                try:   # round 4: opened, then checked on the descriptor (a linked file is left out)
+                    with qlsafe.open_confined(bridge.sessions_dir, fn) as fh:
+                        meta = json.loads(fh.readline(65536).decode('utf-8'))
+                        size = os.fstat(fh.fileno()).st_size
+                except (OSError, ValueError, qlsafe.Refused):
                     continue
                 out.append({'id': sid, 'label': meta.get('label'), 'device': (meta.get('device') or {}).get('name'),
                             'started': meta.get('recorded'), 'recorded': meta.get('recorded'), 'tier': meta.get('tier'),
-                            'pictures': None, 'bytes': os.path.getsize(path), 'version': meta.get('version', 1),
+                            'pictures': None, 'bytes': size, 'version': meta.get('version', 1),
                             'build': (meta.get('build') or {}).get('id')})   # ql-disc: format 2 names its build
             return out
 

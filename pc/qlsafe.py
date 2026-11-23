@@ -183,6 +183,34 @@ class Anchor:
                 self.close()
                 raise Refused('%s changed while it was anchored' % root)
 
+    def sub(self, rel):
+        """A folder below this one anchored from this anchor's own descriptor (round 4): opened relative to it with
+        O_DIRECTORY, checked on the opened descriptor, never resolved again by name. Without dir_fd (Windows) it falls
+        back to a checked name (the deferred list in docs/RELEASE_0.2.md names that window)."""
+        if rel is None or '\0' in rel:
+            raise Refused('a NUL in the name')
+        rel = rel.replace('\\', '/').strip('/')
+        parts = rel.split('/')
+        if not rel or any(x in ('', '.', '..') for x in parts) or ':' in parts[0]:
+            raise Refused('%r is not a plain name below the root' % rel[:80])
+        if self.fd is None:
+            p = confine(self.real, rel, want='dir')
+            if p is None:
+                raise Refused('%r is not a folder below the root' % rel[:80])
+            return Anchor(p)
+        fd = os.open(os.path.join(*parts), os.O_RDONLY | os.O_DIRECTORY, dir_fd=self.fd)
+        try:
+            real = _fd_path(fd)
+            if real is None or not _below(self.real, real):
+                raise Refused('%r is not a folder below the root' % rel[:80])
+            a = Anchor.__new__(Anchor)
+            st = os.fstat(fd)
+            a.root, a.real, a.ident, a.fd = real, os.path.normcase(real), (st.st_dev, st.st_ino), fd
+            return a
+        except BaseException:
+            os.close(fd)
+            raise
+
     def open(self, rel):
         """A peer's name (the rules of confine) below the anchored folder, opened and checked; Refused otherwise."""
         if rel is None or '\0' in rel:

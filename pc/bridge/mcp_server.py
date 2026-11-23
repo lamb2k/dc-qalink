@@ -75,16 +75,52 @@ def mcp_root():
 
 
 
+JSON_SLICE = 1 << 16   # characters of one string escaped at a time while it is measured
+
+
+def json_size(obj, limit):
+    """The exact length of json.dumps(obj) (ASCII escaping), or None as soon as it would pass `limit`, measured with
+    no copy larger than one JSON_SLICE: a string over the limit is refused by its length alone, before any escaping;
+    others are escaped one slice at a time (round 4, item 3)."""
+    enc = json.encoder.encode_basestring_ascii
+    total = [0]
+
+    def add(n):
+        total[0] += n
+        return total[0] <= limit
+
+    def walk(o):
+        if isinstance(o, str):
+            if not add(len(o) + 2):   # escaping never shortens a string: refused by its length alone
+                return False
+            extra = 0
+            for i in range(0, len(o), JSON_SLICE):
+                part = o[i:i + JSON_SLICE]
+                extra += len(enc(part)) - 2 - len(part)
+                if total[0] + extra > limit:
+                    return False
+            return add(extra)
+        if isinstance(o, dict):
+            if not add(2 + max(0, len(o) - 1) * 2):   # {} and ", " between items
+                return False
+            for k, v in o.items():
+                if not (walk(k if isinstance(k, str) else str(k)) and add(2) and walk(v)):
+                    return False
+            return True
+        if isinstance(o, (list, tuple)):
+            if not add(2 + max(0, len(o) - 1) * 2):
+                return False
+            return all(walk(v) for v in o)
+        return add(len(json.dumps(o)))   # numbers, true/false/null: small
+    return total[0] if walk(obj) else None
+
+
 def json_capped(body, limit):
-    """`body` as JSON bytes, or None once the encoding passes `limit` bytes: the encoder is stopped there, so a large
-    name, path or base64 field never builds a whole oversized request (round 3, blocker 3)."""
-    out, n = [], 0
-    for chunk in json.JSONEncoder().iterencode(body):
-        n += len(chunk)
-        if n > limit:
-            return None
-        out.append(chunk)
-    return ''.join(out).encode()
+    """`body` as JSON bytes, or None when it would be over `limit` bytes. Measured first (json_size: no oversized field
+    is ever escaped or copied whole), then encoded (round 3 bounded what was sent; round 4 bounds what is built)."""
+    if json_size(body, limit) is None:
+        return None
+    return json.dumps(body).encode()
 
 class BridgeClient:
     def __init__(self, base, who, root=None):

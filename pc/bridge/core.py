@@ -1,7 +1,7 @@
 """core.py: the bridge's link side. One UDP socket owns the link to one console (or one Flycast); a pump thread reads it
 while nothing runs, the run worker reads it while a run is on, and every datagram passes the same tap, so lines, files,
 stills, records, trace and log are handled the same way whoever is reading. Sends never wait for the reader."""
-import hashlib, itertools, json, os, queue, random, re, socket, struct, sys, threading, time, zlib
+import collections, hashlib, itertools, json, os, queue, random, re, socket, struct, sys, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -263,11 +263,55 @@ class Stills:
         self.expired = 0         # unfinished stills abandoned (idle over cl.STILL_STALE_S): their slots freed
         self.receipts = cl.StillReceipts()   # completed stills (bounded): a repeated head / END is answered, not reopened
         self.crc_failed = 0   # pictures whose CRC failed (each asked for again)
-        self.META_KEEP = 4096
+
+    META_KEEP = 4096     # still records held in memory (held and failed alike)
+    CRC_TRIES = 3        # full copies of one capture whose CRC fails before it ends as failed (round 4)
+    FAILED_IDLE_S = 3.0  # a capture that failed its CRC and then hears nothing this long ends as failed
+
+    def _end(self, key, st, ok, tier, emit):
+        """A capture's one record (held or failed), kept under META_KEEP with its waiter told; out of `cur`."""
+        run, b = key
+        sid = '%08x-%d' % (run, b)
+        j = {'id': sid, 'run': '%08x' % run, 'index': b, 'picture': st['picture'], 'width': st['w'],
+             'height': st['h'], 'format': 'rgb565', 'crc_ok': ok, 'bytes': st['bytes'],
+             'seconds': round(time.time() - st['t0'], 3), 'request': st['req'] or None, 'tier': tier,
+             'at': now_iso(), 'png': os.path.join(self.folder, 'still-%s.png' % sid) if ok else None}
+        if not ok:
+            j['crc_failures'] = st.get('crc_fail', 0)
+        self.cur.pop(key, None)
+        self.meta.pop(sid, None)
+        self.meta[sid] = j
+        while len(self.meta) > self.META_KEEP:   # the still's record stays on disk with its run; memory bounded
+            old = next(iter(self.meta))
+            self.meta.pop(old)
+            for w in [w for w, ids in self.waiters.items() if old in ids]:
+                self.waiters.pop(w, None)
+        self.log('still %s (picture %d) %s in %.2f s' % (sid, st['picture'], 'held' if ok else
+                                                         'FAILED its CRC (%d copies)' % st.get('crc_fail', 0),
+                                                         j['seconds']))
+        if st['req']:
+            self.waiters.setdefault(st['req'], []).append(sid)
+        if emit is not None:
+            emit(j)
+        return j
+
+    def expire(self, now=None):
+        """Abandoned captures ended on a timer (each message and each grab wait calls it, not only a new head): one
+        that failed its CRC and went quiet for FAILED_IDLE_S ends as one failed record (its waiter released); any
+        other unfinished one idle over STILL_STALE_S is dropped."""
+        now = time.time() if now is None else now
+        for k, s in list(self.cur.items()):
+            idle = now - s.get('t_last', s['t0'])
+            if s.get('crc_fail') and idle > self.FAILED_IDLE_S:
+                self._end(k, s, False, s.get('tier'), s.get('emit'))
+            elif not s['done'] and idle > cl.STILL_STALE_S:
+                self.cur.pop(k, None)
+                self.expired += 1
 
     def on_still(self, loop, run, a, b, payload, tier, emit):
         key = (run, b)
         now = time.time()
+        self.expire(now)
         st = self.cur.get(key)
         if a == cl.STILL_HEAD:
             hd = cl.still_head(payload)   # checked before anything is allocated (audit 2026-11-23, item 3)
@@ -308,38 +352,27 @@ class Stills:
                 ok = (zlib.crc32(bytes(st['data'])) & 0xFFFFFFFF) == crc
                 sid = '%08x-%d' % (run, b)
                 path = os.path.join(self.folder, 'still-%s.png' % sid)
-                if ok:
-                    cl.png_rgb565(path, st['w'], st['h'], bytes(st['data']))
-                j = {'id': sid, 'run': '%08x' % run, 'index': b, 'picture': st['picture'], 'width': st['w'],
-                     'height': st['h'], 'format': 'rgb565', 'crc_ok': ok, 'bytes': st['bytes'],
-                     'seconds': round(time.time() - st['t0'], 3), 'request': st['req'] or None, 'tier': tier,
-                     'at': now_iso(), 'png': path if ok else None}
-                self.meta[sid] = j
                 if not ok:
                     # round 3, blocker 5: a CRC mismatch is never a completion. No receipt, no full ACK: every block
-                    # is asked for again (all missing), as for a partial picture; the program sends a fresh copy or
-                    # gives up after its own rounds (and counts the still as failed)
+                    # is asked for again (all missing). Round 4: no record per attempt; after CRC_TRIES copies (or
+                    # when the program stops sending, expire()) the capture ends as ONE failed record, its waiter
+                    # released (a grab answers 502)
                     st['done'] = False
                     st['have'] = set()
                     st['crc_fail'] = st.get('crc_fail', 0) + 1
+                    st['emit'], st['tier'] = emit, tier
                     self.crc_failed += 1
-                    self.log('still %s (picture %d) CRC MISMATCH (%d): a fresh copy asked for' % (
-                        sid, st['picture'], st['crc_fail']))
-                    emit(j)
+                    self.log('still %s (picture %d) CRC MISMATCH (%d of %d)' % (sid, st['picture'], st['crc_fail'],
+                                                                               self.CRC_TRIES))
+                    if st['crc_fail'] >= self.CRC_TRIES:
+                        self._end(key, st, False, tier, emit)   # given up: the program's next END is not answered
+                        return
                     loop.send(cl.STILLACK, run, b, min(nblocks, 0xFFFF),
                               bytes(bytearray((nblocks + 7) // 8)[:cl.DGRAM_MAX - cl.HDR - 4]))
                     return
-                while len(self.meta) > self.META_KEEP:   # the still's record stays on disk with its run; memory bounded
-                    old = next(iter(self.meta))
-                    self.meta.pop(old)
-                    for w in [w for w, ids in self.waiters.items() if old in ids]:
-                        self.waiters.pop(w, None)
+                cl.png_rgb565(path, st['w'], st['h'], bytes(st['data']))
                 self.receipts.add(key, st['bytes'])
-                self.log('still %s (picture %d) held in %.2f s' % (sid, st['picture'], j['seconds']))
-                if st['req']:
-                    self.waiters.setdefault(st['req'], []).append(sid)
-                emit(j)
-                self.cur.pop(key, None)
+                self._end(key, st, True, tier, emit)
             loop.send(cl.STILLACK, run, b, min(missing, 0xFFFF), bytes(bits[:cl.DGRAM_MAX - cl.HDR - 4]))
             return
         if not st['done'] and cl.still_block_ok(st, a, payload):   # present only at its exact place and length
@@ -373,7 +406,7 @@ class Run:
         self.crash = None
         self.error = None
         self.files_stats = None
-        self.serial = []
+        self.serial = collections.deque(maxlen=self.SERIAL_KEEP)
         self.serial_gaps = 0
         self.serial_dropped = 0
         self.stills = []
@@ -721,7 +754,10 @@ class Bridge:
                     # side); a program that links while a pushed run is on is that run (Flycast f2)
                     h['run_id'] = self.active.sid
                 fresh = self.client is None or self.client_run != h['run_id']
+                old = self.client_run
                 self.client, self.client_run = h, h['run_id']
+                if old is not None and old != h['run_id'] and (self.active is None or self.active.sid != old):
+                    self.retire_run_state(old)   # round 4: the replaced link's grant goes with it
                 self.client_hello_run = h['hello_run']   # kept after the program leaves (self.client goes None)
                 if fresh:
                     s = self.session_for(h['run_id'])
@@ -747,11 +783,9 @@ class Bridge:
                 if r is not None:
                     if r.serial and a > r.serial[-1][0] + 1:
                         r.serial_gaps += a - r.serial[-1][0] - 1
+                    if len(r.serial) == r.serial.maxlen:   # round 4: exactly the last SERIAL_KEEP lines are kept
+                        r.serial_dropped += 1                # (the session file keeps every line)
                     r.serial.append((a, pl.decode('latin-1')))
-                    if len(r.serial) > Run.SERIAL_KEEP:   # round 3: a run's serial lines bounded (oldest dropped;
-                        drop = len(r.serial) - Run.SERIAL_KEEP // 2   # the session file keeps every line)
-                        r.serial_dropped += drop
-                        del r.serial[:drop]
                 self.record({'t': 'line', 'run': '%08x' % run, 'seq': a, 'text': pl.decode('latin-1').rstrip('\n')}, s)
             elif len(pl) >= 4:
                 n = struct.unpack_from('<I', pl, 0)[0]
@@ -769,8 +803,9 @@ class Bridge:
             def held(j):
                 rr = self.runs.get(j['run'])
                 j['build'] = rr.build if rr is not None else self.build_id
-                if rr is not None:
+                if rr is not None and j['id'] not in rr.stills[-8:]:   # one id per capture (round 4)
                     rr.stills.append(j['id'])
+                    del rr.stills[:-Stills.META_KEEP]
                 self.record({'t': 'still', 'run': j['run'], 'id': j['id'], 'picture': j['picture'], 'crc_ok': j['crc_ok']}, s)
                 if j['crc_ok']:
                     self.record({'t': 'grab', 'n': j['picture'], 'w': j['width'], 'h': j['height'], 'fmt': 'png',
@@ -849,27 +884,42 @@ class Bridge:
         (an external session that said hello). Any other run ID is refused (audit round 3, blocker 1: an unknown ID
         never receives the whole share)."""
         a = self.active
-        if a is not None and a.sid == run:
-            return True
+        if a is not None:   # round 4: while a pushed run is active, its grant is the only one (no external owner)
+            return a.sid == run
         return self.client is not None and self.client_run == run
 
     def file_service(self, run):
         fs = self.files.get(run)
-        if fs is None and not self.file_owner(run):
+        if not self.file_owner(run):   # round 4: checked on every lookup, a cached service included
+            if fs is not None:
+                self.retire_run_state(run)
             self.log('/pc request from run %08x: not the active run or the linked program; refused' % run)
             return cl.FileService(None, None)   # refuses every open; not kept
         if fs is None:
             r = self.runs.get('%08x' % run)
-            root = self.files_root
+            root, anchor = self.files_root, None
             if r is not None and r.files:
                 # a run that asked for a subfolder gets that subfolder or nothing (audit round 2: fail closed, never
-                # widened to the whole /pc root)
-                root = qlsafe.confine(self.files_root, r.files, want='dir') if self.files_root else None
-                if root is None:
+                # widened to the whole /pc root); round 4: anchored from the root's descriptor, not resolved again
+                root = None
+                if self.files_root:
+                    try:
+                        base = qlsafe.Anchor(self.files_root)
+                        try:
+                            anchor = base.sub(r.files)
+                        finally:
+                            if anchor is None or anchor.fd != base.fd:
+                                base.close()
+                    except (OSError, qlsafe.Refused):
+                        anchor = None
+                if anchor is None:
                     self.log('run %s: /pc subfolder %r is not a folder below the served root: /pc refused for this run'
                              % (r.id, r.files))
             while len(self.files) >= self.FILES_MAX:
                 self.retire_run_state(next(iter(self.files)))
+            if anchor is not None:
+                fs = self.files[run] = cl.FileService(None, self.log, anchor=anchor)
+                return fs
             fs = self.files[run] = cl.FileService(root, self.log)
         return fs
 
@@ -1172,7 +1222,11 @@ class Bridge:
         run.report_crc_ok = er['crc_ok']
         run.state = RUN_STATE_OF.get(er['state'], 'lost')
         run.ending = {k: er[k] for k in ('bytes', 'tail_bytes', 'complete', 'whole', 'crc_ok', 'by')}
-        if not er['complete']:
+        if er['whole'] and not er['crc_ok']:
+            # round 4: a whole report whose CRC is known to be wrong is never a successful result
+            run.state = 'lost'
+            run.error = "the END's whole report failed its CRC"
+        elif not er['complete']:
             run.error = "the END's tail is incomplete (%d of %d bytes held)" % (er['tail_bytes'],
                                                                                er['end']['sent_len'])
         elif note:
@@ -1289,20 +1343,24 @@ class Bridge:
 
     def _grab(self, timeout):
         req = next(self.grab_n) & 0xFFFFFFFF
-        t0 = time.time()
-        while time.time() - t0 < timeout:
+        deadline = time.time() + timeout   # absolute (round 4): no wait extends past it
+        while time.time() < deadline:
             if self.client is None:
                 return 410, {'error': 'the program left before its picture arrived'}
             self.loop.send(wire.GRAB, self.client_run, req, 0)
-            end = time.time() + 2.0
+            end = min(deadline, time.time() + 2.0)
             while time.time() < end:
+                self.stills.expire()   # a capture that failed and went quiet ends here, releasing this wait
                 got = self.stills.waiters.get(req)
                 if got:
-                    j = self.stills.meta[got[0]]
-                    return (200 if j['crc_ok'] else 502), dict(j, request=req)
-                # a grab under way keeps the program busy: wait while blocks arrive
-                if any(st['req'] == req for st in self.stills.cur.values()):
-                    end = time.time() + 2.0
+                    j = self.stills.meta.get(got[0])
+                    if j is not None:
+                        return (200 if j['crc_ok'] else 502), dict(j, request=req)
+                # a grab under way keeps the program busy: wait while its blocks keep arriving (progress in the last
+                # 2 s), never past the deadline
+                if any(st['req'] == req and time.time() - st.get('t_last', st['t0']) < 2.0
+                       for st in list(self.stills.cur.values())):
+                    end = min(deadline, time.time() + 2.0)
                 time.sleep(0.05)
         return 504, {'error': 'no picture from the program in %.0f s (does its link answer GRAB?)' % timeout}
 
