@@ -281,24 +281,44 @@ if grep -q -- "'--controls'" "$S/tests/test_assets.py" 2>/dev/null; then
 else
   row "control test_assets four broken pieces" FAIL "tests/test_assets.py has no --controls (a required control)"
 fi
-if [ -f "$S/tests/test_safety.py" ]; then
-  test_row test_safety 0 python3 tests/test_safety.py --out "$H/safety"
-  if rm -rf "$W/old-1990fb9" && mkdir -p "$W/old-1990fb9" && git -C "$S" archive 1990fb9 pc tools | tar -x -C "$W/old-1990fb9"; then
-    test_row control-test_safety-1990fb9 0 python3 tests/test_safety.py --pc "$W/old-1990fb9/pc" --controls --out "$H/safety-old"
-    for it in A1 A2 A3 A4 A5; do
-      grep -qE "^control $it .*must fail\) PASS" "$H/control-test_safety-1990fb9.log" \
-        && row "control 1990fb9 fails $it" PASS "the audited PC code fails item $it as it must" \
-        || row "control 1990fb9 fails $it" FAIL "item $it did not fail on 1990fb9's pc/ (host/control-test_safety-1990fb9.log)"
+# pinned safety rows (audit round 2, item 6): the gate names every row itself. A positive run must show each pinned row
+# PASS (a row that is missing is a FAIL row of its own); the control on the audited tree must show each control row
+# failing with its expected discrepancy (tests/ctlrows.py prints "control <id> (...) PASS" only then: an exception, a
+# missing helper or another failure is a control FAIL). One gate row per pinned row.
+safety_rows() {   # test, old revision, "control ids", "positive-only ids"
+  local t=$1 rev=$2 ctl=$3 pos=$4 id
+  if [ ! -f "$S/tests/$t.py" ]; then row "test $t" FAIL "tests/$t.py missing (a required test)"; return; fi
+  test_row "$t" 0 python3 "tests/$t.py" --out "$H/$t"
+  for id in $ctl $pos; do
+    grep -qE "^${id//./\\.} +.* PASS found=" "$H/$t.log" \
+      && row "pinned $t $id" PASS "present and passing" \
+      || row "pinned $t $id" FAIL "missing or not passing (host/$t.log)"
+  done
+  if rm -rf "$W/old-$rev" && mkdir -p "$W/old-$rev" && git -C "$S" archive "$rev" pc tools | tar -x -C "$W/old-$rev"; then
+    test_row "control-$t-$rev" 0 python3 "tests/$t.py" --pc "$W/old-$rev/pc" --controls --out "$H/$t-old"
+    for id in $ctl; do
+      grep -qE "^control ${id//./\\.} \(.*\) PASS$" "$H/control-$t-$rev.log" \
+        && row "control $rev $id" PASS "fails on $rev with its expected discrepancy" \
+        || row "control $rev $id" FAIL "did not fail as expected on $rev (host/control-$t-$rev.log)"
     done
   else
-    row "control 1990fb9 fails A1-A5" FAIL "1990fb9's pc/ could not be taken from git"
+    row "control $rev $t" FAIL "$rev's pc/ could not be taken from git"
   fi
-else
-  row "test test_safety" FAIL "tests/test_safety.py missing (a required test)"
-fi
+}
+safety_rows test_safety 1990fb9 \
+  "A1.bind_default A1.bind_flycast A1.lan_unparsed A2.pc_links A2.folder_disc A2.gdi_names A2.model_deps A2.asset_path
+   A2.mcp_path A3.stills_cli A3.stills_bridge A3.open_files A3.http_length A3.mcp_base64 A4.bridge_end A5.parse_way_back" \
+  "A1.allow_lan A1.local_linked A4.assembler A5.decoder A5.first_console"
+safety_rows test_safety2 2ff9b9d \
+  "B1.cli_wildcard B1.core_wildcard B2.plugin_link B2.loader_zip_link B2.gdi_swap B2.subfolder_closed B3.files_retired
+   B3.files_capped B3.disc_capped B3.disc_retired B3.elf_span B3.png_dims B3.report_len B3.report_offsets
+   B3.queue_capped B3.raw_dropped B3.mcp_upload B4.ladder_exhausted B4.bad_crc_report B4.failed_report
+   B4.label_full_restart B5.bridge_receipt B5.cli_receipts_bounded B5.bridge_expire B5.cli_expire B5.bridge_exact_len
+   B5.cli_exact_len" \
+  "B1.allow_lan B1.flycast_exception B2.subfolder_api B4.label_stub B6.harness"
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done
