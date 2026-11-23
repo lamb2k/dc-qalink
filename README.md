@@ -15,7 +15,14 @@ broadband adapter.
 <code>GOTO level1-boss</code>, and dialling. The addresses on the status line are documentation addresses
 (192.0.2.x) drawn over the capture's own in the same font.</sub></p>
 
-## New in 0.2 (branch `v0.2`, not released): the control loop and the broadband adapter
+## Desktop companion: DC QA Link Cloud
+
+[DC QA Link Cloud](https://github.com/lamb2k/dc-qalink-cloud) is the desktop app for dc-qalink: live timings against
+your budget, screen grabs, push and run, commands and a virtual pad, recorded sessions, and an MCP server so agents
+(Claude Code, Codex) can drive the console. Its 0.2 build on this release follows; until then the
+[0.1.0 preview](https://github.com/lamb2k/dc-qalink-cloud/releases/tag/v0.1.0-preview) (Windows x64) is the download.
+
+## New in 0.2.0: the control loop and the broadband adapter
 
 What each claim rests on is marked: **console** (a real Dreamcast), **Flycast** (the emulator, function checks
 only), **host** (tests on a PC), **link map** (exact bytes). The full list with dates: `docs/RELEASE_0.2.md`.

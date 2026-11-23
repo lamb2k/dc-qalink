@@ -1,8 +1,8 @@
 # dc-qalink 0.2: what it holds, and what is still open
 
-Branch `v0.2` is the integration branch for 0.2.0. Work reaches it only through the gate (`tools/gate/gate.sh`,
-below). 0.2.0 is tagged from it when the release criteria at the end of this file hold at the exact tag head and the
-maintainer approves; until then nothing here is a release.
+0.2.0 was tagged on 2026-11-23 from branch `v0.2` after the release criteria at the end of this file held at the
+tag head (the gate's record: head, ledger, sizes and link maps) and the maintainer approved. `CHANGELOG.md` has the
+short list and the known issues.
 
 Every number below carries its tier: **console** (a real Dreamcast), **Flycast** (the emulator: a function check,
 never a speed claim), **host** (tests on a PC), **link map** (exact bytes).
