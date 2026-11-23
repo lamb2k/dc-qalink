@@ -59,6 +59,12 @@ Rulings on the gate's rows:
   reboots with no ending comes back with its run named **LOST** (the loader's start-of-run record survives the
   restart), and the PC tool exits 5. The row expects exactly that: exit 5, state LOST. Its earlier form (exit 4,
   "back without this run") stays as the `ret nosave` row: no link, nothing kept, exit 4.
+- **2026-11-23, ql-core4's cite "program link up after EXEC" (static address), re-cited from 1.29 s to 0.67 s, ±30%.**
+  Cause: ql-mem's next-hop fix (011a5a0). KallistiOS asks again for an unknown MAC only after 5 s, so the adapter now
+  asks for the next hop at link up and every 100 ms for up to 3 s. The program no longer waits on that, and its link
+  comes up sooner. The new figure was measured by the gate on v0.2 plus ql-mem 6917f03: 0.681 and 0.654 s (Flycast,
+  function-check tier, rows c4-01 to c4-05). This re-cites a known cause and does not loosen anything. Every other
+  cite stays as it was, including "end to beacon, copy kept" at 5.26 s (5.247 and 5.234 s on the same runs).
 
 ## Limits (plan section 3), measured by the gate
 
