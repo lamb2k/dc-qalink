@@ -15,6 +15,13 @@ broadband adapter.
 <code>GOTO level1-boss</code>, and dialling. The addresses on the status line are documentation addresses
 (192.0.2.x) drawn over the capture's own in the same font.</sub></p>
 
+## Coming in 0.3 (branch `v0.3-demo`): a sample game to try it with
+
+`example/demo3d/` is a small original 3D game (a craft, a tiled floor, cubes to collect) built with the client library:
+live data, the in-game menu with a crash button, screen grabs, serial lines, and its texture and model read from the
+network disc, so a texture changed on the PC shows on the next push. QA Link Cloud's first-run set-up pushes it.
+Build, run in Flycast or on a console, and swap the texture: `example/demo3d/README.md`. Tier so far: Flycast.
+
 ## New in 0.2 (branch `v0.2`, not released): the control loop and the broadband adapter
 
 What each claim rests on is marked: **console** (a real Dreamcast), **Flycast** (the emulator, function checks
