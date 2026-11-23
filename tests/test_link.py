@@ -145,12 +145,12 @@ class CutTest(unittest.TestCase):
 
 class PiSetupTest(unittest.TestCase):
     def test_parse_arp_windows_and_linux(self):
-        win = '  192.168.1.16          b8-27-eb-12-34-56     dynamic\n  192.168.1.255         ff-ff-ff-ff-ff-ff     static'
-        lin = '? (192.168.1.20) at dc:a6:32:00:11:22 [ether] on wlan0\n192.168.1.30 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE'
+        win = '  192.0.2.16          b8-27-eb-12-34-56     dynamic\n  192.0.2.255         ff-ff-ff-ff-ff-ff     static'
+        lin = '? (192.0.2.20) at dc:a6:32:00:11:22 [ether] on wlan0\n192.0.2.30 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE'
         got = pi_setup.parse_arp(win + '\n' + lin)
-        self.assertIn(('192.168.1.16', 'b8:27:eb:12:34:56'), got)
-        self.assertIn(('192.168.1.20', 'dc:a6:32:00:11:22'), got)
-        self.assertIn(('192.168.1.30', '00:11:22:33:44:55'), got)
+        self.assertIn(('192.0.2.16', 'b8:27:eb:12:34:56'), got)
+        self.assertIn(('192.0.2.20', 'dc:a6:32:00:11:22'), got)
+        self.assertIn(('192.0.2.30', '00:11:22:33:44:55'), got)
         self.assertFalse(any(ip.endswith('.255') for ip, _ in got))
         self.assertTrue(pi_setup.is_pi_mac('b8:27:eb:12:34:56'))
 

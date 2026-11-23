@@ -26,6 +26,7 @@ def main(argv=None):
     ap.add_argument('--files', help='folder served to programs as /pc/ (a run may name a subfolder)')
     ap.add_argument('--selftest', help='the self-test program (dc-qalink\'s testprog.elf)')
     ap.add_argument('--loader-disc', help='folder of the loader disc image served by /v0/loader')
+    ap.add_argument('--viewer', help='the console asset viewer (example/viewer\'s viewer.elf) for /v0/assets')
     # the network disc (lane ql-disc): a program that mounts lib/dcql_disc reads /cd from these
     ap.add_argument('--disc', help='the network disc\'s base: the built disc folder, or an image (.gdi with its tracks, .iso)')
     ap.add_argument('--overlay', help='the network disc\'s overlay folder: its changed files are served, the rest read '
@@ -57,6 +58,7 @@ def main(argv=None):
                autoconnect=not a.no_autoconnect, only_local=not a.allow_lan, disc=a.disc, overlay=a.overlay,
                whole=a.whole)
     b.asset_plugins = a.asset_plugins
+    b.viewer_elf = a.viewer
     serve(b, '127.0.0.1', a.port, a.level)
     if a.mcp_http:
         from bridge import mcp_server

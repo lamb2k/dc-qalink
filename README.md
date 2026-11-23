@@ -80,7 +80,7 @@ and the marker echoes in the relay log.</sub></p>
 
 Flycast instead of a Pi: run the relay on the PC, set `[network] DCNet = no` in emu.cfg, configure the console with
 `cfg.host = "<PC address>"` and `cfg.lport = 52042` (Flycast opens the console's port on the PC). For the example:
-`make CFLAGS_EXTRA='-DEX_HOST=\"192.168.1.10\" -DEX_LPORT=52042'`, then load `dcql-example.elf` in Flycast.
+`make CFLAGS_EXTRA='-DEX_HOST=\"192.0.2.10\" -DEX_LPORT=52042'`, then load `dcql-example.elf` in Flycast.
 
 ## API (`lib/dcql.h`)
 

@@ -58,7 +58,7 @@ unsigned dcql_net_tx_queued(void);
 void dcql_net_relearn(void);
 int dcql_net_learning(void);
 int dcql_net_mac(unsigned char out[6]);            /* the adapter's MAC address; -1 (all zero) on the modem */
-void dcql_net_text(char *out, unsigned n);          /* "UP 192.168.1.5 TO 192.168.1.10 ADAPTER", "DIALLING 1/3" */
+void dcql_net_text(char *out, unsigned n);          /* "UP 192.0.2.5 TO 192.0.2.10 ADAPTER", "DIALLING 1/3" */
 void dcql_net_counters(unsigned *tx, unsigned *rx, unsigned *txd, unsigned *rxd);
 unsigned dcql_net_ip(void), dcql_net_host(void), dcql_net_mask(void), dcql_net_gw(void);
 unsigned dcql_net_port(void), dcql_net_lport(void), dcql_net_rate(void), dcql_net_stalls(void);

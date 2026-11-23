@@ -20,7 +20,7 @@ def load(path, name):
 
 
 def hello(cl, role=1):
-    p = struct.pack('<16I', 1, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, struct.unpack('<I', socket.inet_aton('192.168.1.235'))[0],
+    p = struct.pack('<16I', 1, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, struct.unpack('<I', socket.inet_aton('192.0.2.235'))[0],
                     0, 0) + b'echo-test loader'.ljust(32, b'\0') + struct.pack('<4I', 2, role, 2, 2120) + bytes(8) + \
         struct.pack('<II', 0, 2)
     return cl.frame(cl.HELLO, 0, payload=p)
@@ -75,7 +75,7 @@ def main():
     res.append(('dcql_loop --udp auto: the peer is the loader, not our echo', peer == want, peer, want))
     peer, want, echoes, disc = run_bridge()
     res.append(('bridge: the peer is the loader; the echo counted and dropped', peer == want and echoes == 1 and
-                len(disc) == 1 and disc[0]['console_ip'] == '192.168.1.235', peer, want))
+                len(disc) == 1 and disc[0]['console_ip'] == '192.0.2.235', peer, want))
     if a.old:
         old = load(a.old, 'dcql_loop_old')
         peer, want = run_loop(old)
