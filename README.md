@@ -30,7 +30,11 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
   before every way back so a return lands on the loader and not on openMenu. Its screen shows three large lines you
   can read off a TV: the console's address, the PC it looks for, beacons sent and answers heard. Its HELLO carries the
   adapter's MAC (a PC keeps one console by it across address changes), the GDEMU slot and version, and the stub's
-  record of the last way back.
+  record of the last way back. While no PC answers (10 s), the adapter loader moves its own port (`lport`) to a new
+  one from 49152 every 5 s (every 20 s after 2 minutes): Flycast on Windows stops receiving on a port that once sent
+  to a PC port nobody listened on, so a bridge started after the loader linked but never reached it. The bridge and
+  `pc/dcql_loop.py` answer the port the beacons come from (Flycast and host; a console's KallistiOS loses nothing
+  this way).
 - **The first run on a console:** `python tools/first_console.py --program build/testprog.elf` waits for the beacon,
   pushes the test program, reads its report, grabs the console's screen 3 times, sends RESET and prints a pass/fail
   table. The PC tool learns the console's address from its beacon (`--udp auto`).
