@@ -15,7 +15,24 @@ test program `loader/liveprog.c`, over the objects `client.o`, `cl_util.o`, `dcq
 | a program with the network disc (own row, reported) | 168,767 B | 114,591 B |
 
 Both columns are the gate's own size rows (lane ql-mem's gate runs `gates\ql-mem-base-2ac5297c5` and
-`gates\ql-mem-77e8c38d0`, same options).
+`gates\ql-mem-77e8c38d0`, same options). With the next-hop fix below (011a5a0): fixed **70,167 B** (+16 B: the next
+hop's address, a flag and a start time), code 20,421 B (`gates\m-fix2-011a5a00f`).
+
+## The next hop asked again (011a5a0)
+
+ql-int's gate on fd4b45d found end to beacon after a kept record at 10.23 s against 5.25 s. A timestamped Flycast
+serial showed the console on time and the loader's first HELLO reaching the PC 5.0 s late. KallistiOS queues a
+datagram whose next hop is not in its ARP cache, asks once, and asks again only after 5 s (`net_arp.c`); in Flycast the
+first question right after the adapter comes up usually goes unanswered. The link now asks again from its send thread
+every 100 ms (at most 3 s) while the MAC is missing, and still counts as up at once. Flycast, rows 01 to c4-05, one run
+each (function tier):
+
+| | fd4b45d (m-rep) | 011a5a0 (m-fix2) |
+|---|---|---|
+| end to beacon, copy kept (c4-05) | 10.24 s | 5.24 s |
+| program's link up after EXEC | 1.30 s | 0.66 s (the client's ARP wait at link up shortens with it) |
+| END after EXEC (lines:5) | 2.76 s | 2.16 s |
+| next hop answered | not logged | 124 to 214 ms in 20 boots, once 609 ms |
 
 ## Every symbol of 256 B or more (before), and what happened to it
 
