@@ -56,7 +56,8 @@ ERRORS = {0: 'ok', 1: 'stream crc', 2: 'inflate', 3: 'raw length', 4: 'sha256', 
           7: 'no memory', 8: 'not verified', 9: 'unknown session', 10: 'bad load', 11: 'codec', 12: 'no report',
           13: 'busy', 14: 'protocol version'}
 PC_TYPES = frozenset((LOAD, DATA, RUN, REPQ, REPDONE, PING, ABORT, VERIFY, RESET, FINFO, FDATA, STILLACK,
-                      0x1c, 0x1d, 0x1e, ENDACK))   # PC -> console (with the live additions SUB, GRAB, CMD; ENDACK)
+                      0x1c, 0x1d, 0x1e, ENDACK, 0x2a, 0x2b))   # PC -> console (live: SUB, GRAB, CMD; ENDACK;
+                                                                # disc: DINFO, DDATA)
 STATES = {0: 'IDLE', 1: 'RECEIVING', 2: 'VERIFIED', 3: 'FAILED', 4: 'EXEC'}
 RUN_STATES = {0: 'NONE', 1: 'RUNNING', 2: 'DONE', 3: 'CRASHED', 4: 'TIMEOUT', 5: 'LOST', 6: 'RESET'}
 NETS = {0: '-', 1: 'modem', 2: 'adapter'}
@@ -398,6 +399,28 @@ class SshRelayTransport:
 
 
 # ------------------------------------------------------------------------------------------------ the program's side
+def disc_service(a, stamp, out):
+    """The network disc (pc/dcql_disc.py) from --disc / --overlay / --whole, or None. Its reads go to
+    <out>/disc-reads.jsonl (file, offset, bytes, ms, side)."""
+    if not getattr(a, 'disc', None) and not getattr(a, 'overlay', None):
+        return None
+    import dcql_disc
+    os.makedirs(out, exist_ok=True)
+    f = open(os.path.join(out, 'disc-reads.jsonl'), 'a', encoding='utf-8')
+    t0 = time.time()
+
+    def record(r):
+        r.setdefault('s', round(time.time() - t0, 3))
+        f.write(json.dumps(r, separators=(',', ':')) + '\n')
+        f.flush()
+    svc = dcql_disc.DiscService(a.disc, a.overlay, a.whole, stamp, record)
+    m = svc.manifest()
+    json.dump(m, open(os.path.join(out, 'disc-manifest.json'), 'w'), indent=1)
+    stamp('network disc: %s, %d files, %d from the PC, manifest %s' % (m['mode'], m['count'], m['served'],
+                                                                     m['sha256'][:16]))
+    return svc
+
+
 class FileService:
     """/pc/<path> for the running program: read-only, below one root folder, no '..'. Answers FOPEN with FINFO and
     FREAD with FDATA blocks (the client re-asks for what it lost)."""
@@ -842,6 +865,9 @@ def main(argv=None):
         s.add_argument('--no-collect', action='store_true')
         s.add_argument('--wmax', type=int, default=16, help='most chunks in flight (default 16)')
         s.add_argument('--files', help='folder served to the program as /pc/ (adapter)')
+        s.add_argument('--disc', help='the network disc\'s base: the built disc folder or an image (.gdi/.iso)')
+        s.add_argument('--overlay', help='the network disc\'s overlay folder: its files win over the base')
+        s.add_argument('--whole', action='store_true', help='serve the whole disc (else only changed files)')
         s.add_argument('--reset-after', type=float, help='send RESET this many seconds after EXEC')
         s.add_argument('--reset-wait', type=float, default=20.0, help='seconds RESET may take before the next rung')
         s.add_argument('--loader', help='self-update: this loader (ELF or LOADER.BIN) first, if the console runs another')
@@ -855,6 +881,9 @@ def main(argv=None):
                         help='serve programs a launcher on the console started (files, lines, stills); tail = '
                              'serve --tail; stills = serve, keeping the PNGs')
     sv.add_argument('--files', help='folder served as /pc/')
+    sv.add_argument('--disc', help='the network disc\'s base (folder or .gdi/.iso)')
+    sv.add_argument('--overlay', help='the network disc\'s overlay folder')
+    sv.add_argument('--whole', action='store_true', help='serve the whole disc')
     sv.add_argument('--out', default='.')
     sv.add_argument('--for', dest='seconds', type=float, default=3600.0, help='stop after this many seconds')
     sv.add_argument('--until', help='stop when a serial line contains this text')
@@ -900,11 +929,14 @@ def serve(a, loop, stamp):
     line. Needs no loader beacon. Returns 0, or 1 if --until never came."""
     os.makedirs(a.out, exist_ok=True)
     files = FileService(a.files, stamp)
+    disc = disc_service(a, stamp, a.out)
     sinks, serials, seen = {}, {}, {'lines': 0, 'hit': False}
     t0 = time.time()
 
     def other(m):
         typ, run, aa, bb, pl = m
+        if disc is not None and disc.handle(loop, typ, run, aa, bb, pl):
+            return
         if typ == HELLO and run not in serials:
             stamp('program run %08x link up' % run)
             serials[run] = open(os.path.join(a.out, 'serial-%08x.txt' % run), 'w', encoding='latin-1', newline='')
@@ -935,7 +967,8 @@ def serve(a, loop, stamp):
     for f in serials.values():
         f.close()
     summary = {'seconds': round(time.time() - t0, 1), 'runs': ['%08x' % r for r in serials], 'lines': seen['lines'],
-               'files': files.summary(), 'stills': {('%08x' % r): k.saved for r, k in sinks.items()}}
+               'files': files.summary(), 'stills': {('%08x' % r): k.saved for r, k in sinks.items()},
+               'disc': disc.summary() if disc is not None else None}
     json.dump(summary, open(os.path.join(a.out, 'serve-%d.json' % int(t0)), 'w'), indent=2)
     stamp('serve: %s' % json.dumps(summary)[:400])
     return 0 if not a.until or seen['hit'] else 1
@@ -1032,6 +1065,7 @@ def collect(a, loop, stamp, session, result, h):
     b0 = (loop.hello or {}).get('boot_count')
     t0 = time.time()
     files = FileService(a.files, stamp)
+    disc = disc_service(a, stamp, a.out)
     stills = StillSink(a.out, session, stamp)
     lines = {'n': 0, 'gaps': 0, 'next': 0, 'first_at': None}
     os.makedirs(a.out, exist_ok=True)
@@ -1041,6 +1075,8 @@ def collect(a, loop, stamp, session, result, h):
     def other(m):
         typ, run, aa, bb, pl = m
         if run != session:
+            return
+        if disc is not None and disc.handle(loop, typ, run, aa, bb, pl):
             return
         if typ == LINE:
             lines['n'] += 1
@@ -1131,6 +1167,9 @@ def collect(a, loop, stamp, session, result, h):
     er = end_result()
     if er:
         result['end'] = er
+    if disc is not None:
+        result['program_side']['disc'] = disc.summary()
+        stamp('network disc: %s' % json.dumps(result['program_side']['disc'])[:600])
     if hb is None:
         stamp('the loader did not come back' + ('' if a.reset_after is not None else ' within %.0f s' % a.wait))
         result['report'] = er

@@ -10,6 +10,8 @@
 #include <string.h>
 #include "dcql_loop.h"
 #include "dcql_live.h"
+/* the network disc (lib/dcql_disc.c): weak, so a program without it links as before */
+int dcql_disc_datagram(uint8_t type, uint32_t a, uint16_t b, const uint8_t *pl, int len) __attribute__((weak));
 
 #define CH_REC 1u
 #define CH_TRACE 2u
@@ -155,6 +157,8 @@ int dcql_live_datagram(uint8_t type, uint32_t a, uint16_t b, const uint8_t *pl, 
         send_def(send);
         return 1;
     }
+    if (type == CL_DINFO || type == CL_DDATA)   /* the network disc's answers (lib/dcql_disc.c, when linked) */
+        return dcql_disc_datagram ? dcql_disc_datagram(type, a, b, pl, len) : 0;
     if (type != CL_CMD) return 0;
     uint8_t ack[4 + 60];
     cl_wr32(ack, g_n);

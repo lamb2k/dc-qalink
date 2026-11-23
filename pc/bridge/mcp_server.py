@@ -186,7 +186,7 @@ def handle(bc, name, a):
     elif name == 'read_memory':
         c, r = bc.call('POST', '/v0/memory/read', {'addr': int(a['addr'], 16), 'len': a['len']})
     elif name == 'upload_asset':
-        c, r = bc.call('POST', '/v0/assets', {})
+        c, r = bc.call('POST', '/v0/assets', {k: a[k] for k in ('path', 'base64', 'name') if k in a})
     elif name == 'list_sessions':
         c, r = bc.call('GET', '/v0/sessions')
     elif name == 'export_session':

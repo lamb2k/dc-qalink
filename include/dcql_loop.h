@@ -70,7 +70,10 @@ enum {
        main RAM on the console, so the PC must have the result before it). console -> PC: END, a = CL_END_HEAD with a
        cl_end_t payload, else a = byte offset into the report and the payload its bytes (b = the head's report bytes in
        this END, to a datagram's count). PC -> console: ENDACK, a = run id, b = report bytes still missing (0 = whole). */
-    CL_END = 0x21, CL_ENDACK = 0x1f
+    CL_END = 0x21, CL_ENDACK = 0x1f,
+    /* v2 network disc (lane ql-disc; lib/dcql_disc.h, pc/dcql_disc.py; additive). console -> PC: DOPEN, DREAD,
+       DCLOSE, DLOG; PC -> console: DINFO, DDATA */
+    CL_DOPEN = 0x27, CL_DREAD = 0x28, CL_DCLOSE = 0x29, CL_DINFO = 0x2a, CL_DDATA = 0x2b, CL_DLOG = 0x2c
 };
 #define CL_END_HEAD 0xffffffffu
 typedef struct {
