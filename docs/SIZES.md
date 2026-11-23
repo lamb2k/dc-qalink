@@ -9,8 +9,13 @@ test program `loader/liveprog.c`, over the objects `client.o`, `cl_util.o`, `dcq
 
 | | before (v0.2 2ac5297) | after (lane ql-mem) |
 |---|---|---|
-| fixed memory, link + live | 124,327 B: OVER | AFTER_TOTAL |
-| code and constant data | 19,333 B | AFTER_CODE |
+| fixed memory, link + live | 124,327 B: OVER | **70,151 B: inside** (3,577 B to spare) |
+| code and constant data | 19,333 B | 19,961 B (row 49,152) |
+| per object, fixed | client 53,906; adapter 52,013; live 17,380; utilities 1,028 | client 26,922; adapter 24,821; live 17,380; utilities 1,028 |
+| a program with the network disc (own row, reported) | 168,767 B | 114,591 B |
+
+Both columns are the gate's own size rows (lane ql-mem's gate runs `gates\ql-mem-base-2ac5297c5` and
+`gates\ql-mem-77e8c38d0`, same options).
 
 ## Every symbol of 256 B or more (before), and what happened to it
 
@@ -40,7 +45,33 @@ test program `loader/liveprog.c`, over the objects `client.o`, `cl_util.o`, `dcq
 Not in the row, for reading: the client's link thread (16 KiB) and grab thread (8 KiB) stacks come from KallistiOS's
 heap when the link starts (`thd_create_ex` without a stack pointer), as before.
 
-STACKS
+## Stacks and rings as used (Flycast, function tier: the `cl-mem:` line of each run)
+
+| run | dial + receive stack (16,384) | send stack (8,192) | ring drops rx / tx refusals |
+|---|---|---|---|
+| push + run, 5 lines | 1,740 | 2,264 | 0 / 0 |
+| three screen grabs | 1,740 | 3,984 | 0 / 1,037 (base with the 16 KiB ring: 1,029; senders wait and send again) |
+| /pc file 1 MiB | 1,740 | 2,264 | 0 / 0 |
+| network disc, default arm | 1,780 | 2,824 | 0 / 0 |
+
+These runs use a static address (no DHCP). A DHCP start goes deeper into net_init on the dial stack, so the stacks
+stay as they are until a DHCP run (and the console) has been measured.
+
+## No slower (Flycast, function tier; one run each side, same build options, same slot; no speed claim)
+
+| measure | before | after |
+|---|---|---|
+| push 290 KB (loader) | 0.848 s, 222.3 KB/s goodput | 0.890 s, 212.4 KB/s |
+| program's link up / end to beacon | 1.28 s / 5.23 s | 1.25 s / 5.24 s |
+| three screen grabs, held in | 639 / 661 / 659 ms | 643 / 661 / 659 ms |
+| live data 20 s: pictures, live copy mean, sends per picture | 1197, 2.84 us, 37.81 | 1197, 2.83 us, 37.76 |
+| planted 2 ms control | passes | passes |
+| network disc small read mean / worst | 16.49 / 21.51 ms | 17.06 / 26.67 ms |
+| network disc whole file, 2K sequential | 0.343, 0.345 MB/s | 0.348, 0.344 MB/s |
+| /pc file 1 MiB through the C library | 3,374 ms | 3,365 ms |
+
+The small-read mean moved by 0.57 ms. Earlier gates of the same code read 16.7, 17.04 and 17.15 ms, so this is within
+the run-to-run spread. The receive ring dropped nothing in any run.
 
 ## How to re-measure
 
