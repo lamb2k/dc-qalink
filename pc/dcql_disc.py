@@ -376,7 +376,20 @@ class DiscService:
         if h is not None and h in self.handles:   # a repeated DOPEN (its answer lost)
             v = self.handles[h]
             return self._info(loop, run, req, DS_OK, h, v['size'], v['flags'])
-        if len(self.handles) >= self.HANDLES_MAX:   # a cap before one more is made
+        if flags & DO_MOUNT:
+            # a mount starts a program's use of the disc: one console runs one program at a time, so every handle an
+            # earlier program left open (reset, crash, a chain-load, a link never seen to drop) is dead. Retired here,
+            # so back-to-back programs are each served to the end whatever the previous one left (ql-fix-pc2 r3)
+            for other in {v.get('run') for v in self.handles.values()} - {run}:
+                self.retire(other)
+        if len(self.handles) >= self.HANDLES_MAX:
+            # at the cap: another run's handles go first (oldest first); only this run's own are never taken
+            for oh in sorted(h_ for h_, v_ in self.handles.items() if v_.get('run') != run):
+                if len(self.handles) < self.HANDLES_MAX:
+                    break
+                self.handles.pop(oh, None)
+                self.stats['evicted'] = self.stats.get('evicted', 0) + 1
+        if len(self.handles) >= self.HANDLES_MAX:   # a cap before one more is made (this run holds them all)
             self.stats['refused'] += 1
             self.stats['too_many'] = self.stats.get('too_many', 0) + 1
             return self._info(loop, run, req, self.DS_MFILE)

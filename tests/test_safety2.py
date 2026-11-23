@@ -55,6 +55,8 @@ PINNED = {
     'B5.bridge_exact_len': 'short block counted',
     'B5.cli_exact_len': 'short block counted',
     'B6.harness': None,
+    'B7.disc_back_to_back': None,   # 2ff9b9d had no cap, so it serves this: its control is on 24cd792 (--control-rev)
+    'B7.disc_whole_big': None,
 }
 
 
@@ -685,11 +687,87 @@ def b5(R, ctx):
           lambda: exact(cli_send, cl.StillSink(None, 1, lambda s: None)))
 
 
+# ------------------------------------------------------------------------------------------------ B7 (network disc)
+def b7(R, ctx):
+    """Back-to-back programs against one disc service (the bridge keeps one for its lifetime), the whole disc from a
+    .gdi, a 1 MiB file read to its end in 4 KiB requests as lib/dcql_disc.c asks (after gate 24cd792, where
+    back-to-back network-disc runs stalled)."""
+    import hashlib
+    dcql_disc, root = ctx['dcql_disc'], ctx['root']
+    sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
+    import netdisc_testdata as td
+    out = os.path.join(root, 'b7')
+    exp = td.make(out, iso=True)
+    big = exp['BIG.BIN']
+    svc = dcql_disc.DiscService(os.path.join(out, 'base.gdi'), os.path.join(out, 'overlay'), whole=True)
+    lp = FakeLoop()
+    req = [1000]
+
+    def call(typ, run, pl):
+        req[0] += 1
+        lp.sent.clear()
+        svc.handle(lp, typ, run, req[0], 0, pl)
+        return req[0], list(lp.sent)
+
+    def dopen(run, path, flags=0):
+        r, sent = call(dcql_disc.DOPEN, run, struct.pack('<I', flags) + path.encode())
+        st, h, size, _ = struct.unpack('<iIII', [x for x in sent if x[0] == dcql_disc.DINFO][0][4])
+        return st, h, size
+
+    def read_all(run, h, size):
+        got = bytearray()
+        for off in range(0, size, 4096):
+            n = min(4096, size - off)
+            r, sent = call(dcql_disc.DREAD, run, struct.pack('<IIIIII', h, off, n, (1 << ((n + 1023) // 1024)) - 1,
+                                                            0, 0))
+            pieces = {x[3]: x[4] for x in sent if x[0] == dcql_disc.DDATA and x[2] == r}
+            if len(pieces) != (n + 1023) // 1024:
+                return bytes(got), off   # a request not answered whole: the console would wait on it
+            got += b''.join(pieces[i] for i in sorted(pieces))
+        return bytes(got), None
+
+    def program(run, leave_open):
+        st, _, _ = dopen(run, '/cd', dcql_disc.DO_MOUNT)
+        if st != 0:
+            return 'mount %d' % st, None
+        for _ in range(leave_open):   # a program that ends (reset, crash, chain-load) with files still open
+            dopen(run, 'NETDISC/LIST.TXT')
+        st, h, size = dopen(run, 'NETDISC/BIG.BIN')
+        if st != 0:
+            return 'open %d' % st, None
+        data, stalled = read_all(run, h, size)
+        ok = stalled is None and hashlib.sha256(data).hexdigest() == big['sha256']
+        return ('served' if ok else 'stalled at %s' % stalled), size
+
+    def back_to_back():
+        a, _ = program(0x0A0A0A0A, 70)     # the first program leaves 70 files open and its link is never seen to drop
+        b, size_b = program(0x0B0B0B0B, 0)  # the next program: mount, then BIG.BIN (1 MiB) whole
+        c, _ = program(0x0C0C0C0C, 0)
+        ok = b == 'served' and c == 'served' and size_b == (1 << 20)
+        return ok, 'served' if ok else 'next program refused', {'first': a, 'second': b, 'third': c,
+                                                                 'bytes': size_b}
+    R.row('B7.disc_back_to_back', 'one disc service, programs back to back: each is served to the end (1 MiB whole-'
+          'disc read) whatever the last left open', back_to_back)
+
+    def whole_big():
+        res, size = program(0x0D0D0D0D, 0)
+        return res == 'served' and size == (1 << 20), res, {'bytes': size}
+    R.row('B7.disc_whole_big', 'positive: the whole disc from a .gdi serves a 1 MiB file to its last byte', whole_big)
+
+
+# the control set for --controls --control-rev 24cd792 (the round-2 head the gate refused): only the rows of its fix
+PINNED_24CD792 = {k: None for k in PINNED}
+PINNED_24CD792['B7.disc_back_to_back'] = 'next program refused'
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out')
     ap.add_argument('--pc', default=os.path.join(HERE, '..', 'pc'), help='the pc/ tree to test')
     ap.add_argument('--controls', action='store_true', help='the control: pinned rows must fail as named on this --pc')
+    ap.add_argument('--control-rev', choices=('2ff9b9d', '24cd792'), default='2ff9b9d',
+                    help='which old tree --pc is: 2ff9b9d (the audited head; 27 rows) or 24cd792 (the head the gate '
+                         'refused: the back-to-back disc row)')
     a = ap.parse_args()
     pcdir = os.path.abspath(a.pc)
     sys.path.insert(0, pcdir)
@@ -697,10 +775,10 @@ def main():
     import dcql_disc
     from bridge import core
     root = tempfile.mkdtemp(prefix='ql-safety2-')
-    R = ctlrows.Rows(PINNED, a.controls)
+    R = ctlrows.Rows(PINNED_24CD792 if a.controls and a.control_rev == '24cd792' else PINNED, a.controls)
     ctx = {'cl': cl, 'core': core, 'dcql_disc': dcql_disc, 'pcdir': pcdir, 'root': root}
     try:
-        for part in (b1, b2, b3, b4, b5):
+        for part in (b1, b2, b3, b4, b5, b7):
             try:
                 part(R, ctx)
             except Exception as e:   # a setup error: its rows go missing, and a missing pinned row is a FAIL
