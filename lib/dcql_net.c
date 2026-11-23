@@ -487,6 +487,32 @@ static void *dcql_bba_tx_thd(void *arg) {
 }
 static void set4(unsigned char *d, unsigned v) { memcpy(d, &v, 4); }
 
+/* the next hop's MAC asked for before the link counts as up (lane ql-mem). KallistiOS queues a datagram whose next hop
+   is not in its ARP cache and asks once; when that one question goes unanswered (Flycast, just after the adapter came
+   up: the loader's first HELLO after a fast start reached the PC 5.0 s late, end to beacon 10.24 s instead of 5.24 s),
+   it asks again only after 5 s (net_arp.c). Asked here every 250 ms, at most 1 s, so the first datagram finds the
+   MAC. Returns the ms it took, -1 when nothing answered (the link is used anyway, as before), -2 when there is no
+   fixed peer to ask for (a peer learnt from its first datagram). */
+int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
+static int next_hop_known(void) {
+    netif_t *nif = net_default_dev;
+    unsigned hop = g_host, me, mask, gw;
+    if (!nif || !hop || hop == 0xFFFFFFFFu) return -2;
+    memcpy(&me, nif->ip_addr, 4);
+    memcpy(&mask, nif->netmask, 4);
+    memcpy(&gw, nif->gateway, 4);
+    if (mask && (hop & mask) != (me & mask) && gw) hop = gw;
+    uint8_t ip[4], mac[6];
+    memcpy(ip, &hop, 4);
+    const uint64_t t0 = timer_ms_gettime64();
+    for (int i = 0; i < 40; ++i) {   /* 40 x 25 ms */
+        if (net_arp_lookup(nif, ip, mac, NULL, NULL, 0) == 0) return (int)(timer_ms_gettime64() - t0);
+        if (i && i % 10 == 0) net_arp_query(nif, ip);   /* the first lookup asked already */
+        thd_sleep(25);
+    }
+    return -1;
+}
+
 /* returns 1 when this (dial) thread is to stay on as the receive thread */
 static int bba_main(void) {
     register_adapters();
@@ -554,9 +580,11 @@ static int bba_main(void) {
         g_bthreads = 1;
         stay = 1;   /* this thread receives from now on (dial_main) */
     }
+    const int arp_ms = next_hop_known();
     g_state = g_stop ? DCQL_LINK_OFF : DCQL_LINK_UP;
-    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
-          g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP");
+    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s; next hop %s %d ms)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
+          g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP",
+          arp_ms >= 0 ? "answered ARP in" : arp_ms == -1 ? "silent for" : "not asked,", arp_ms >= 0 ? arp_ms : arp_ms == -1 ? 1000 : 0);
     return stay;
 }
 /* a later dcql_net_start() on a running adapter link (after dcql_net_stop()): what bba_main does when the address,
