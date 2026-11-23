@@ -47,7 +47,8 @@ import argparse, ctypes as C, glob, hashlib, json, os, re, selectors, shutil, so
 import urllib.error, urllib.request, uuid
 
 LOADER_PORT = 52060   # the real console's loader port: never used by the suite
-BRIDGE_ARGS = []      # extra bridge arguments from the plans ({build} = the build folder), e.g. --viewer {build}/viewer.elf
+BRIDGE_ARGS = []      # extra bridge arguments from the plans ({build} = the build folder, {out} = the suite's folder),
+                      # e.g. --viewer {build}/viewer.elf, --asset-root {out} (the generated assets are written below it)
 
 
 # ----------------------------------------------------------------------------------------------------------- machine
@@ -487,7 +488,7 @@ def main_run(a):
             bargs = [py, '-u', os.path.join(a.tree, 'pc', 'qalink_bridge.py'), '--port', str(a.http), '--udp-port',
                      str(a.port), '--data', os.path.join(out, 'bridge'), '--device', 'flycast', '--console',
                      '%s:%d' % (a.pc_ip, a.lport), '--selftest', m['testprog'], '--mcp-http', str(a.mcp_http)] + \
-                [subst(x, {'build': a.build}) for x in BRIDGE_ARGS]
+                [subst(x, {'build': a.build, 'out': out}) for x in BRIDGE_ARGS]   # {out}: this suite's folder
             bridge = subprocess.Popen(bargs, stdout=open(os.path.join(out, 'bridge.out'), 'w'), stderr=subprocess.STDOUT,
                                       cwd=os.path.join(a.tree, 'pc'), creationflags=0x08000000)
             say('bridge pid %d on http %d, udp %d, console pinned to %s:%d' % (bridge.pid, a.http, a.port, a.pc_ip, a.lport))
