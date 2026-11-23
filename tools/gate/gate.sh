@@ -70,6 +70,7 @@ mkdir -p "$G"/build
 W=/dev/shm/dcql-gate/$ID
 rm -rf "${W:?}"; mkdir -p "$W"/host
 export GATE_W=$W   # plan host rows may name it ($GATE_W/host/...)
+export GATE_WINPY  # and the Windows Python (a lane's checks that need Windows-only packages)
 STEPS=$G/steps.tsv; : > "$STEPS"
 row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STEPS"; printf '[%s] %s: %s\n' "$2" "$1" "$3"; }
 started=$(date '+%Y-%m-%d %H:%M:%S %z')
@@ -315,6 +316,26 @@ else
       row "test data" FAIL "disc_prep of $(basename "$p"): build/disc_prep.log: $(tail -1 "$G/build/disc_prep.log")"
     fi
   done
+  # a lane's own discs (phase "disc" rows): {"own_discs": [{"name", "build": "<sh in the merged tree>", "elf": "<path>",
+  # "title"}]}, each its program alone on a small disc in fly/discs/<name>/
+  for p in "${PLANS[@]}"; do
+    while IFS=$'\t' read -r on ob oe ot; do
+      [ -n "$on" ] || continue
+      od=$W/own-disc-$on; rm -rf "$od"; mkdir -p "$od/data" "$G/fly/discs/$on"
+      echo "dc-qalink gate: $LANE's own disc $on" > "$od/data/README.TXT"
+      if (cd "$S" && timeout 900 sh -c "$ob") > "$G/build/own-$on.log" 2>&1 && oe=$(eval echo "$oe") && [ -s "$oe" ] \
+         && TMPDIR=$W/tmp LAYOUT=legacy SECTOR=2048 PAD_1ST=1 TITLE="${ot:-DC-QALINK}" timeout 600 bash "$GATE_MKGDI" "$oe" "$od/data" "$od/x" \
+              >> "$G/build/own-$on.log" 2>&1; then
+        cp "$od"/x/disc.gdi "$od"/x/track0* "$G/fly/discs/$on/"
+        row "own disc $on" PASS "$(basename "$oe") $(stat -c %s "$oe") B on its own disc"
+      else
+        row "own disc $on" FAIL "build/own-$on.log: $(grep -m2 -E 'error|Error|No rule' "$G/build/own-$on.log" | tr '\n' ' ' | cut -c1-200)"
+      fi
+      rm -rf "$od"
+    done < <(python3 -c 'import json,sys
+for d in json.load(open(sys.argv[1])).get("own_discs", []):
+    print("\t".join([d["name"], d["build"], d["elf"], d.get("title", "")]))' "$p")
+  done
   if TMPDIR=$W/tmp LAYOUT=legacy SECTOR=2048 PAD_1ST=1 TITLE="DC-QALINK LOADER" timeout 600 bash "$GATE_MKGDI" "$O/loader.elf" "$D" "$X" \
        > "$G/build/mkgdi.log" 2>&1; then
     cp "$X"/disc.gdi "$X"/track0* "$D/LINK.TXT" "$G/fly/disc/"
@@ -328,7 +349,7 @@ else
       timeout 3000 "$GATE_WINPY" -u "$FLYPY" run --flycast "$GATE_FLYCAST" --config "$GATE_FLYCFG" \
         --disc "$(winp "$G/fly/disc/disc.gdi")" --tree "$(winp "$G/tree")" --build "$(winp "$G/build")" \
         --pc-ip "$GATE_PC_IP" --port "$GATE_PORT" --lport "$GATE_LPORT" --ctl "$GATE_CTL" --http "$GATE_HTTP" \
-        --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" --fixtures "$(winp "$GATE_FIXTURES")" \
+        --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" --fixtures "$(winp "$GATE_FIXTURES")" --discs "$(winp "$G/fly/discs")" \
         ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} "${pargs[@]}" \
         > "$G/fly/run.out" 2>&1; rc=$?
       sum=$(python3 -c 'import json,sys
@@ -344,7 +365,7 @@ print("%d of %d rows, %d of %d cited numbers reproduced%s" % (ok, len(r["rows"])
         *) row flycast FAIL "rc $rc; $sum; fly/fly.md" ;;
       esac
     fi
-    rm -f "$G"/fly/disc/track0*
+    rm -f "$G"/fly/disc/track0* "$G"/fly/discs/*/track0*
     rm -rf "${GATE_FIXTURES:?}"   # generated test data: rebuilt by disc_prep
   else
     row "flycast disc" FAIL "build/mkgdi.log: $(tail -2 "$G/build/mkgdi.log" | tr '\n' ' ')"

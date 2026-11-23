@@ -32,12 +32,18 @@ Plan rows (JSON): {"name", "phase": "loop"|"bridge", "kind": "loop"|"push"|"mcp"
          "numbers": {"<label>": [min, max]}}
   mcp:   "timeout", "must": {"passed": 9}
   delta: "a", "b" (row names), "number": "<label>", "range": [min, max]   (b minus a)
+  loop "must" also takes "report_regex": {"<name>": "<regex, one number group>"} (the number is cited as at:<name>).
+  phase "disc" (last): a lane's own disc (gate.sh builds it from the plan's "own_discs" into --discs <dir>/<name>/),
+         booted alone with no relay; nothing is sent to it. "disc": "<name>", "until": "<serial text>", "timeout",
+         "serial_regex": {"<name>": "<regex, one number group>"}, "after": [{"name", "args": [python arguments;
+         {out} {tree} {serial} substituted], "expect": 0, "grep": "<regex a line must match>", "regex": {...}}],
+         "at_sum": {"<name>": [names]}, "must_at": {"<name>": [min, max]}.
 Extra plans add rows, replace rows by name ("replace": true) or drop them ("drop": [names]); "cites" are listed as
 {"lane", "what", "row", "from": "number:<label>"|"seconds"|"json:<a.b.c>"|"mcp:<record name prefix>:<field>",
  "cited", "unit", "tol" (relative, default 0.25)}.
 Flycast is a function check: every time here is tier "Flycast", never a console number.
 """
-import argparse, ctypes as C, glob, hashlib, json, os, selectors, shutil, socket, subprocess, sys, threading, time
+import argparse, ctypes as C, glob, hashlib, json, os, re, selectors, shutil, socket, subprocess, sys, threading, time
 import urllib.error, urllib.request, uuid
 
 LOADER_PORT = 52060   # the real console's loader port: never used by the suite
@@ -373,6 +379,12 @@ def check_loop(r, rd, res):
         elif k == 'transfer_refused':
             v = ((j or {}).get('transfer') or {}).get('verdict')
             out.append(('transfer refused by the loader', v not in (None, 0), v))
+        elif k == 'report_regex':   # {"name": "<regex with one number group>"}: the number goes to res['at'][name]
+            for name, rx in want.items():
+                mt = re.search(rx, text)
+                if mt:
+                    at[name] = float(mt.group(1))
+                out.append(('report matches /%s/' % rx[:50], bool(mt), mt.group(0)[:80] if mt else len(text)))
         else:
             out.append(('unknown must %s' % k, False, None))
     return out
@@ -631,6 +643,90 @@ def main_run(a):
             if relay.tripped:
                 result['guard']['tripped'] = relay.tripped
                 return 9
+        # phase "disc": a lane's own disc (its program alone, no loader), booted on a fresh Flycast; its serial line
+        # is the evidence. Nothing is sent to it and no relay runs: the guard is heard again first.
+        drows = [r for r in rows if r.get('phase') == 'disc']
+        if drows:
+            if bridge:   # nothing of the loader's runs may talk to the lane's program
+                subprocess.run(['taskkill', '/PID', str(bridge.pid), '/T', '/F'], capture_output=True, creationflags=0x08000000)
+                try:
+                    bridge.wait(10)
+                except subprocess.TimeoutExpired:
+                    bridge.kill()
+                bridge = None
+            if fly:
+                stop_flycast(fly)
+                fly = None
+            for r in drows:
+                rd = os.path.join(out, r['name'])
+                os.makedirs(rd, exist_ok=True)
+                res = {'name': r['name'], 'phase': 'disc', 'what': r.get('what', ''), 'control': r.get('control', False),
+                       'console_only': r.get('console_only', False)}
+                checks, at = [], {}
+                disc = os.path.join(a.discs or '', r['disc'], 'disc.gdi')
+                ok, foreign = guard([a.port, LOADER_PORT], loc, 5.0, say)
+                if not ok:
+                    result['guard']['tripped'] = foreign
+                    return 9
+                if not os.path.isfile(disc):
+                    checks.append(('the disc %s was built' % r['disc'], False, disc))
+                else:
+                    t0 = time.time()
+                    fly = launch_flycast(a.flycast, a.config, disc, rd, 'dcql-gate-disc-%d' % os.getpid())
+                    say('disc %s: flycast pid %d' % (r['disc'], fly[3].pid))
+                    until, ser, seen = r.get('until', 'QLDONE'), os.path.join(rd, 'serial.txt'), False
+                    while time.time() - t0 < r.get('timeout', 300):
+                        time.sleep(2.0)
+                        try:
+                            with open(ser, 'rb') as f:
+                                if until.encode() in f.read():
+                                    seen = True
+                                    break
+                        except OSError:
+                            pass
+                    stop_flycast(fly)
+                    fly = None
+                    res['seconds'] = round(time.time() - t0, 1)
+                    checks.append(('serial says %s' % until, seen, '%s s' % res['seconds']))
+                    text = open(ser, encoding='latin-1').read() if os.path.isfile(ser) else ''
+                    for name, rx in r.get('serial_regex', {}).items():
+                        mt = re.search(rx, text)
+                        if mt:
+                            at[name] = float(mt.group(1))
+                        checks.append(('serial matches /%s/' % rx[:50], bool(mt), mt.group(0)[:80] if mt else None))
+                    mm = dict(m, out=rd, tree=a.tree, serial=ser)
+                    for x in r.get('after', []):
+                        args = [py, '-I', '-u'] + [subst(y, mm) for y in x['args']]
+                        lp = os.path.join(rd, '%s.log' % x['name'])
+                        with open(lp, 'w', encoding='utf-8') as f:
+                            try:
+                                code = subprocess.run(args, stdout=f, stderr=subprocess.STDOUT, cwd=rd, timeout=x.get('timeout', 300),
+                                                      creationflags=0x08000000).returncode
+                            except subprocess.TimeoutExpired:
+                                code = 'timeout'
+                        lt = open(lp, encoding='utf-8', errors='replace').read()
+                        checks.append(('%s exit %s' % (x['name'], x.get('expect', 0)), code == x.get('expect', 0), code))
+                        if x.get('grep'):
+                            checks.append(('%s: a line matches /%s/' % (x['name'], x['grep'][:50]),
+                                           re.search(x['grep'], lt, re.M) is not None, lt.strip().splitlines()[-1:] if lt.strip() else None))
+                        for name, rx in x.get('regex', {}).items():
+                            mt = re.search(rx, lt)
+                            if mt:
+                                at[name] = float(mt.group(1))
+                            checks.append(('%s matches /%s/' % (x['name'], rx[:50]), bool(mt), mt.group(0)[:80] if mt else None))
+                    for name, parts in r.get('at_sum', {}).items():
+                        if all(p in at for p in parts):
+                            at[name] = sum(at[p] for p in parts)
+                    for name, (lo, hi) in r.get('must_at', {}).items():
+                        v = at.get(name)
+                        checks.append(('%s in [%s, %s]' % (name, lo, hi), isinstance(v, float) and lo <= v <= hi, v))
+                res['at'] = at
+                res['checks'] = [{'check': c, 'ok': bool(o), 'seen': s} for c, o, s in checks]
+                res['ok'] = bool(checks) and all(o for _, o, _ in checks)
+                rowres[r['name']] = res
+                result['rows'].append(res)
+                say('row %-22s %s %s' % (r['name'], 'ok' if res['ok'] else 'FAILED: ' + '; '.join(
+                    '%s (%s)' % (c, s) for c, o, s in checks if not o), json.dumps(at)[:200]))
         # the cited numbers, re-measured
         for c in cites:
             row = rowres.get(c['row'], {})
@@ -727,6 +823,7 @@ def main():
     r.add_argument('--boot-wait', type=float, default=20.0)
     r.add_argument('--lock')
     r.add_argument('--fixtures', help='test data the rows name as {fixtures} (a lane plan\'s disc_prep makes it)')
+    r.add_argument('--discs', help='a lane\'s own discs (phase "disc"): <dir>/<name>/disc.gdi, built by gate.sh')
     a = ap.parse_args()
     return machine(a) if a.cmd == 'machine' else main_run(a)
 
