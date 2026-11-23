@@ -45,6 +45,8 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+# GATE_FLY_ONLY=<row,row>: a measuring run (those Flycast rows only); it can never merge, move a branch or push
+[ -n "${GATE_FLY_ONLY:-}" ] && NOPUSH=1
 : "${GATE_ENV:?GATE_ENV names the machine settings file}"
 . "$GATE_ENV"
 for v in GATE_REPO GATE_SCRATCH GATE_OUT GATE_KOS_ENV GATE_MKGDI GATE_WINPY GATE_FLYCAST GATE_FLYCFG GATE_PC_IP \
@@ -352,7 +354,7 @@ for d in json.load(open(sys.argv[1])).get("own_discs", []):
         --disc "$(winp "$G/fly/disc/disc.gdi")" --tree "$(winp "$G/tree")" --build "$(winp "$G/build")" \
         --pc-ip "$GATE_PC_IP" --port "$GATE_PORT" --lport "$GATE_LPORT" --ctl "$GATE_CTL" --http "$GATE_HTTP" \
         --mcp-http "$GATE_MCP" --out "$(winp "$G/fly")" --fixtures "$(winp "$GATE_FIXTURES")" --discs "$(winp "$G/fly/discs")" \
-        ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} "${pargs[@]}" \
+        ${GATE_FLYLOCK:+--lock "$GATE_FLYLOCK"} ${GATE_FLY_ONLY:+--only "$GATE_FLY_ONLY"} "${pargs[@]}" \
         > "$G/fly/run.out" 2>&1; rc=$?
       sum=$(python3 -c 'import json,sys
 r=json.load(open(sys.argv[1]))
@@ -392,12 +394,24 @@ if [ $MODE = merge ]; then
   } > "$W/msg.txt"
   git -C "$S" commit -q -F "$W/msg.txt" || { row commit FAIL "git commit failed"; finish FAIL; }
   NEWSHA=$(git -C "$S" rev-parse HEAD)
-  [ "$(git -C "$GR" rev-parse "$BASE")" = "$BASESHA" ] || { row commit FAIL "$BASE moved during the gate"; finish FAIL; }
-  git -C "$GR" merge -q --ff-only "$NEWSHA" || { row commit FAIL "fast-forward of $BASE failed"; finish FAIL; }
-  row commit PASS "$NEWSHA on $BASE"
+  if [ $NOPUSH = 1 ]; then
+    # --no-push never moves a branch of GATE_REPO (ql-mem's run fast-forwarded the lane's own checked-out branch onto
+    # the gate's merge commit): the merge commit stays in the scratch tree only, named here
+    row commit PASS "$NEWSHA (scratch only; no branch of GATE_REPO moved)"
+  else
+    # only the integration branch itself is fast-forwarded, and only when GATE_REPO has it checked out
+    [ "$(git -C "$GR" symbolic-ref -q --short HEAD)" = "$BASE" ] || { row commit FAIL "GATE_REPO is not on $BASE: nothing moved"; finish FAIL; }
+    [ "$(git -C "$GR" rev-parse "$BASE")" = "$BASESHA" ] || { row commit FAIL "$BASE moved during the gate"; finish FAIL; }
+    git -C "$GR" merge -q --ff-only "$NEWSHA" || { row commit FAIL "fast-forward of $BASE failed"; finish FAIL; }
+    row commit PASS "$NEWSHA on $BASE"
+  fi
+fi
+if [ -n "${GATE_FLY_ONLY:-}" ]; then   # a measuring run (only some Flycast rows) never merges or pushes
+  row push SKIPPED "GATE_FLY_ONLY=$GATE_FLY_ONLY: a measuring run, not a gate; nothing moved or pushed"
+  finish "MEASURED (not a gate)"
 fi
 if [ $NOPUSH = 1 ]; then
-  row push SKIPPED "--no-push: $BASE is $(git -C "$GR" rev-parse "$BASE") here, not pushed"
+  row push SKIPPED "--no-push: nothing moved or pushed${NEWSHA:+; the merge would be $NEWSHA}"
   finish "PASS (not pushed)"
 fi
 if git -C "$GR" push -q origin "refs/heads/$BASE:refs/heads/$BASE" > "$G/push.log" 2>&1; then

@@ -412,6 +412,10 @@ def main_run(a):
         if p == LOADER_PORT:
             raise SystemExit('refused: port %d is the real console loader port' % p)
     rows, cites, notes = load_plans(a.plan)
+    if a.only:   # a measuring run: only these rows, and only the cites that read them
+        keep = set(a.only.split(','))
+        rows = [r for r in rows if r['name'] in keep]
+        cites = [c for c in cites if c['row'] in keep]
     py = sys.executable
     loop_py = os.path.join(a.tree, 'pc', 'dcql_loop.py')
     m = {'testprog': os.path.join(a.build, 'testprog.elf'), 'liveprog': os.path.join(a.build, 'liveprog.elf'),
@@ -832,6 +836,7 @@ def main():
     r.add_argument('--boot-wait', type=float, default=20.0)
     r.add_argument('--lock')
     r.add_argument('--fixtures', help='test data the rows name as {fixtures} (a lane plan\'s disc_prep makes it)')
+    r.add_argument('--only', help='comma-separated row names: a measuring run of only these rows (gate.sh GATE_FLY_ONLY)')
     r.add_argument('--discs', help='a lane\'s own discs (phase "disc"): <dir>/<name>/disc.gdi, built by gate.sh')
     a = ap.parse_args()
     return machine(a) if a.cmd == 'machine' else main_run(a)
