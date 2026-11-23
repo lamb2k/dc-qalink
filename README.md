@@ -1,6 +1,7 @@
 # dc-qalink
 
-A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the console's own 56k modem.
+A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the console's own 56k modem or (0.2) the
+broadband adapter.
 
 - **Measure on real hardware:** your program sends `key=value` telemetry once a second; the PC cuts labelled sections
   and averages them.
@@ -11,9 +12,13 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
 <p align="center"><img src="docs/images/flycast-up.png" width="45%" alt="Example connected (Flycast capture)">
 <img src="docs/images/flycast-dialling.png" width="45%" alt="Example dialling (Flycast capture)"></p>
 <p align="center"><sub>Flycast captures of example/ through Flycast's emulated modem: connected after a remote
-<code>GOTO level1-boss</code>, and dialling.</sub></p>
+<code>GOTO level1-boss</code>, and dialling. The addresses on the status line are documentation addresses
+(192.0.2.x) drawn over the capture's own in the same font.</sub></p>
 
-## New in 0.2 (branch `v0.2-bba-loader`, not released): the control loop and the broadband adapter
+## New in 0.2 (branch `v0.2`, not released): the control loop and the broadband adapter
+
+What each claim rests on is marked: **console** (a real Dreamcast), **Flycast** (the emulator, function checks
+only), **host** (tests on a PC), **link map** (exact bytes). The full list with dates: `docs/RELEASE_0.2.md`.
 
 - **One link layer, two transports** (`lib/dcql_net.h`): the modem as in 0.1, or the broadband adapter (HIT-0400 or
   the LAN adapter; DHCP or a static address). The 0.1 API is unchanged; `dcql_config_t` gains `net`, `ip`, `mask`,
@@ -32,11 +37,21 @@ A QA and telemetry link for KallistiOS (KOS) Dreamcast programs, over the consol
 - **The client library** (`loader/client.mk`) in each pushed program: its report and exit code back to the PC, its
   serial lines live, stills (RGB565 frame buffers as PNG on the PC), the PC's files as `/pc/...` (load time; a
   program that wants reads in play counted does it itself), and RESET from the PC.
-- **Every exit returns to the loader without a power cycle**: a 2 KB return stub in the hand-off area quiets the
-  hardware, reads `LOADER.BIN` from the disc with the BIOS's own disc calls, checks its SHA-256 and jumps. Normal
-  exit, deadline, exception, `abort`/`assert` and RESET go there, also after a program wrecked the heap. A program
-  with interrupts off for ever: the SH-4 watchdog (reset mode, fed from the vertical blank, `wdt=1`) or, last,
-  `pc/power.py` ("power cycle needed", or your smart plug).
+- **The way back is a full restart** (the default, `LINK.TXT` `return reboot`): every ending (normal exit,
+  deadline, exception, `abort`/`assert`, RESET) first sends the run's END (its state and the tail of its report) to
+  the PC, then selects the loader's GDEMU image and reboots through the BIOS, so the console comes back to the loader
+  without a power cycle. A PC that has gone away delays the restart by at most 4 s (host and code reading; the
+  Flycast row is in `docs/RELEASE_0.2.md`). A copy of the run's record is also kept for the loader to read after the
+  reboot. The quick in-RAM return stub (`return stub`) is **optional and experimental**: on the console (2026-11-22)
+  it froze after its jump, and it is not the default until a console run brings it back.
+- **The SH-4 watchdog is opt-in** (`wdt=1` in the run's arguments): reset mode, fed by TMU1 every 1 ms. On the
+  owner's console (2026-11-22) it measured a 5.22 ms limit and a longest feeding gap of 2.76 ms, and a program hung
+  with interrupts off came back by itself (console). Otherwise, last, `pc/power.py` ("power cycle needed", or your
+  smart plug; the plug rung is still open).
+- **The in-game menu** (`lib/dcql_menu.c`, `docs/MENU.md`, `DCQL_MENU=1`): the link's state, log lines, a QR code
+  of a state snapshot and pages the game registers (host pictures and Flycast).
+- **The network disc** (`lib/dcql_disc.c`, `docs/NETDISC.md`): a pushed program reads `/cd/...` from the PC over
+  the adapter, either changed files over the GDEMU disc or a whole disc (Flycast and host).
 - **One PC tool**: `python pc/dc_qalink.py loop status|push|run|report|serve|tail|stills|reset|power|relay-local`
   (`pc/dcql_loop.py`). The protocol and the hand-off area are one versioned header (`include/dcql_loop.h`,
   protocol 2); the loader and the PC tool refuse each other's other versions.
@@ -110,6 +125,21 @@ capture cut accepts any echo of a marker (C, M, A or the L line), so one lost da
 
 ## Limits and footprint
 
+0.2, the control loop's client in a pushed program (link + live data; link map, exact bytes, `docs/SIZES.md`):
+
+| | at most | measured |
+|---|---|---|
+| code and constant data | 49,152 B | 21,313 B |
+| fixed memory (data + bss) | 73,728 B | 70,187 B |
+| return stub | 7,168 B | 6,144 B |
+| with the in-game menu | (reported) | +10,038 B code, +3,988 B fixed |
+| a program with the network disc | (reported, its own program) | 114,627 B fixed (the disc's cache and tables 44,440 B) |
+
+Heap, outside those rows: the client's link thread (16 KiB) and grab thread (8 KiB) stacks while the link runs, the
+/pc read-ahead block (8 KiB) while a /pc file is open, and the built-in 4 KiB rings only for a program that supplies
+none. Lifetimes: `docs/SIZES.md` "Heap".
+
+0.1, the text-row API on the modem:
 - Measured with KOS 2.x (GCC 15.2), example ELF with vs without the link: **+49.0 KB code, +1.0 KB data,
   +31.4 KB BSS** (the library itself: 6.1 KB code, 28 KB BSS; libppp 8.3 KB code). Includes the KOS modem, PPP, UDP
   and socket code it pulls in.
@@ -135,8 +165,14 @@ to a KOS game), `dc-qalink-pi-setup` (set up the relay on a Pi), `dc-qalink-capt
 start marker) and checks `pi_setup.py`'s discovery parsing, ssh config writing and dry run.
 `python3 tests/test_loop.py --host build/cl_host --out <dir>` runs the control loop's own console code (built for the
 PC) against the PC tool over a simulated bad line: loss, corruption, a dead line, a restarted sender, damaged images
-that must be refused, the protocol-version refusal both ways, the file service and stills. Every check has a control
-that must fail. No game and no console needed.
+that must be refused, the protocol-version refusal both ways, the file service and stills. The checks that guard a
+fault come with a control that must fail (a damaged image, an old implementation); not every positive case has one.
+`sh lib/test/run.sh` checks the console library's directory-entry and ring-ownership rules with AddressSanitizer, and
+its control (the code before the fix) must fail. No game and no console needed.
+
+The PC side is Python 3.10 or newer, standard library only, except: the MCP server needs the Python MCP SDK
+(`pip install mcp`), and the asset pipeline (`pc/assets`, the bridge's asset routes and `tests/test_assets.py`) needs
+numpy, with Pillow for image formats other than PNG.
 
 ## Licence
 

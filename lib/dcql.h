@@ -74,7 +74,7 @@ void dcql_set_command(dcql_command_fn fn, void* user);
 int dcql_start(void);                          /* dial (or hang up + redial); returns at once; 0 = started/already */
 void dcql_stop(void);                          /* hang up in the background; returns at once */
 dcql_state_t dcql_state(void);
-void dcql_state_text(char* out, size_t n);     /* "DIALLING 1/3", "UP 10.0.0.2 TO 10.0.0.1", ... */
+void dcql_state_text(char* out, size_t n);     /* "DIALLING 1/3", "UP 192.0.2.2 TO 192.0.2.1", ... */
 void dcql_counters(dcql_counters_t* c);
 
 /* Per frame (or any cadence), on one thread: dispatches received commands to the handler / built-ins. */

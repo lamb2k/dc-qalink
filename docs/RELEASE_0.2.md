@@ -19,14 +19,29 @@ never a speed claim), **host** (tests on a PC), **link map** (exact bytes).
   screen grabs, the PC's files as `/pc/...`, RESET from the PC, the watchdog.
 - The PC tool `pc/dcql_loop.py` (`dc_qalink.py loop ...`) and `tools/first_console.py` for a first session.
 
-**The way back** (from `v0.2-console-fix`)
-- A return stub (6,144 B) with three rungs: the BIOS's disc calls, the drive's own read, then a GDEMU image select and
-  both again. Its refusal is shown on the TV as bars and kept in a record that outlives a reboot.
+**The way back** (from `v0.2-console-fix`, ql-core4 to ql-core6)
+- **The full restart is the default** (`LINK.TXT` `return reboot`, owner 2026-11-22): every ending sends the run's END
+  (state, registers on a crash, the last 32 KiB of the report; 4 KiB from an exception) to the PC, then selects the
+  loader's GDEMU image and reboots through the BIOS. The END path ends within 4 s when the PC has gone away, and at
+  once when the link is down (ql-fix-dc; code reading, Flycast row f-03 below).
 - The run's hand-off is copied before every BIOS reboot and put back by the loader, so a run that ends in a reboot
-  still reports.
+  still reports when no END arrived (Flycast; whether a copy survives a real BIOS reboot is a console question).
+- **The return stub is optional and experimental** (`return stub`): 6,144 B, three rungs (the BIOS's disc calls, the
+  drive's own read, then a GDEMU image select and both again). Flycast brings the loader back through it; on the
+  console (2026-11-22) it froze after its jump. It stays off by default until a console run shows it working.
+- **The SH-4 watchdog is opt-in** (`wdt=1`): reset mode, fed by TMU1 every 1 ms. Console, 2026-11-22 (ql-core6, the
+  owner's console): a measured limit of 5.22 ms, a longest feeding gap of 2.76 ms, and a program hung with interrupts
+  off came back to the loader by itself. Flycast has no watchdog reset.
+
+**The in-game menu** (ql-menu): `lib/dcql_menu.c` (`DCQL_MENU=1`, `docs/MENU.md`), design "Bar", Spleen 8x16; link
+state and counters, log lines, a QR state snapshot, the game's own pages. Host pictures and Flycast runs.
+
+**The network disc** (ql-disc): `lib/dcql_disc.c` (`docs/NETDISC.md`): `/cd/...` from the PC over the adapter, changed
+files over the GDEMU disc or a whole disc (folder, `.gdi`, `.iso`), with a build record. Flycast and host.
 
 **The bridge, live data and MCP** (from `v0.2-bridge`)
-- `pc/qalink_bridge.py`: one local service (standard-library Python) on 127.0.0.1, contract 1
+- `pc/qalink_bridge.py`: one local service on 127.0.0.1 (Python standard library, except the MCP server, which needs
+  the MCP SDK, and the asset routes, which need numpy and, for formats other than PNG, Pillow), contract 1
   (`docs/BRIDGE_API.md`): devices and discovery, push and run, reports, stills, the reset ladder, sessions recorded to
   files, live events as Server-Sent Events. Only-local by default (it links only a loader at this PC's own address,
   that is Flycast, until a person allows the LAN). Autoconnect keyed by the adapter's MAC from HELLO.
@@ -70,12 +85,22 @@ Rulings on the gate's rows:
 
 Console side, in QA and test builds only; a release build with `DCQL_ENABLE=0` contains none of it.
 
-| Limit | Row | Measured (6311e2f, link map) | Verdict |
+Measured at the head of `v0.2-fix-dc` (lane ql-fix-dc, 2026-11-23) by `tools/gate/sizes.py` from the candidate's
+link maps (exact bytes). The row's objects: `client.o`, `cl_util.o`, `dcql_return.o`, `dcql_net_bba.o`,
+`dcql_live.o` in `liveprog.map` (the test program `loader/liveprog.c`). The menu and the network disc are measured
+separately, from `example/menu`'s `menu-cl.map` and `example/netdisc`'s `netdisc.map`; they are not in the row.
+
+| Limit | Row | Measured (link map) | Verdict |
 |---|---|---|---|
-| Code and constant data: link + live data (+ the menu, not built yet) | at most 48 KB | 15,653 B (client 8,137, adapter 3,448, live 2,872, utilities 628, way back 568) | inside; the menu's share is to come |
-| Fixed memory (rings, stacks, state) | at most 72 KB | 122,326 B (adapter 52,013, client 51,905, live 17,380, utilities 1,028) | **over by 48 KB: open** |
+| Code and constant data: link + live data | at most 48 KB (49,152 B) | 21,313 B (client 12,073, adapter 4,640, live 2,932, way back 1,040, utilities 628) | inside, 27,839 B to spare |
+| Fixed memory (rings, stacks, state) | at most 72 KB (73,728 B) | 70,187 B (client 26,934, adapter 24,845, live 17,380, utilities 1,028) | inside, 3,541 B to spare |
 | Return stub | at most 7,168 B | 6,144 B | inside |
-| Heap use after start | none | the client references `memalign` and `free` (read: where and when) | to be read |
+| The in-game menu (`dcql_menu.o`, with its font) | reported | +10,038 B code and constants, +3,988 B fixed | not in the row: a program that links the menu adds it |
+| A program with the network disc (`netdisc.elf`: the row's objects plus `dcql_disc.o`) | reported | 28,207 B code, 114,627 B fixed (`dcql_disc.o`: 6,874 B code, 44,440 B fixed: its cache, mount table and requests) | its own program, not the row |
+| Heap use | none in a picture | thread stacks from KallistiOS's heap at link start (link 16 KiB, grab 8 KiB; the deadline thread at the default size); the /pc read-ahead (8 KiB) while a /pc file is open; the built-in rings (2 x 4 KiB) only for a program that supplies none. Lifetimes: `docs/SIZES.md` "Heap" | read, not judged by the gate |
+
+On the base `1990fb9` the same maps gave 20,421 B and 70,167 B; ql-fix-dc adds 892 B of code (the END bound, the ring
+swap, the read-ahead hold) and 20 B of fixed memory.
 | Cost each picture, live data on | 0.10 ms mean, 0.25 ms worst, calibrated tier | 2.85 us mean, 3.0 us worst (Flycast, plain) | inside on Flycast; the calibrated tier needs a console-like Flycast with the adapter |
 | Cost each picture, link off | one test, under 0.01 ms | 0.62 us mean, 1.0 us worst (Flycast) | inside |
 | Network or disc access inside a picture | none | copies into rings only (code reading) | inside |
@@ -84,20 +109,16 @@ Console side, in QA and test builds only; a release build with `DCQL_ENABLE=0` c
 
 ## Still open before 0.2.0
 
-1. **The way back on a real console.** On the console (first sessions, 2026-11-22) the loader, push (0.57 to 0.65 s),
-   the program's link (15 to 18 s with DHCP), reports and screen grabs (0.64 s each) worked, but every way back was a
-   full reboot, and the three-rung stub froze after its jump on hardware. The chosen direction: the full restart as
-   the standard way back, with each ending sent to the PC before the restart (branch `v0.2-console-fix`, next through
-   the gate), the stub kept behind a `LINK.TXT` option. What only the console can show: whether any saved copy
-   survives a real BIOS reboot, the SH-4 watchdog's reset, the end-to-beacon time.
-2. **Fixed memory over its row** (122,326 B against 72 KB). Listed savings, each to be measured: the modem dial
-   thread's 16 KB stack unused on an adapter link; the adapter's default 4 + 4 KB rings when the program supplies its
-   own; the adapter's receive and send stacks sized by measured high-water marks; the program's rings (24 + 16 KB)
-   checked for loss at smaller sizes; the 8 KB file read-ahead only for programs that read files. The row is not
-   loosened.
-3. **The in-game menu** (design "Bar"): not built. Its code, font and state count in the rows above when it lands.
-4. **The network disc**: a game reads its disc from the PC over the adapter (the GDEMU disc as the base, changed
-   files served from the PC, whole images served), with a build record stamped on every run, grab and asset. In
-   progress on `v0.2-netdisc`.
-5. Also open: the modem's summary mode in the desktop app, the power rung of the reset ladder (a smart plug), and
+1. **The way back on a real console, at this head.** Console sessions of 2026-11-22 showed the loader, push (0.57 to
+   0.65 s), the program's link (15 to 18 s with DHCP), reports and screen grabs (0.64 s each), the full restart, and
+   the watchdog (above). Those sessions ran earlier heads; they do not establish recovery or timing at this head.
+   Still to run on the console with this head's loader and PC tool (audit 2026-11-23, section 7): normal exit,
+   RESET, timeout and exception through the CLI and the bridge; the PC disconnected before the end and during a large
+   report; which saved copy survives; the end-to-beacon time; watchdog off and armed; static and DHCP starts; repeated
+   /pc and network-disc reads under load; stack high-water marks with DHCP. The optional stub's results are recorded
+   apart.
+2. Also open: the modem's summary mode in the desktop app, the power rung of the reset ladder (a smart plug), and
    every cost row on the calibrated tier.
+
+Closed since the first version of this list: fixed memory under its row (ql-mem, 70,151 B, then 70,167 B and
+70,187 B above); the in-game menu (ql-menu) and the network disc (ql-disc) are built and measured above.
