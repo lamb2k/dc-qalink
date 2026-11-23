@@ -21,7 +21,9 @@ level in `mcp-calls.log` (`~/.dc-qalink/bridge`), and reaches the bridge's `call
 Files: `push_build` and `run_and_wait` read a `path` only below `QALINK_MCP_ROOT` (default: the MCP server's working
 folder); any other path is refused (403) before it is read. A pushed program is at most 16 MiB (the bridge's body
 limit), checked before it is read or decoded. `upload_asset`'s `base64` is refused when it is over 16 MiB less 64 KiB
-(16,711,680 characters), checked before the request's JSON is built (ql-fix-pc round 2).
+(16,711,680 characters), checked before the request's JSON is built. Every request the MCP server sends the bridge
+is bounded while its JSON is built: past 16 MiB (names and paths included) the encoder stops and the tool answers 413,
+nothing sent. A `path` is read through the descriptor that was checked (opened, then checked below the root).
 
 Test: `tests/test_mcp.py` (a real MCP client: list, link_status, bad arguments refused, push_build, grab_screen,
 live_summary, list_presets, level read refuses push_build), against the simulated console or a running bridge.

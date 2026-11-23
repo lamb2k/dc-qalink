@@ -62,13 +62,83 @@ def confine(root, rel, want='file'):
     return inside(root, os.path.join(root, *parts), want)
 
 
+def _win_handle_path(fd):
+    """Windows: the final path of the object an open descriptor names (GetFinalPathNameByHandleW), else None."""
+    try:
+        import ctypes, msvcrt
+        from ctypes import wintypes
+        h = msvcrt.get_osfhandle(fd)
+        f = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+        f.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        buf = ctypes.create_unicode_buffer(32768)
+        n = f(h, buf, 32768, 0)
+        if not 0 < n < 32768:
+            return None
+        p = buf.value
+        if p.startswith('\\\\?\\UNC\\'):
+            p = '\\\\' + p[8:]
+        elif p.startswith('\\\\?\\'):
+            p = p[4:]
+        return p
+    except Exception:
+        return None
+
+
 def _fd_path(fd):
-    """The real path of an open descriptor where the system says it (Linux /proc), else None."""
+    """The real path of the object an open descriptor names, from the descriptor itself: Linux /proc/self/fd, Windows
+    GetFinalPathNameByHandleW. None where the system cannot say (the caller then refuses)."""
+    if os.name == 'nt':
+        return _win_handle_path(fd)
     try:
         p = os.readlink('/proc/self/fd/%d' % fd)
     except OSError:
-        return None
-    return p if p.startswith('/') and not p.endswith(' (deleted)') else None
+        p = None
+    if p is None and hasattr(os, 'F_GETPATH'):   # macOS
+        try:
+            import fcntl
+            p = fcntl.fcntl(fd, os.F_GETPATH, b'\0' * 1024).split(b'\0', 1)[0].decode()
+        except OSError:
+            p = None
+    return p if p and p.startswith('/') and not p.endswith(' (deleted)') else None
+
+
+def _below(root_real, real):
+    try:
+        return os.path.commonpath([root_real, os.path.normcase(real)]) == root_real
+    except ValueError:   # another drive
+        return False
+
+
+def _checked(f, name, root_real):
+    """An opened file kept only when the descriptor itself says it is a regular file below root_real (round 3: both
+    the identity and the containment come from the opened descriptor, on every platform)."""
+    try:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused('%s is not a regular file' % name)
+        real = _fd_path(f.fileno())
+        if real is None:
+            raise Refused('%s: this system cannot say what an open file is; refused' % name)
+        if not _below(root_real, real):
+            raise Refused('%s is not below its root' % name)
+        return f
+    except BaseException:
+        f.close()
+        raise
+
+
+def _open_ro(path, dir_fd=None):
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(path, flags)
+    except OSError as e:
+        raise Refused('%s: %s' % (os.path.basename(str(path)), e.strerror or e))
+    if hasattr(os, 'set_blocking'):
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
+    return os.fdopen(fd, 'rb')
 
 
 def open_inside(root, path):
@@ -76,30 +146,70 @@ def open_inside(root, path):
     descriptor) is below `root`. The open file, or Refused (the file is closed first)."""
     if not root or path is None:
         raise Refused('no root')
-    try:
-        f = open(path, 'rb')
-    except OSError as e:
-        raise Refused('%s: %s' % (os.path.basename(str(path)), e.strerror or e))
-    try:
-        st = os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            raise Refused('%s is not a regular file' % os.path.basename(path))
-        real = _fd_path(f.fileno())
-        if real is None:   # no /proc (Windows): the real path now must name this very object
-            real = os.path.realpath(path)
-            s2 = os.stat(real)
-            if (s2.st_dev, s2.st_ino) != (st.st_dev, st.st_ino):
-                raise Refused('%s changed while it was opened' % os.path.basename(path))
-        r = _real(root)
-        try:
-            if os.path.commonpath([r, os.path.normcase(real)]) != r:
-                raise Refused('%s is not below its root' % os.path.basename(path))
-        except ValueError:
-            raise Refused('%s is not below its root' % os.path.basename(path))
-        return f
-    except BaseException:
-        f.close()
-        raise
+    return _checked(_open_ro(path), os.path.basename(str(path)), _real(root))
+
+
+def read_inside(root, path, limit):
+    """A file below `root` read through the descriptor that was checked (open, check, read: no second open), refused
+    when it is over `limit` bytes."""
+    with open_inside(root, path) as f:
+        n = os.fstat(f.fileno()).st_size
+        if n > limit:
+            raise Refused('%s is %d bytes, over the %d-byte limit' % (os.path.basename(str(path)), n, limit))
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise Refused('%s grew over the %d-byte limit while read' % (os.path.basename(str(path)), limit))
+    return data
+
+
+class Anchor:
+    """A served folder anchored once, for the lifetime of the service that serves it (round 3): its real path and
+    identity are taken when the service starts, and (where the system has dir_fd) it is held open, so every name is
+    opened relative to that very directory object. Each open is checked on its descriptor against the anchor: a folder
+    swapped or relinked afterwards never becomes the new authority."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.real = _real(self.root)
+        st = os.stat(self.real)
+        if not stat.S_ISDIR(st.st_mode):
+            raise Refused('%s is not a folder' % root)
+        self.ident = (st.st_dev, st.st_ino)
+        self.fd = None
+        if os.open in getattr(os, 'supports_dir_fd', ()) and hasattr(os, 'O_DIRECTORY'):
+            self.fd = os.open(self.real, os.O_RDONLY | os.O_DIRECTORY)
+            dst = os.fstat(self.fd)
+            if (dst.st_dev, dst.st_ino) != self.ident:
+                self.close()
+                raise Refused('%s changed while it was anchored' % root)
+
+    def open(self, rel):
+        """A peer's name (the rules of confine) below the anchored folder, opened and checked; Refused otherwise."""
+        if rel is None or '\0' in rel:
+            raise Refused('a NUL in the name')
+        rel = rel.replace('\\', '/').lstrip('/')
+        parts = rel.split('/')
+        if not rel or any(x in ('', '.', '..') for x in parts) or ':' in parts[0]:
+            raise Refused('%r is not a plain name below the root' % rel[:80])
+        if self.fd is not None:   # resolved from the anchored directory object itself
+            f = _open_ro(os.path.join(*parts), dir_fd=self.fd)
+            now = _fd_path(self.fd)
+            root_real = os.path.normcase(now) if now else self.real
+        else:                     # no dir_fd (Windows): the anchored folder must still be the same object
+            st = os.stat(self.real)
+            if (st.st_dev, st.st_ino) != self.ident:
+                raise Refused('the served folder %s was replaced' % self.root)
+            f = _open_ro(os.path.join(self.real, *parts))
+            root_real = self.real
+        return _checked(f, os.path.basename(rel), root_real)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
 
 
 def open_confined(root, rel):

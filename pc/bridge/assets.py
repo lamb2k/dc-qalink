@@ -311,7 +311,7 @@ class Assets:
         real, why = self.confined(path)
         if real is None:
             raise PermissionError(why[1])
-        data = qlsafe.read_capped(real, ASSET_MAX)
+        data = qlsafe.read_inside(self.root(), real, ASSET_MAX)   # the checked descriptor is the one read
         return self.add(os.path.basename(real), data, model.folder_resolver(os.path.dirname(real), self.root()),
                         body.get('format', 'auto'), body.get('mips', True), path)
 

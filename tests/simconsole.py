@@ -131,6 +131,11 @@ class SimConsole:
         elif typ == cl.REPQ and sess == self.report_run and self.repq_err:
             self.send(cl.ERR, sess, 12)
         elif typ == cl.REPQ and sess == self.report_run:
+            if getattr(self, 'late_end', None):   # 'lateend': the run's END (delayed) arrives during the fetch
+                for f in self.late_end:
+                    self.send(*f)
+                self.late_end = None
+                time.sleep(0.3)
             for k in range(b):
                 off = a + k * cl.CHUNK
                 if off < len(self.report):
@@ -357,10 +362,13 @@ class Program:
             rep = b''.join(self.report)
             head = struct.pack('<IiIIIIIIIIIIIIII', state, code, 0, 0, 0, 0, len(rep), zlib.crc32(rep) & 0xFFFFFFFF,
                                0, len(rep), 0, int((time.time() - t0) * 1000), 0, 0, 200, 1)
-            for _ in range(2):
-                self.send(cl.END, 0, len(rep), rep)
-                self.send(cl.END, 0xFFFFFFFF, len(rep), head)
-                time.sleep(0.2)
+            if 'lateend' in words:   # round 3: the END is delayed until the PC fetches the loader's report
+                self.con.late_end = [(cl.END, self.run, 0, len(rep), rep), (cl.END, self.run, 0xFFFFFFFF, len(rep), head)]
+            else:
+                for _ in range(2):
+                    self.send(cl.END, 0, len(rep), rep)
+                    self.send(cl.END, 0xFFFFFFFF, len(rep), head)
+                    time.sleep(0.2)
             if 'noreturn' in words:
                 self.dead = True   # nothing more from this console: no beacon, no RESETACK
                 return

@@ -15,6 +15,8 @@ VERSION = 2
 
 
 class Session:
+    KEEP = 200000   # records held in memory per list (round 3, blocker 3); the session's file keeps every record
+
     def __init__(self, folder, sid, device, tier, label, program=None, build=None):
         self.id = sid
         self.build_id = build['id'] if build else None
@@ -75,10 +77,22 @@ class Session:
                 self.grabs.append(r)
             elif t == 'end':
                 self.ended = r
+            self._trim()
             self._write(r)
             for cb in list(self.listeners):
                 cb(r)
         return r
+
+    def _trim(self):
+        """Each in-memory list and the row table held at KEEP, the oldest half dropped past it (amortised O(1))."""
+        k = self.KEEP
+        for lst in (self.records, self.ctr_recs, self.trace, self.logs, self.grabs):
+            if len(lst) > k:
+                del lst[:len(lst) - k // 2]
+                self.dropped = getattr(self, 'dropped', 0) + 1
+        if len(self.rows) > k:
+            for n in sorted(self.rows)[:len(self.rows) - k // 2]:
+                del self.rows[n]
 
     def set_declaration(self, d):
         """The program's LIVEDEF: phases, counters, lanes into meta. A changed declaration is written as a new meta line

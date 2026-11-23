@@ -337,11 +337,8 @@ def folder_resolver(folder, root=None, limit=DEP_MAX):
     def r(rel):
         if not rel or '\0' in rel:
             return None
-        p = qlsafe.inside(root, os.path.join(folder, rel.replace('\\', '/')))
-        if p is None:
-            return None
-        try:
-            return qlsafe.read_capped(p, limit)
+        try:   # opened, then checked on the opened descriptor, then read through it (round 3: no check-then-reopen)
+            return qlsafe.read_inside(root, os.path.join(folder, rel.replace('\\', '/')), limit)
         except (qlsafe.Refused, OSError):
             return None
     return r

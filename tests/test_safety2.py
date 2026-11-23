@@ -90,6 +90,11 @@ def nfds():
     return len(os.listdir('/proc/self/fd'))
 
 
+def anchors(b):
+    """Directory descriptors the bridge's file services hold for their anchored folders (round 3; none before)."""
+    return sum(1 for fs in b.files.values() if getattr(getattr(fs, 'anchor', None), 'fd', None) is not None)
+
+
 class FakeLoop:
     def __init__(self):
         self.sent = []
@@ -254,13 +259,16 @@ def b2(R, ctx):
         try:
             r = core.Run('x.bin', b'\0' * 16, '', 0, 'nosuch', None, 'test')
             b.runs[r.id] = r
+            b.active = r   # (round 3: /pc belongs to the active run)
             fs = b.file_service(r.sid)
             served = fs.path('wide.txt') is not None
             r2 = core.Run('y.bin', b'\0' * 16, '', 0, 'narrow', None, 'test')
             b.runs[r2.id] = r2
+            b.active = r2
             narrow = b.file_service(r2.sid)
             nar_ok = narrow.path('wide.txt') is None and os.path.basename(narrow.root or '') == 'narrow'
         finally:
+            b.active = None
             b.close()
         return not served and nar_ok, 'widened to root' if served else 'closed', {'served_root': served,
                                                                                  'narrow_ok': nar_ok}
@@ -302,11 +310,11 @@ def b3(R, ctx):
         try:
             n0 = nfds()
             run = 0x1234
+            b.client, b.client_run = {'role': 2}, run   # the program's link (round 3: /pc is the linked program's)
             for req in range(1, 6):
                 fopen(b, run, req)
-            held = nfds() - n0
-            b.client, b.client_run = {'role': 2}, run   # the program's link, then lost
-            b.client_left('test: link lost')
+            held = nfds() - n0 - anchors(b)
+            b.client_left('test: link lost')   # then lost
             after = nfds() - n0
         finally:
             b.close()
@@ -319,14 +327,16 @@ def b3(R, ctx):
         try:
             n0 = nfds()
             for run in range(1, 41):   # 40 runs, each holding one open file, none ending
-                fopen(b, run)
-            held = nfds() - n0
+                b.client, b.client_run = {'role': 2}, run   # each one linked in turn (round 3: /pc is the linked
+                fopen(b, run)                               # program's); none seen to leave
+            n_anchor = anchors(b)
+            held = nfds() - n0 - n_anchor
             closed_all = None
         finally:
             b.close()
             closed_all = nfds() - n0
-        return held <= 4 and closed_all <= 0, 'descriptors kept' if held > 4 else 'capped', {
-            'held_by_40_runs': held, 'after_close': closed_all}
+        return held <= 4 and n_anchor <= 4 and closed_all <= 0, 'descriptors kept' if held > 4 else 'capped', {
+            'held_by_40_runs': held, 'anchors': n_anchor, 'after_close': closed_all}
     R.row('B3.files_capped', 'file services across runs are capped (40 runs hold at most 4 descriptors)', files_capped)
 
     ov = os.path.join(root, 'b3-overlay')
@@ -552,7 +562,7 @@ def b4(R, ctx):
 
         def label_full():
             r = runs['plain'] = run('report secs=1')
-            ok = r.state == 'done' and r.way_back == 'full restart'
+            ok = r.state == 'done' and r.way_back == 'full restart (inferred)'   # round 3: no record says how
             return ok, 'labelled stub' if r.way_back == 'stub' else 'way_back %s' % r.way_back, {
                 'state': r.state, 'way_back': r.way_back}
         R.row('B4.label_full_restart', 'an ending with no stub record is named "full restart", never "stub"', label_full)

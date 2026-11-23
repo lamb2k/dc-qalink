@@ -262,6 +262,7 @@ class Stills:
         self.refused = 0         # heads refused: malformed, or over the pending budget
         self.expired = 0         # unfinished stills abandoned (idle over cl.STILL_STALE_S): their slots freed
         self.receipts = cl.StillReceipts()   # completed stills (bounded): a repeated head / END is answered, not reopened
+        self.crc_failed = 0   # pictures whose CRC failed (each asked for again)
         self.META_KEEP = 4096
 
     def on_still(self, loop, run, a, b, payload, tier, emit):
@@ -314,14 +315,27 @@ class Stills:
                      'seconds': round(time.time() - st['t0'], 3), 'request': st['req'] or None, 'tier': tier,
                      'at': now_iso(), 'png': path if ok else None}
                 self.meta[sid] = j
+                if not ok:
+                    # round 3, blocker 5: a CRC mismatch is never a completion. No receipt, no full ACK: every block
+                    # is asked for again (all missing), as for a partial picture; the program sends a fresh copy or
+                    # gives up after its own rounds (and counts the still as failed)
+                    st['done'] = False
+                    st['have'] = set()
+                    st['crc_fail'] = st.get('crc_fail', 0) + 1
+                    self.crc_failed += 1
+                    self.log('still %s (picture %d) CRC MISMATCH (%d): a fresh copy asked for' % (
+                        sid, st['picture'], st['crc_fail']))
+                    emit(j)
+                    loop.send(cl.STILLACK, run, b, min(nblocks, 0xFFFF),
+                              bytes(bytearray((nblocks + 7) // 8)[:cl.DGRAM_MAX - cl.HDR - 4]))
+                    return
                 while len(self.meta) > self.META_KEEP:   # the still's record stays on disk with its run; memory bounded
                     old = next(iter(self.meta))
                     self.meta.pop(old)
                     for w in [w for w, ids in self.waiters.items() if old in ids]:
                         self.waiters.pop(w, None)
                 self.receipts.add(key, st['bytes'])
-                self.log('still %s (picture %d) %s in %.2f s' % (sid, st['picture'], 'held' if ok else 'CRC MISMATCH',
-                                                               j['seconds']))
+                self.log('still %s (picture %d) held in %.2f s' % (sid, st['picture'], j['seconds']))
                 if st['req']:
                     self.waiters.setdefault(st['req'], []).append(sid)
                 emit(j)
@@ -336,6 +350,8 @@ class Stills:
 # ------------------------------------------------------------------------------------------------ runs
 class Run:
     _n = itertools.count(1)
+
+    SERIAL_KEEP = 20000   # serial lines held per run (round 3, blocker 3)
 
     def __init__(self, name, raw, args, deadline_s, files, reset_after_s, by, commit=None):
         self.sid = random.getrandbits(32) | 1
@@ -359,6 +375,7 @@ class Run:
         self.files_stats = None
         self.serial = []
         self.serial_gaps = 0
+        self.serial_dropped = 0
         self.stills = []
         self.transfer = None
         self.summary = None
@@ -372,7 +389,7 @@ class Run:
              'args': self.args, 'state': self.state, 'times': self.times, 'way_back': self.way_back, 'by': self.by,
              'queued_at': self.queued_at, 'ended_at': self.ended_at, 'device': device_name, 'tier': tier,
              'deadline_s': self.deadline_s, 'files': self.files_stats, 'stills': self.stills,
-             'serial_lines': len(self.serial), 'error': self.error, 'summary': self.summary, 'build': self.build}
+             'serial_lines': len(self.serial) + self.serial_dropped, 'error': self.error, 'summary': self.summary, 'build': self.build}
         if self.crash:
             j['crash'] = self.crash
         if self.transfer:
@@ -481,7 +498,8 @@ class Bridge:
         self.runs = {}
         self.run_order = []
         self.queue = queue.Queue()
-        self.submit_lock = threading.Lock()
+        self.submit_lock = threading.RLock()
+        self.reserved = [0, 0]   # runs and bytes reserved, not yet queued
         self.active = None
         self.sessions = {}
         self.current = None          # the session of the linked program (or the last one)
@@ -657,6 +675,8 @@ class Bridge:
             r.setdefault('s', 0.0)
             self.emit(r)
 
+    SESSIONS_KEEP = 32   # sessions held in memory; older ones are read back from their files
+
     def new_session(self, run_sid, program):
         sid = '%s-%08x' % (time.strftime('%Y%m%d-%H%M%S'), run_sid)
         dev = self.device()
@@ -670,6 +690,8 @@ class Bridge:
             self.current.close('another program linked')
         self.sessions[sid] = s
         self.current = s
+        while len(self.sessions) > self.SESSIONS_KEEP:   # round 3: closed sessions leave memory (their files stay)
+            self.sessions.pop(next(iter(self.sessions)))
         self.emit(dict(s.meta, s=0.0))
         return s
 
@@ -726,6 +748,10 @@ class Bridge:
                     if r.serial and a > r.serial[-1][0] + 1:
                         r.serial_gaps += a - r.serial[-1][0] - 1
                     r.serial.append((a, pl.decode('latin-1')))
+                    if len(r.serial) > Run.SERIAL_KEEP:   # round 3: a run's serial lines bounded (oldest dropped;
+                        drop = len(r.serial) - Run.SERIAL_KEEP // 2   # the session file keeps every line)
+                        r.serial_dropped += drop
+                        del r.serial[:drop]
                 self.record({'t': 'line', 'run': '%08x' % run, 'seq': a, 'text': pl.decode('latin-1').rstrip('\n')}, s)
             elif len(pl) >= 4:
                 n = struct.unpack_from('<I', pl, 0)[0]
@@ -787,7 +813,8 @@ class Bridge:
                 w['ack'] = {'status': b, 'n': n, 'text': pl[4:].decode('utf-8', 'replace')}
                 w['ev'].set()
         elif typ == cl.RESETACK:
-            self.record({'t': 'reset', 'run': '%08x' % a, 'rung': 'stub', 'acknowledged': True}, s)
+            # round 3, blocker 6: the program's RESETACK acknowledges a RESET; it is not a rung, and not the stub
+            self.record({'t': 'reset_ack', 'run': '%08x' % a, 'acknowledged': True}, s)
         elif typ == cl.END:
             act = self.active
             asm = self.endings.get(run)
@@ -817,8 +844,20 @@ class Bridge:
     FILES_MAX = 4   # live file services (one per run); the oldest is retired past this, so descriptors stay bounded
                     # at FILES_MAX x FileService.OPEN_MAX for the bridge's lifetime
 
+    def file_owner(self, run):
+        """True when `run` may use /pc: the run the bridge is running now, or the program whose link is established
+        (an external session that said hello). Any other run ID is refused (audit round 3, blocker 1: an unknown ID
+        never receives the whole share)."""
+        a = self.active
+        if a is not None and a.sid == run:
+            return True
+        return self.client is not None and self.client_run == run
+
     def file_service(self, run):
         fs = self.files.get(run)
+        if fs is None and not self.file_owner(run):
+            self.log('/pc request from run %08x: not the active run or the linked program; refused' % run)
+            return cl.FileService(None, None)   # refuses every open; not kept
         if fs is None:
             r = self.runs.get('%08x' % run)
             root = self.files_root
@@ -914,28 +953,63 @@ class Bridge:
     QUEUE_BYTES = 64 << 20        # and their program bytes together
     RUNS_KEEP = 512               # finished runs kept in memory (their files stay in the data folder)
 
-    def submit(self, name, raw, args='', deadline_s=0, files=None, reset_after_s=None, by='api', commit=None):
-        if cl.LOAD_ADDR + len(raw) + 4 > cl.IMAGE_END:
-            raise ValueError('program too large: %d bytes' % len(raw))
-        with self.submit_lock:   # admission: the queue is capped in count and bytes before anything is kept
+    def reserve(self, nbytes):
+        """A place in the run queue (one run, `nbytes` bytes) reserved atomically under the admission lock, counting
+        the runs waiting and every reservation not yet queued (round 3, blocker 3: parallel submissions can no longer
+        all pass one snapshot). Refused when the queue is full; the caller releases it on every path (release())."""
+        with self.submit_lock:
             waiting = [q for q in list(self.queue.queue) if q is not None]
-            if len(waiting) >= self.QUEUE_MAX or sum(q.nbytes for q in waiting) + len(raw) > self.QUEUE_BYTES:
-                raise qlsafe.Refused('the run queue is full (%d runs, %d bytes waiting; at most %d runs, %d bytes)' % (
-                    len(waiting), sum(q.nbytes for q in waiting), self.QUEUE_MAX, self.QUEUE_BYTES))
-            done = [i for i in self.run_order if self.runs[i].done.is_set()]
-            for i in done[:max(0, len(self.run_order) - self.RUNS_KEEP)]:
-                self.runs.pop(i, None)
-                self.run_order.remove(i)
-        r = Run(name, raw, args, int(deadline_s or 0), files, reset_after_s, by, commit)
-        b = self.make_build(name, r.sha256, len(raw), args, commit, by)
-        r.build = b['id']
-        b['runs'].append(r.id)
-        self.save_builds()
-        self.runs[r.id] = r
-        self.run_order.append(r.id)
-        self.queue.put(r)
+            n = len(waiting) + self.reserved[0]
+            b = sum(q.nbytes for q in waiting) + self.reserved[1]
+            if n >= self.QUEUE_MAX or b + nbytes > self.QUEUE_BYTES:
+                raise qlsafe.Refused('the run queue is full (%d runs, %d bytes waiting or arriving; at most %d runs, '
+                                     '%d bytes)' % (n, b, self.QUEUE_MAX, self.QUEUE_BYTES))
+            self.reserved[0] += 1
+            self.reserved[1] += nbytes
+            return [nbytes]
+
+    def release(self, ticket):
+        with self.submit_lock:
+            if ticket and ticket[0] is not None:
+                self.reserved[0] -= 1
+                self.reserved[1] -= ticket[0]
+                ticket[0] = None
+
+    def submit(self, name, raw, args='', deadline_s=0, files=None, reset_after_s=None, by='api', commit=None,
+               ticket=None):
+        if cl.LOAD_ADDR + len(raw) + 4 > cl.IMAGE_END:
+            if ticket is not None:
+                self.release(ticket)
+            raise ValueError('program too large: %d bytes' % len(raw))
+        if ticket is None:
+            ticket = self.reserve(len(raw))
+        try:
+            r = Run(name, raw, args, int(deadline_s or 0), files, reset_after_s, by, commit)
+            b = self.make_build(name, r.sha256, len(raw), args, commit, by)
+            r.build = b['id']
+            b['runs'].append(r.id)
+            self.save_builds()
+            with self.submit_lock:   # queued and the reservation released together: the run is counted once
+                self.runs[r.id] = r
+                self.run_order.append(r.id)
+                self.prune_runs()
+                self.queue.put(r)
+                self.release(ticket)
+        finally:
+            self.release(ticket)
         self.log('run %s queued: %s %d bytes by %s' % (r.id, name, len(raw), by))
         return r
+
+    def prune_runs(self):
+        """At most RUNS_KEEP runs in memory, counted after insertion over every run (round 3, blocker 6): the oldest
+        finished runs go first; runs not finished (queued or running) are never dropped, and there are at most
+        QUEUE_MAX + 1 of them."""
+        extra = len(self.run_order) - self.RUNS_KEEP
+        if extra <= 0:
+            return
+        for i in [i for i in self.run_order if self.runs[i].done.is_set()][:extra]:
+            self.runs.pop(i, None)
+            self.run_order.remove(i)
 
     def _run(self, run):
         loop = self.loop
@@ -947,9 +1021,10 @@ class Bridge:
                 return
             if h['report_state'] not in (0, 1):
                 try:
-                    old = loop.fetch_report(h, None)
+                    old = loop.fetch_report(h, os.path.join(self.data_dir, 'reports'))
                     self.log('earlier report %s collected first (%s)' % (old['run'], old['state']))
-                except RuntimeError as e:
+                    self.attach_late(old, run)
+                except (RuntimeError, OSError) as e:
                     self.log('earlier report: %s' % e)
             try:
                 raw = program_image(run.raw)
@@ -1034,6 +1109,11 @@ class Bridge:
                 run.evidence['loader_report'] = 'failed: %s' % e
             else:
                 run.evidence['loader_report'] = 'crc ok' if rep['crc_ok'] else 'bad crc'
+            # round 3, blocker 4: the tap may have completed the END during the blocking fetch; decide on what is in
+            # hand now (the assembler is kept until this run is finalised: the worker retires it afterwards)
+            asm = self.endings.get(run.sid)
+            er = cl.end_report(asm, run.sid, None) if asm is not None else er
+            run.evidence['end'] = cl.ending_state(er)
             if (rep is None or not rep['crc_ok']) and cl.end_rank(er) > 0:
                 # audit round 2: the loader's saved report failed (unreadable or bad CRC); the run's END, verified,
                 # is the best report: the result is the END's, the loader's failure stays in `evidence`
@@ -1054,6 +1134,32 @@ class Bridge:
             run.times['total_s'] = round(time.time() - t_start, 3)
             session.add({'t': 'end', 'n': session.max_n, 'reason': '%s, exit %s' % (run.state, rep['exit'])})
             session.flush()
+
+    def attach_late(self, rep, by):
+        """A loader report collected late (the loader came back after its run was finalised; the next worker fetched
+        it) attached to its own run (round 3, blocker 4), when that run has no verified result yet. True if attached."""
+        r = self.runs.get(rep['run'])
+        if r is None or r is by or not rep['crc_ok'] or not rep.get('path'):
+            return False
+        if r.report is not None and r.report_crc_ok:
+            return False
+        try:
+            with open(rep['path'], 'rb') as f:
+                data = f.read(cl.REPORT_MAX + 1)
+        except OSError:
+            return False
+        r.report, r.report_crc_ok = data, True
+        was = r.state
+        r.state = RUN_STATE_OF.get(rep['state'], 'lost')
+        r.error = None
+        r.evidence = dict(r.evidence or {}, loader_report='crc ok (collected late, before run %s)' % by.id)
+        try:
+            r.summary = parse_summary(data.decode('latin-1'), r.state, rep['exit'], r.times.get('run_s'), self.tier(),
+                                      None)
+        except Exception as e:   # the report is kept whatever its summary says
+            self.log('run %s: late report summary: %r' % (r.id, e))
+        self.log('run %s: its report collected late (was %s, now %s)' % (r.id, was, r.state))
+        return True
 
     def _end_result(self, run, er, session, t_start, note):
         """A run's result from its END (the report tail it carried), when the loader has no report for it."""

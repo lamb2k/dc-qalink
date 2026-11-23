@@ -18,6 +18,12 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 ## Shape
 - HTTP/1.1 with JSON bodies on **127.0.0.1:52080** only (the bridge refuses any other address). The hosted relay
   (QA Link Cloud, L3b) carries the same paths with a token.
+- `/pc` (the program's file service) answers only the run the bridge is running or the program whose link is up (its
+  HELLO); any other run ID is refused, never given the served root. A run's folder is anchored when its service
+  starts (its identity, and a directory descriptor where the system has one); every file is opened relative to it and
+  checked on the opened descriptor (a regular file below the anchor), so a folder replaced or relinked afterwards is
+  never served. Where the system cannot say what an open file is, the open is refused. Asset imports, watched
+  reimports, a model's dependencies, MCP build reads and session export read through the descriptor they checked.
 - A request body's `Content-Length` must be digits only and at most 16 MiB; anything else is answered **413** before
   the body is read.
 - Paths under **`/v0/`**. Every JSON answer carries **`contract: 1`**. A client sends `X-Contract: 1` (or
@@ -67,17 +73,17 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `GET /v0/devices` | read | `{devices: [device]}` (one device per bridge) |
 | `GET /v0/discovery` | read | `listening`, `port`, `seen[]`: `id`, `console_ip`, `address`, `port`, `kind` (flycast when the beacon comes from this PC), `transport`, `loader`, `protocol`, `beacons`, `last_s_ago`, `chosen`, `ident`, `remembered`, `at`, `mac`, `gdemu_slot`, `gdemu_version`, `stub`, `stub_text` |
 | `POST /v0/link` | control | `{console_ip}` (or `device` id): talk to that loader; answers the status. 404 if none was heard there |
-| `POST /v0/runs` | run | Push and run. **multipart/form-data**: `program` (file: ELF or raw image), `sha256` (required; a mismatch is 400 and nothing is queued), `name`, `args`, `deadline_s`, `files` (a folder name below the bridge's `--files`, never a path; one that is not a folder below the served /pc root is **400**, and that run is never given the whole root), `reset_after_s`. Scripts may send `application/octet-stream` with `X-Build-Sha256`, `X-Build-Name`, `X-Args`. Answers **202** with the run; **429** when the queue is full (at most 8 runs waiting, 64 MiB of their programs together) |
+| `POST /v0/runs` | run | Push and run. **multipart/form-data**: `program` (file: ELF or raw image), `sha256` (required; a mismatch is 400 and nothing is queued), `name`, `args`, `deadline_s`, `files` (a folder name below the bridge's `--files`, never a path; one that is not a folder below the served /pc root is **400**, and that run is never given the whole root), `reset_after_s`. Scripts may send `application/octet-stream` with `X-Build-Sha256`, `X-Build-Name`, `X-Args`. Answers **202** with the run; **429** when the queue is full (at most 8 runs waiting or arriving, 64 MiB of their programs together; a push reserves its place from its declared length before its body is read, and a refused or failed push releases it) |
 | `GET /v0/runs` | read | `{runs: [run]}`, newest first |
 | `GET /v0/runs/{id}` | read | The run with `report` (text) |
 | `GET /v0/runs/{id}/report` | read | The report, `text/plain`; `X-Report-CRC-OK: 1` |
-| `GET /v0/runs/{id}/serial` | read | The serial lines in order, a gap marked `[gap: n lines lost]` |
+| `GET /v0/runs/{id}/serial` | read | The serial lines in order, a gap marked `[gap: n lines lost]`; the last 20,000 lines of a run are held in memory (`serial_lines` counts every line; the session file keeps them all) |
 | `POST /v0/selftest` | run | Push and run the bridge's test program (`--selftest`, dc-qalink's `testprog.elf`) with `report screen:1`; 202 with the run; 501 if none is set up |
 | `POST /v0/stills` | control | **Grab now**: `{timeout_s?}`. The linked program sends its displayed picture (a program with live data is paused for the read and resumed). Answers the still's JSON; 409 no program linked, 504 no answer (a program without the live additions), 410 the program left, 502 CRC mismatch |
 | `GET /v0/stills` | read | `{stills: [still]}` |
 | `GET /v0/stills/{id}` | read | The PNG. `GET /v0/stills/{id}.json`: `id`, `run`, `index`, `picture`, `width`, `height`, `format` (`rgb565`), `crc_ok`, `bytes`, `seconds`, `request`, `tier`, `at` |
-| `POST /v0/command` | control | One endpoint: `{cmd: pause}`, `{cmd: resume}`, `{cmd: step, count}`, `{cmd: warp, preset}`, `{cmd: option, name, value}`, `{cmd: pad, state | steps}`, `{cmd: reset, level: return|watchdog|power}`. Answers `{ok, id, n, error}` (`n` the picture it took effect at); reset answers `rung` (`reset` / `watchdog wait` / `none`) and `way_back` (below). **409** no program linked; **501** what the loader or the program cannot do yet (a program without the live additions; `memory`) |
-| `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: the rung tried, `reset` / `watchdog wait` / `none`; `way_back`: how the loader came back, below; `seconds`); the last rung (`done`, `say`) |
+| `POST /v0/command` | control | One endpoint: `{cmd: pause}`, `{cmd: resume}`, `{cmd: step, count}`, `{cmd: warp, preset}`, `{cmd: option, name, value}`, `{cmd: pad, state | steps}`, `{cmd: reset, level: return|watchdog|power}`. Answers `{ok, id, n, error}` (`n` the picture it took effect at); reset answers `rung` (`reset` / `watchdog wait` / `power` / `none`; `power` when the ladder ran out under a running program and only a power cycle is left; `none needed` when no program runs) and `way_back` (below). **409** no program linked; **501** what the loader or the program cannot do yet (a program without the live additions; `memory`) |
+| `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: the rung tried, `reset` / `watchdog wait` / `power` / `none`; `way_back`: how the loader came back, below; `seconds`); the last rung (`done`, `say`) |
 | `GET /v0/summary?slowest=k` | read | The current session: `session`, `label`, `device`, `tier`, `pictures`, `measured`, `missing` (pictures never received), `window`, `phases[]` {`key`, `label`, `budget`, `mean`, `p95`, `p99`, `worst`, `worstAt`, `over`, `tier`}, `guards[]` {`key`, `name`, `value`, `tier`}, `slowest[]` {`n`, `total` (busy: the phases that are not the total), `phases`}, `trace_lost` |
 | `GET /v0/trace?from&to&lane&limit` | read | `from`, `to`, `events[]` {`lane`, `n`, `d`, `label`}, `truncated`, `lost` |
 | `GET /v0/log?from&to&level&q&limit` | read | `from`, `to`, `lines[]` {`n`, `lv`, `msg`}, `truncated` (the newest when over the limit; `warn` includes `err`) |
@@ -88,16 +94,21 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `POST /v0/memory/read`, `POST /v0/assets` | - | **501** in this loader (memory reads: plan L5; live assets: plan L5b) |
 
 A **run**: `id`, `program` {`name`, `sha256`, `bytes`} (a finished run keeps the count, not the program's bytes; at
-most 512 runs are kept in memory), `args`, `state` (`queued` / `sending` / `running` / `done` /
+most 512 runs are kept in memory, counted over every run after insertion: the oldest finished runs go first, and a run
+still queued or running is never dropped, so the count can pass 512 only by the at most 9 runs not finished), `args`, `state` (`queued` / `sending` / `running` / `done` /
 `crashed` / `timeout` / `reset` / `lost` / `refused`), `times` {`push_s`, `run_s`, `report_s`, `total_s`}, `way_back`
-(from evidence only, ql-fix-pc round 2: `stub` when the loader's HELLO carries the stub's record of a jump, `full
-restart` when the loader is back without it, null when it is not back), `reset_rung` (only when the ladder ran: the
+(from evidence only: `stub` when the loader's HELLO carries the stub's record of a jump, `full restart` when it
+carries the full restart's own record, `full restart (inferred)` when the loader is back with neither (no record says
+how it came back; the BIOS restart is what is left), null when it is not back), `reset_rung` (only when the ladder ran: the
 rung tried, `reset` / `watchdog wait` / `power`; a request, not how the console came back), `evidence` {`end` (the
-END's state), `loader_back` (true/false), `loader_report` (`none` / `crc ok` / `bad crc` / `failed: ...`)}: a whole END
-with its CRC right is the run's result even when the loader's report fails or the ladder runs out, `by`, `queued_at`, `ended_at`, `device`, `tier`, `deadline_s`, `files` (the file
+END's state), `loader_back` (true/false), `loader_report` (`none` / `crc ok` / `bad crc` / `failed: ...` / `crc ok (collected late, before run <id>)`)}:
+an END whose declared tail arrived complete (`end`: `complete`, or `whole crc ok` when the whole report came with its
+CRC right) is the run's result even when the loader's report fails or the ladder runs out; an END that arrives while
+the loader's report is being fetched counts; a loader report collected late (by the next run's worker) is attached to
+its own run when that run has no verified result, `by`, `queued_at`, `ended_at`, `device`, `tier`, `deadline_s`, `files` (the file
 service's totals), `stills`, `serial_lines`, `error`, `transfer` (the push's numbers), `crash` {`event`, `pc`, `pr`, `sp`},
-**`ending`** when the result came by END before the console's restart (ql-fix-pc: `bytes`, `tail`, `complete`,
-`whole`, `crc_ok`; the run is kept even when the loader's saved report is empty afterwards) and the parsed
+**`ending`** when the result came by END before the console's restart (`bytes`, `tail_bytes`, `complete`,
+`whole`, `crc_ok`, `by`; the run is kept even when the loader's saved report is empty afterwards) and the parsed
 **`summary`**: `exit`, `state`, `seconds`, `pictures`, `numbers[]` {`label`, `value`, `unit`, `tier`}
 (report lines of the form `@ label = value unit`, and each phase's mean and worst when the program sent records),
 `notes`, `crash`, `tier`. Crash symbols and source lines (from an ELF with symbols) are for later.
@@ -146,7 +157,8 @@ version 1): `meta` (again whenever the program declares its phases; a new sessio
 version 1): `link` {`state`, `role` loader/program, `console_ip`, `transport`, `beacons`}, `hello` (the device),
 `push` {`run`, `chunks_have`, `chunks`, `bytes_per_s`, `resent`}, `verdict` {`run`, `ok`, `why`}, `exec`, `line`
 {`run`, `seq`, `text`}, `file` {`run`, `path`, `op`}, `still` {`run`, `id`, `picture`, `crc_ok`}, `back` {`run`,
-`state`, `way_back`, `seconds`, `error`}, `reset` {`run`, `rung`, `seconds`}.
+`state`, `way_back`, `seconds`, `error`}, `reset` {`run`, `rung`, `acknowledged`, `seconds`} (a rung the bridge
+tried), `reset_ack` {`run`, `acknowledged`} (the program's RESETACK: an acknowledgement of a RESET, never a rung).
 
 **Session format version 2** (v0.2-netdisc): `meta.build` is the build record and every record carries `build` (its id)
 when the session has one; `disc` records are the network disc's: `mount` {`mode`, `served`, `files`, `manifest`},

@@ -201,10 +201,13 @@ def elf_image(data, span_max=None):
     if hi - lo > span_max:
         raise ValueError('ELF load span %d bytes (%08x..%08x) is over the %d bytes a program may take' % (
             hi - lo, lo, hi, span_max))
-    segs = [(va, data[off:off + fs]) for va, off, fs in segs]
+    total = sum(s[2] for s in segs)
+    if total > span_max:   # round 3, blocker 2: overlapping segments cannot multiply the work past the span
+        raise ValueError('ELF segments copy %d bytes in all, over the %d bytes a program may take' % (total, span_max))
     img = bytearray(hi - lo)
-    for va, b in segs:
-        img[va - lo:va - lo + len(b)] = b
+    mv = memoryview(data)
+    for va, off, fs in segs:   # copied from views straight into the one image (no per-segment slices)
+        img[va - lo:va - lo + fs] = mv[off:off + fs]
     return lo, bytes(img)
 
 
@@ -474,48 +477,54 @@ class FileService:
     def __init__(self, root, log):
         self.root = os.path.abspath(root) if root else None
         self.log = log
+        # round 3: the folder is anchored once for the service's lifetime (its identity, and a directory descriptor
+        # where the system has one); every open is checked against that anchor on the opened descriptor
+        try:
+            self.anchor = qlsafe.Anchor(self.root) if self.root else None
+        except (OSError, qlsafe.Refused):
+            self.anchor = None
         self.handles = {}
         self.next = 1
         self.closed = False
         self.stats = {'opened': 0, 'refused': 0, 'reads': 0, 'bytes': 0, 'first_at': None, 'last_at': None, 'files': {}}
 
     OPEN_MAX = 32    # open files a program may hold at once (each is a descriptor on this PC)
+    NAMES_MAX = 1024  # distinct names kept in the totals
 
     def path(self, rel):
-        """The real path of /pc/<rel> when its target, links followed, is a file below the root; else None."""
-        return qlsafe.confine(self.root, rel)
+        """The real path of /pc/<rel> when its target, links followed, is a file below the anchored root; else None
+        (a listing helper: serving opens through the anchor, never through this path)."""
+        return qlsafe.confine(self.anchor.real, rel) if self.anchor is not None else None
 
     def on_open(self, loop, run, req, payload):
         rel = payload.decode('latin-1', 'replace')
-        p = self.path(rel)
         now = time.time()
-        if self.closed:
-            p = None
-        if self.log and (rel not in self.stats['files'] or p is None):
-            self.log('file service: %s %s' % (rel, 'refused' if p is None else 'open'))
-        if p is None:
-            self.stats['refused'] += 1
-            loop.send(FINFO, run, req, 0, struct.pack('<iIII', -2, 0, 0, 0))
-            return
-        key = os.path.normcase(p)
-        h = next((k for k, v in self.handles.items() if v[2] == key and v[3] == req), None)
-        if h is None and len(self.handles) >= self.OPEN_MAX:   # a cap on descriptors, before one more is opened
-            self.stats['refused'] += 1
-            self.stats['too_many'] = self.stats.get('too_many', 0) + 1
-            loop.send(FINFO, run, req, 0, struct.pack('<iIII', -24, 0, 0, 0))
-            return
+        h = next((k for k, v in self.handles.items() if v[3] == req and v[2] == rel), None)
         if h is None:   # a repeated FOPEN (lost answer) keeps its handle
-            try:   # opened, then checked on the opened object (audit round 2: no check-then-reopen)
-                f = qlsafe.open_confined(self.root, rel)
-            except qlsafe.Refused:
+            if self.closed or self.anchor is None:
+                f = None
+            elif len(self.handles) >= self.OPEN_MAX:   # a cap on descriptors, before one more is opened
+                self.stats['refused'] += 1
+                self.stats['too_many'] = self.stats.get('too_many', 0) + 1
+                loop.send(FINFO, run, req, 0, struct.pack('<iIII', -24, 0, 0, 0))
+                return
+            else:
+                try:   # opened relative to the anchored folder, then checked on the opened descriptor
+                    f = self.anchor.open(rel)
+                except qlsafe.Refused:
+                    f = None
+            if self.log and (rel not in self.stats['files'] or f is None):
+                self.log('file service: %s %s' % (rel[:200], 'refused' if f is None else 'open'))
+            if f is None:
                 self.stats['refused'] += 1
                 loop.send(FINFO, run, req, 0, struct.pack('<iIII', -2, 0, 0, 0))
                 return
             h = self.next
             self.next += 1
-            self.handles[h] = (f, os.fstat(f.fileno()).st_size, key, req)
+            self.handles[h] = (f, os.fstat(f.fileno()).st_size, rel, req)
             self.stats['opened'] += 1
-            self.stats['files'].setdefault(rel, 0)
+            if len(self.stats['files']) < self.NAMES_MAX:
+                self.stats['files'].setdefault(rel, 0)
             self.stats['first_at'] = self.stats['first_at'] or now
         loop.send(FINFO, run, req, 0, struct.pack('<iIII', 0, h, self.handles[h][1], 0))
 
@@ -545,6 +554,8 @@ class FileService:
         self.closed = True
         for h in list(self.handles):
             self.on_close(h)
+        if self.anchor is not None:
+            self.anchor.close()
 
     def summary(self):
         s = dict(self.stats)
@@ -674,16 +685,30 @@ class StillSink:
             if not missing and not st['done']:
                 ok = (zlib.crc32(bytes(st['data'])) & 0xFFFFFFFF) == st['crc']
                 name = 'still-%08x-%03d-p%05d.png' % (self.run, idx, st['picture'])
+                if not ok:
+                    # round 3, blocker 5: a CRC mismatch is never a completion: no receipt, no full ACK; every block
+                    # is asked for again, as for a partial picture (the program sends a fresh copy or gives up)
+                    st['have'] = set()
+                    st['crc_fail'] = st.get('crc_fail', 0) + 1
+                    if st['crc_fail'] == 1:
+                        self.saved.append({'index': idx, 'picture': st['picture'], 'crc_ok': False, 'file': None,
+                                           'seconds': round(now - st['t0'], 3), 'bytes': st['bytes']})
+                    self.log('still %d (picture %d) CRC MISMATCH (%d): a fresh copy asked for' % (
+                        idx, st['picture'], st['crc_fail']))
+                    loop.send(STILLACK, self.run, idx, min(nblocks, 0xFFFF),
+                              bytes(bytearray((nblocks + 7) // 8)[:DGRAM_MAX - HDR - 4]))
+                    return
                 if ok and self.out:
                     os.makedirs(self.out, exist_ok=True)
                     png_rgb565(os.path.join(self.out, name), st['w'], st['h'], bytes(st['data']))
                 st['done'] = True
                 self.cur.pop(idx, None)            # held as a PNG now: only a bounded receipt stays
                 self.receipts.add(idx, st['bytes'])
-                self.saved.append({'index': idx, 'picture': st['picture'], 'crc_ok': ok, 'file': name if ok else None,
-                                   'seconds': round(now - st['t0'], 3), 'bytes': st['bytes']})
-                self.log('still %d (picture %d) %s, %d bytes in %.2f s' % (idx, st['picture'], 'saved' if ok else
-                                                                           'CRC MISMATCH', st['bytes'], now - st['t0']))
+                self.saved = [x for x in self.saved if not (x['index'] == idx and not x['crc_ok'])]
+                self.saved.append({'index': idx, 'picture': st['picture'], 'crc_ok': True, 'file': name if self.out
+                                   else None, 'seconds': round(now - st['t0'], 3), 'bytes': st['bytes']})
+                self.log('still %d (picture %d) saved, %d bytes in %.2f s' % (idx, st['picture'], st['bytes'],
+                                                                             now - st['t0']))
             loop.send(STILLACK, self.run, idx, min(missing, 0xFFFF), bytes(bits[:DGRAM_MAX - HDR - 4]))
             return
         if not st['done'] and still_block_ok(st, a, payload):
@@ -954,9 +979,16 @@ class Loop:
         ok = (zlib.crc32(data) & 0xFFFFFFFF) == crc and len(data) == length
         path = None
         if out_dir:
+            # round 3, blocker 4: written to its own file first; it becomes report-<run>.txt only when its CRC checks,
+            # so a good END already written there is never overwritten by bytes that failed
             os.makedirs(out_dir, exist_ok=True)
-            path = os.path.join(out_dir, 'report-%08x.txt' % run)
-            open(path, 'wb').write(data)
+            path = os.path.join(out_dir, 'report-%08x.loader.txt' % run)
+            with open(path, 'wb') as f:
+                f.write(data)
+            if ok:
+                final = os.path.join(out_dir, 'report-%08x.txt' % run)
+                os.replace(path, final)
+                path = final
         if ok:
             self.wait(lambda m: m if m[0] == HELLO and self.hello['report_state'] == 0 else None, 10.0,
                       every=2.0, poke=lambda: self.send(REPDONE, run))
@@ -1136,17 +1168,24 @@ def serve(a, loop, stamp):
     return 0 if not a.until or seen['hit'] else 1
 
 
+FULL_RESTART_TAKEN = 17   # the full restart's own crumb: "the full restart taken" (tools/first_console.py)
 STUB_JUMP = 6   # CL_STUB_STEP_* "jump": the return stub read the loader and jumped to it
 
 
 def way_back_of(hb):
-    """How the console came back to the loader, from evidence only (audit round 2): 'stub' when the loader's HELLO
-    carries the stub's record of this boot with its jump step; otherwise the default way back, the BIOS restart
-    ('full restart'). None with no HELLO (the loader is not back)."""
+    """How the console came back to the loader, from evidence only (audit rounds 2 and 3): 'stub' when the loader's
+    HELLO carries the stub's record of this boot with its jump step; 'full restart' when it carries the full restart's
+    own crumb; otherwise 'full restart (inferred)' (no record says how: the BIOS restart is what is left). None with
+    no HELLO (the loader is not back)."""
     if not hb:
         return None
     s = hb.get('stub')
-    return 'stub' if s and s.get('step') == STUB_JUMP else 'full restart'
+    if s and s.get('step') == STUB_JUMP:
+        return 'stub'
+    if s and s.get('step') == FULL_RESTART_TAKEN:
+        return 'full restart'
+    # round 3, blocker 6: no record of a jump is not evidence of the BIOS restart; it is what is left (inferred)
+    return 'full restart (inferred)'
 
 
 def ladder(loop, run, wait_s, stamp, b0=None):
@@ -1221,11 +1260,19 @@ def session_main(a, loop, stamp):
     result['transfer'] = res
     rc = 0 if res['verdict'] == 0 else 3
     if a.cmd == 'run' and (res['verdict'] == 0 or a.corrupt):
-        r = loop.run_verified(session)
+        # round 3, blocker 4: the run's END is taken from the moment RUN is sent (a fast program can end while the
+        # EXEC answer is awaited; that END was consumed and lost before)
+        ending, t_run = qlsafe.EndAssembler(session), time.time()
+        loop.on_other = lambda m: end_on(ending, loop, session, m[2], m[4], stamp, t_run) \
+            if m[0] == END and m[1] == session else None
+        try:
+            r = loop.run_verified(session)
+        finally:
+            loop.on_other = None
         stamp('run: %s' % r)
         result['run'] = r
         if r in ('exec', 'no answer') and not a.no_collect:
-            rc = collect(a, loop, stamp, session, result, h)
+            rc = collect(a, loop, stamp, session, result, h, ending)
         elif r not in ('exec', 'no answer'):
             rc = 3
     result['link'] = loop.stats
@@ -1289,7 +1336,7 @@ def end_rank(er):
     return 0 if not er else 2 if er['crc_ok'] else 1 if er['complete'] else 0
 
 
-def collect(a, loop, stamp, session, result, h):
+def collect(a, loop, stamp, session, result, h, ending=None):
     """After EXEC: serve the program (files, lines, stills), RESET it if asked, wait for the loader, take the report."""
     b0 = (loop.hello or {}).get('boot_count')
     t0 = time.time()
@@ -1333,7 +1380,7 @@ def collect(a, loop, stamp, session, result, h):
         elif typ == END:
             end_datagram(aa, pl)
     loop.on_other = other
-    ending = qlsafe.EndAssembler(session)
+    ending = ending if ending is not None else qlsafe.EndAssembler(session)
 
     def end_datagram(aa, pl):
         """ql-core4: the run's ending, sent by the program before its full restart (include/dcql_loop.h CL_END)."""
@@ -1404,7 +1451,9 @@ def collect(a, loop, stamp, session, result, h):
         stamp('the loader\'s report %s; the run\'s result from its END (%s exit %d)' % (
             result['evidence']['loader_report'], er['state'], er['exit']))
         result['report'] = er
-        return 0 if er['state'] in ('DONE', 'RESET') and er['crc_ok'] else 5
+        # round 3, blocker 4: a complete declared tail is a valid result even with no whole-report CRC; the evidence
+        # says which it is ('whole crc ok' or 'complete')
+        return 0 if er['state'] in ('DONE', 'RESET') and er['complete'] else 5
     if 'error' in rep:
         stamp('report: %s' % rep['error'])
         result['report'] = None
