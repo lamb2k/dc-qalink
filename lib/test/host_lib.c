@@ -22,6 +22,9 @@ static unsigned char *t_alloc(unsigned n) {
 static void t_free(void *p) { if (p) { --g_live; free(p); } }
 #define DCQL_RING_ALLOC(n) t_alloc(n)
 #define DCQL_RING_FREE(p) t_free(p)
+#define DCQL_RING_LOCK_T int   /* single-threaded here; host_race.c tests the exclusion */
+#define DCQL_RING_LOCK(m) ((m) = 0)
+#define DCQL_RING_UNLOCK(m) ((void)(m))
 #include "../dcql_ring.h"
 #include "../dcql_dirent.h"
 
