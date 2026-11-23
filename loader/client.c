@@ -801,10 +801,13 @@ static void end_head(cl_end_t *e, uint32_t tail_max, uint32_t path) {
 /* from a thread: the head and the tail through the link's ring, then the PC's ENDACK awaited (1 s a round, the whole
    END sent again once when it misses bytes or does not answer). From the link thread itself the answers are read
    here. Returns 1 when the PC acknowledged the whole END.
-   Exit-time bound (lane ql-fix-dc, audit item 2): the whole of it, both rounds with their waits for ring room and for
-   ENDACK, ends by END_LINK_MS after it starts; on a link that is not up it ends at once (nothing can be sent). So a PC
-   that has gone away delays the full restart by at most END_LINK_MS (plus one 1 ms sleep and one datagram's copy);
-   before, each of the up to 33 datagrams of a round could wait 2,000 x 1 ms for ring room. */
+   Exit-time retry budget (lane ql-fix-dc, audit item 2; wording per the round-2 audit): both rounds, with their waits
+   for ring room and for ENDACK, share one budget of END_LINK_MS from the start; no new retry or wait begins after it
+   runs out, and on a link that is not up the path gives up at once (nothing can be sent). It is a budget checked
+   between steps, not a hard wall-clock bound on the whole exit: a step under way when it runs out finishes first (a
+   wait for ring room reads the clock after a failed enqueue and its 1 ms sleep; a receive poll takes up to 10 ms).
+   So a PC that has gone away delays the full restart by about END_LINK_MS. Before, each of the up to 33 datagrams of
+   a round could wait 2,000 x 1 ms for ring room. */
 #define END_LINK_MS 4000u
 static int end_send_link(void) {
     cl_end_t e;

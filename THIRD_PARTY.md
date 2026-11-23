@@ -26,6 +26,17 @@ ASCII glyphs (32..126) are kept, converted to one bit a pixel by `lib/font/mkfon
 copyright notice and licence in your distribution's documentation, as its licence requires. The menu's QR encoder is
 dc-qalink's own.
 
-The Python tools use the Python standard library only (PSF licence) and the system `ssh` / `scp` / `ssh-keygen`; the menu example's picture
-tool (`example/menu/shots.py`, not needed to build) uses Pillow (HPND licence) and, for its QR checks, zxing-cpp
-(Apache 2.0) as an independent decoder.
+The Python tools use the Python standard library (PSF licence) and the system `ssh` / `scp` / `ssh-keygen`, except
+these, which need packages you install yourself:
+- **numpy** (BSD 3-Clause): the asset converters in `pc/assets/` (`gen.py`, `image.py`, `model.py`, `pvrtex.py`,
+  `render.py`, `dqa.py`), so the bridge's asset routes (`pc/bridge/assets.py`, loaded when an asset route is first
+  used) and their test `tests/test_assets.py`.
+- **Pillow** (HPND): `pc/assets/image.py` for pictures other than PNG (PNG is read without it), and the menu
+  example's picture tool `example/menu/shots.py` (not needed to build).
+- **the MCP Python SDK** (`mcp`, MIT): the MCP server `pc/bridge/mcp_server.py` (`pc/qalink_bridge.py` loads it only
+  when MCP is asked for) and its test `tests/test_mcp.py`, which the gate's Flycast suite runs (so the gate's Windows
+  Python needs it).
+- **zxing-cpp** (Apache 2.0): the QR checks of `example/menu/shots.py`, as an independent decoder.
+
+The loop tool (`pc/dcql_loop.py`), the bridge without MCP or asset routes, `tools/first_console.py` and the other
+tests need none of them.
