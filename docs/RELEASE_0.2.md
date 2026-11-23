@@ -119,7 +119,7 @@ swap, the read-ahead hold) and 20 B of fixed memory.
 | a /cd directory entry advanced past the listing | `lib/dcql_dirent.h`: a truncated entry is rejected and ends the listing | `lib/test/run.sh` (host, ASan) | the 1990fb9 rule accepts the truncated entry and leaves the position past the size |
 | built-in rings: one kept when its partner failed; owned rings stranded by a later `dcql_net_config` | `lib/dcql_ring.h`: owned vs borrowed, both or neither, a swap frees the owned rings it replaces | `lib/test/run.sh` (host, ASan leaks) | the 1990fb9 code leaks in both cases |
 | the /pc read-ahead not freed when a program ends with files open | held by each read, freed at the last close or on the way out | Flycast f-01 (read and closed: "none held at exit"), f-02 (left open: "freed at exit") | the lines do not exist at 1990fb9 |
-| END enqueue retries had no total time bound | `END_LINK_MS` 4 s for the whole END path; at once on a link that is down | Flycast f-03 (30 KB report, link stopped before exit): loader back 7.42 s after EXEC, report DONE from the kept copy | CONTROL_F03 |
+| END enqueue retries had no total time bound | `END_LINK_MS` 4 s for the whole END path; at once on a link that is down | Flycast f-03 (30 KB report, link stopped before exit): loader back 7.42 s after EXEC, report DONE from the kept copy | the same row on c0bc0db with the END sender as at 1990fb9 (local branch ql-fix-dc-control2 46c7dbc, `gates\ql-fix-dc-control-46c7dbc1e`): the loader not back within 75 s, FAIL as it must |
 
 Measured on the code commit c0bc0db (`gates\ql-fix-dc-c0bc0db23`, Flycast function tier, one run each). The f-01 heap
 line reads 309,724 B before the open and 310,244 B after the close: the 8 KiB block is gone; the 520 B left is most
