@@ -24,7 +24,7 @@
                 resets the CPU; otherwise only a power cycle returns
      reboot     BIOS reboot without a hand-in: shows what the BIOS boots after a soft reboot (loader -> LOST)
      preload0   no loader preload when no stub is armed
-     wdt=1      arm the SH-4 watchdog (reset mode, fed by the vertical blank; off by default since ql-core5)
+     wdt=1      arm the SH-4 watchdog (manual reset after 5.25 ms, fed every 1 ms by TMU1; off by default)
 
    It shows its state on screen so a photo tells which path ran. */
 #include <kos.h>
@@ -220,9 +220,10 @@ int main(int argc, char **argv) {
     }
     if (has(args, "hangoff")) {
         say(4, "HANG WITH INTERRUPTS OFF");
-        /* ql-core5: the watchdog as the hang starts, on the TV: armed and counting = CSR C7 and a count under 256 */
+        /* the watchdog as the hang starts, on the TV: armed and counting = CSR E7 (ql-core6: manual reset) and a count
+           under 256; it resets the CPU about 5 ms after interrupts go off (the 1 ms feed stops) */
         snprintf(line, sizeof(line), "WDT CSR %02X CNT %3u%s", dcql_wdt_csr(), dcql_wdt_cnt(),
-                 (dcql_wdt_csr() & DCQL_WT_TME) ? " ARMED: RESET IN 21 MS" : " NOT ARMED: POWER CYCLE");
+                 (dcql_wdt_csr() & DCQL_WT_TME) ? " ARMED: RESET IN 5 MS" : " NOT ARMED: POWER CYCLE");
         say(5, line);
         cl_report("hangoff: %s\n", line);
         thd_sleep(500);
