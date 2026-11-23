@@ -12,6 +12,11 @@
      big:<n>    n more bytes of report (the report path under load)
      lines:<n>  n numbered lines on the serial line (forwarded live to the PC on the adapter)
      file:<p>   open /pc/<p> from the PC's file service, read it whole, report its length, time and SHA-256
+                (with the heap in use before the open and after the close: the read-ahead block freed at last close)
+     fileopen:<p> open /pc/<p>, read 100 bytes through the C library (the read-ahead block) and leave it open: the
+                way out frees the block ("cl-files: ... read-ahead freed at exit"; lane ql-fix-dc)
+     endnolink  stop the link just before cl_exit: END cannot be sent, so the way out must not wait for ring room
+                (the exit-time bound; the report comes back from the copy kept in RAM; lane ql-fix-dc)
      cdfile:<p> the same from the loader's disc (/cd/<p>), for the load-time comparison
      still      one 640x480 test still (colour bars) to the PC; stills:<n> n of them
      screen:<n> n grabs of the screen itself (the frame buffer, bars drawn on its lower part) to the PC
@@ -37,6 +42,7 @@
 #include "cl_client.h"
 #include "dcql_loop.h"
 #include "dcql_hw.h"
+#include "dcql_net.h"
 
 void dcql_bios_reboot(void) __attribute__((noreturn));   /* lib/dcql_return.c: the GDEMU image, then a reboot */
 int __real_cdrom_read_toc(cd_toc_t *toc, bool hd);
@@ -63,6 +69,7 @@ static void read_pc_file(const char *path, int cd) {
     snprintf(p, sizeof(p), "/%s/%s", cd ? "cd" : "pc", path);
     for (char *q = p; *q; ++q) if (*q == ' ') { *q = 0; break; }
     printf("file %s: opening\n", p);
+    const unsigned heap0 = (unsigned)mallinfo().uordblks;
     const uint64_t t0 = timer_ms_gettime64();
     FILE *f = fopen(p, "rb");
     if (!f) { cl_report("file %s: open refused\n", p); printf("file %s: open refused\n", p); return; }
@@ -78,7 +85,20 @@ static void read_pc_file(const char *path, int cd) {
     for (int i = 0; i < 32; ++i) snprintf(hex + 2 * i, 3, "%02x", d[i]);
     const unsigned ms = (unsigned)(timer_ms_gettime64() - t0);
     cl_report("file %s: %u bytes in %u ms sha256 %s\n", p, (unsigned)total, ms, hex);
+    cl_report("file %s: heap in use %u B before the open, %u B after the close\n", p, heap0,
+              (unsigned)mallinfo().uordblks);
     printf("file %s: %u bytes in %u ms\n", p, (unsigned)total, ms);
+}
+/* fileopen:<p>: a /pc file left open at exit, its read-ahead block in use */
+static void open_pc_file(const char *path) {
+    char p[160];
+    snprintf(p, sizeof(p), "/pc/%s", path);
+    for (char *q = p; *q; ++q) if (*q == ' ') { *q = 0; break; }
+    FILE *f = fopen(p, "rb");
+    if (!f) { cl_report("fileopen %s: open refused\n", p); return; }
+    static uint8_t b[100];
+    const size_t n = fread(b, 1, sizeof(b), f);
+    cl_report("fileopen %s: %u bytes read, left open\n", p, (unsigned)n);
 }
 
 int main(int argc, char **argv) {
@@ -148,6 +168,7 @@ int main(int argc, char **argv) {
     }
     for (const char *fp = strstr(args, "file:"); fp; fp = strstr(fp + 5, "file:"))
         read_pc_file(fp + 5, fp >= args + 2 && fp[-2] == 'c' && fp[-1] == 'd');
+    for (const char *fp = strstr(args, "fileopen:"); fp; fp = strstr(fp + 9, "fileopen:")) open_pc_file(fp + 9);
     if (has(args, "still")) {   /* "still" = one, "stills:<n>" = n, each with its own bar offset */
         static uint16_t pix[640 * 480];
         static const uint16_t bars[8] = {0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x0000};
@@ -275,5 +296,9 @@ int main(int argc, char **argv) {
     }
     say(4, "DONE: BACK TO THE LOADER");
     thd_sleep(1500);
+    if (word(args, "endnolink")) {   /* the exit-time bound (ql-fix-dc): END has no link to go out on */
+        cl_report("endnolink: link stopped at %u ms, then cl_exit\n", (unsigned)timer_ms_gettime64());
+        dcql_net_stop();
+    }
     cl_exit(0);
 }

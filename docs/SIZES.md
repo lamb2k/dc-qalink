@@ -5,7 +5,41 @@ most **73,728 B** (72 KB). It is measured by the gate (`tools/gate/sizes.py`) fr
 test program `loader/liveprog.c`, over the objects `client.o`, `cl_util.o`, `dcql_return.o`, `dcql_net_bba.o` and
 `dcql_live.o`. Tier: the link map, exact bytes.
 
-## Before and after
+## At this head (lane ql-fix-dc, 2026-11-23)
+
+| | base v0.2 1990fb9 | head of `v0.2-fix-dc` |
+|---|---|---|
+| fixed memory, link + live | 70,167 B | **70,187 B: inside** (3,541 B to spare) |
+| code and constant data | 20,421 B | 21,313 B (row 49,152) |
+| per object, code / fixed | client 11,497 / 26,922; adapter 4,324 / 24,837 | client 12,073 / 26,934; adapter 4,640 / 24,845 (live, utilities, way back unchanged) |
+| the in-game menu, `dcql_menu.o` (menu-cl.map, reported) | | 10,038 B code and constants (font 2,002 B of it), 3,988 B fixed |
+| a program with the network disc (netdisc.map, reported) | 114,591 B (ql-mem) | 114,627 B fixed, 28,207 B code; `dcql_disc.o` 6,874 / 44,440 |
+
+The 20 B: the read-ahead's hold count, its closed flag and its exit result (client), an owned flag per ring
+(adapter). Both columns: `tools/gate/sizes.py` on maps built the same way (`make -C loader`, `make -C example/...`).
+
+## Heap: what is allocated, when, and when it is freed
+
+| block | size | allocated | freed |
+|---|---|---|---|
+| the client's link thread stack | 16 KiB | `cl_init` starts the link (`thd_create_ex` without a stack pointer: KallistiOS's heap) | with the program image (the full restart or a jump) |
+| the client's grab thread stack | 8 KiB | with the link thread | with the program image |
+| the deadline thread's stack (and `diag=1`'s thread) | KallistiOS's default thread stack size | `cl_init` with a deadline (or `diag=1`) | with the program image |
+| the /pc read-ahead block (`g_ra`) | 8 KiB (`CL_FREAD_MAX`) | the first /pc open (none: small reads go to the PC unbuffered) | the last close; or on the way out of a program that leaves files open (`summary()` and `finish()`, threads still running), when no read holds it (it waits up to 200 ms; a read still waiting for the PC keeps it, and the line says "kept"). After the way out begins, reads are unbuffered. An exception's way out frees nothing (the heap may be what failed); the restart ends the image. |
+| the built-in rings (`dcql_net.c`) | 2 x 4 KiB | the first `dcql_net_start()`, only for a ring the program did not supply; both or neither (a failed second allocation frees the first; start fails with err -44) | kept across `dcql_net_stop()` and a later start (the adapter's threads stay on); freed when `dcql_net_config()` supplies the program's own rings in their place; otherwise with the program image |
+| the program's own rings | its own | the program's (static) | never by the link: borrowed |
+
+Ring changes (`dcql_net_config()` with `rx_mem` / `tx_mem`) happen only while the link is off, failed or dropped with no
+dial or hang-up thread; otherwise the current rings are kept and a log line says so. The pointers change with
+interrupts off, after a 2 ms sleep that lets a datagram copy already under way on a link thread finish. Checks: the
+host test `lib/test/run.sh` (both-or-neither, the swap frees owned and never borrowed memory; its control, the code at
+1990fb9, must fail) and the Flycast rows f-01 and f-02 (`docs/RELEASE_0.2.md`).
+
+Close, stop and restart: `close` of the last /pc file frees the read-ahead; `dcql_net_stop()` frees nothing (the
+adapter keeps its socket and threads for a quick restart); `dcql_net_shutdown()` before a jump stops the adapter and
+frees nothing; the full restart (BIOS reboot) and the stub's jump end the program image, heap and all.
+
+## Before and after (lane ql-mem)
 
 | | before (v0.2 2ac5297) | after (lane ql-mem) |
 |---|---|---|
@@ -45,7 +79,7 @@ each (function tier):
 | `g_rec` | dcql_live.o | 11,264 | live records, 128 x 88 B (about 2 s at 60 pictures a second) | kept (a smaller ring drops records) |
 | `g_ra` | client.o | 8,192 | the /pc read-ahead block (CL_FREAD_MAX) | **heap, behind the feature**: allocated when the first /pc file opens, freed when the last closes; without memory small reads go to the PC unbuffered |
 | `g_btx_stack` | dcql_net_bba.o | 8,192 | the adapter's send thread's stack | kept (high-water mark reported, below) |
-| `g_rx_def`, `g_tx_def` | dcql_net_bba.o | 4,096 each | the built-in rings, for a program that supplies none | **heap at start**: allocated by the first `dcql_net_start()` only when the program supplied no rings; never freed |
+| `g_rx_def`, `g_tx_def` | dcql_net_bba.o | 4,096 each | the built-in rings, for a program that supplies none | **heap at start**: allocated by the first `dcql_net_start()` only when the program supplied no rings (ql-fix-dc: both or neither, and freed when the program's own rings replace them; "Heap" above) |
 | `g_tr` | dcql_live.o | 3,072 | trace events, 64 x 48 B | kept |
 | `g_lg` | dcql_live.o | 2,048 | log lines, 16 x 128 B | kept |
 | `g_bpkt_rx` | dcql_net_bba.o | 1,408 | the receive thread's datagram buffer | on the receive thread's static stack |
@@ -60,7 +94,7 @@ each (function tier):
 | `g_pcf` | client.o | 256 | 16 open /pc files | kept |
 
 Not in the row, for reading: the client's link thread (16 KiB) and grab thread (8 KiB) stacks come from KallistiOS's
-heap when the link starts (`thd_create_ex` without a stack pointer), as before.
+heap (`thd_create_ex` without a stack pointer), as before ("Heap" above).
 
 ## Stacks and rings as used (Flycast, function tier: the `cl-mem:` line of each run)
 

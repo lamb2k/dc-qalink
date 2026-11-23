@@ -21,6 +21,7 @@
 #include "dcql_net.h"
 #include "cl_client.h"
 #include "dcql_disc.h"
+#include "dcql_dirent.h"
 
 #define NREQ DCQL_DISC_REQS
 #define NFILE DCQL_DISC_FILES
@@ -506,14 +507,16 @@ static const dirent_t *d_readdir(void *h) {
     df_t *f = fget(h);
     const dirent_t *out = NULL;
     if (f && f->side == DCQL_SIDE_PC && f->dir) {
-        uint8_t hd[6];
-        if (pc_read_locked(f, hd, 6) == 6) {
+        uint8_t hd[DCQL_DIRENT_HEAD];
+        uint32_t keep, skip;
+        if (pc_read_locked(f, hd, DCQL_DIRENT_HEAD) != DCQL_DIRENT_HEAD ||
+            dcql_dirent_take(f->pos, f->size, cl_rd16(hd + 4), NAME_MAX - 1, &keep, &skip)) {
+            f->pos = f->size;   /* a short head or a truncated entry: rejected, and the listing ends here */
+        } else {
             const uint32_t size = cl_rd32(hd);
-            uint16_t n = cl_rd16(hd + 4);
             char name[NAME_MAX];
-            const uint16_t keep = n < NAME_MAX - 1 ? n : NAME_MAX - 1;
-            if (pc_read_locked(f, (uint8_t *)name, keep) == keep) {
-                if (n > keep) f->pos += n - keep;
+            if (pc_read_locked(f, (uint8_t *)name, keep) == (ssize_t)keep) {
+                f->pos += skip;   /* within the listing: dcql_dirent_take checked the whole name's extent */
                 name[keep] = 0;
                 memset(&f->de, 0, sizeof(f->de));
                 memcpy(f->de.name, name, keep + 1u);

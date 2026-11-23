@@ -5,13 +5,14 @@
 # Options: EX_SCRIPT=1 (the pad script, stills and limits over the serial line; the lane's Flycast runs),
 #          EX_PC=a.b.c.d (the PC the link sends to; default: learn it from the PC's first datagram),
 #          EX_PORT / EX_LPORT (UDP ports, default 52040 / 52040), EX_IP (the console's static address on the adapter;
-#          default DHCP).
+#          default DHCP), EX_GW (its gateway with a static address; default none: the PC on the same network).
 OUT ?= build
 EX_SCRIPT ?= 0
 EX_PC ?= peer
 EX_PORT ?= 52040
 EX_LPORT ?= 52040
 EX_IP ?=
+EX_GW ?=
 TOP := $(abspath ../..)
 
 # the default goal first: dcql.mk and client.mk below bring rules of their own
@@ -25,7 +26,7 @@ DCQL_OBJDIR := $(OUT)/dcql
 include $(DCQL_DIR)/dcql.mk
 include $(TOP)/loader/client.mk
 
-EX_IPDEF := $(if $(EX_IP),-DEX_IP='"$(EX_IP)"',-DEX_IP=0)
+EX_IPDEF := $(if $(EX_IP),-DEX_IP='"$(EX_IP)"',-DEX_IP=0) $(if $(EX_GW),-DEX_GW='"$(EX_GW)"',-DEX_GW=0)
 EX_DEFS := -DEX_SCRIPT=$(EX_SCRIPT) -DEX_PC='"$(EX_PC)"' -DEX_PORT=$(EX_PORT) -DEX_LPORT=$(EX_LPORT) $(EX_IPDEF)
 HDRS := demo.h $(DCQL_DIR)/dcql_menu.h $(DCQL_DIR)/font/spleen8x16.h
 

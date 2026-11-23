@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     lc.lport = EX_LPORT;
     lc.ip = EX_IP;
     lc.mask = "255.255.255.0";
-    lc.gw = "192.168.1.1";
+    lc.gw = EX_GW;   /* make EX_GW=a.b.c.d; none by default (the PC on the same network) */
     lc.log = link_log;
     dcql_config(&lc);
     dcql_start();

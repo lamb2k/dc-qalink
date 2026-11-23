@@ -80,13 +80,13 @@ the normalisation (centre, scale), flags and the palette format. Texture data is
 ## Bridge endpoints (contract 1, additive)
 | Method and path | Level | What |
 |---|---|---|
-| `POST /v0/assets` | control | `{name, base64}` or `{path}` (a file on the bridge's PC; an OBJ's .mtl and textures are read beside it) or multipart with an `asset` file; options `format` (`auto`, `rgb565`, `argb1555`, `argb4444`, `vq`, `pal4`, `pal8`), `mips` (true), `send` (false). Answers the **asset record** |
+| `POST /v0/assets` | control | `{name, base64}` or `{path}` (a file on the bridge's PC below `--asset-root`, or `--files` when that is not given; with neither, a path import is **403** and uploads still work; an OBJ's .mtl and textures are read beside it, below the same root, at most 16 MiB of dependencies in all) or multipart with an `asset` file; options `format` (`auto`, `rgb565`, `argb1555`, `argb4444`, `vq`, `pal4`, `pal8`), `mips` (true), `send` (false). Answers the **asset record** |
 | `GET /v0/assets` | read | `{assets: [record], viewer: {linked, run, loaded, state, vfree, tier}, budget: {ram, vram, vbuf}, watching: [...]}` |
 | `GET /v0/assets/{id}` | read | The record; `/file` the DQA1 bytes; `/render.png?yaw&pitch&dist&fov&view&filter&bg&cull` the PC render alone |
 | `POST /v0/assets/viewer` | run | Push the viewer through the loader (`--viewer <viewer.elf>`) and wait for its link |
 | `POST /v0/assets/{id}/view` | control (run with `start_viewer: true`) | The round trip with the camera JSON above: send if not loaded, set the view, measure 60 pictures, grab, render, compare. Answers the **view** |
 | `GET /v0/assets/views` | read | Every view, newest first; `/v0/assets/views/{view}/(pc|console|diff|side).png` |
-| `POST /v0/assets/watch` | control | `{path, send, camera...}`: a saved file is converted again and, with the viewer linked, sent and viewed with the last camera |
+| `POST /v0/assets/watch` | control | `{path, send, camera...}` (the path below the same root as a path import): a saved file is converted again and, with the viewer linked, sent and viewed with the last camera |
 
 **Asset record:** `id` (first 12 hex of the DQA1's SHA-256), `name`, `kind` (`texture` / `model`), `state` (the Assets
 editor's: `checked`, `refused`, `live`; `sent` while the console loads), `tris`, `strips`, `stripVerts`, `texW`, `texH`,

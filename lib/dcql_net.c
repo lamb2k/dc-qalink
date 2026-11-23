@@ -91,42 +91,17 @@ static bool thread_busy(tid_t id) {
     return busy;
 }
 
-/* ---- single-producer single-consumer rings of datagrams: [u16 length][bytes]
-   The program's own ring memory (dcql_net_config), or the built-in 4 KiB rings, allocated once by the first
-   dcql_net_start() only when the program supplied none (lane ql-mem: a program with its own rings no longer carries
-   8 KiB of unused built-in rings in its fixed memory); never freed, so there is no heap use after the link's start. */
-typedef struct { unsigned char *buf; unsigned size; volatile unsigned head, tail; } ring_t;
+/* ---- single-producer single-consumer rings of datagrams (dcql_ring.h, with who owns their memory)
+   The program's own ring memory (dcql_net_config: borrowed, never freed here), or the built-in 4 KiB rings (owned),
+   allocated by dcql_net_start() only when the program supplied none (lane ql-mem: a program with its own rings carries
+   no unused built-in rings). Lifetimes (docs/SIZES.md "Heap"): owned rings stay across dcql_net_stop() and a later
+   start (the adapter's threads keep running); a dcql_net_config() with the program's own rings frees the owned ones it
+   replaces (lane ql-fix-dc); the full restart or a jump ends the program image and its heap. */
+#define DCQL_RING_DGRAM DCQL_NET_DGRAM
+#include "dcql_ring.h"
 #define DEF_RING 4096u
-static ring_t g_rx = {NULL, DEF_RING, 0, 0}, g_tx = {NULL, DEF_RING, 0, 0};
-static int rings_ready(void) {
-    if (!g_rx.buf) { g_rx.buf = memalign(32, DEF_RING); g_rx.size = DEF_RING; g_rx.head = g_rx.tail = 0; }
-    if (!g_tx.buf) { g_tx.buf = memalign(32, DEF_RING); g_tx.size = DEF_RING; g_tx.head = g_tx.tail = 0; }
-    return g_rx.buf && g_tx.buf;
-}
-static unsigned ring_used(const ring_t *r) { return r->head - r->tail; }
-static bool ring_put(ring_t *r, const void *p, unsigned n) {
-    if (!p || !n || n > DCQL_NET_DGRAM || ring_used(r) + n + 2 > r->size) return false;
-    unsigned h = r->head;
-    r->buf[h++ % r->size] = (unsigned char)n;
-    r->buf[h++ % r->size] = (unsigned char)(n >> 8);
-    for (unsigned i = 0; i < n; ++i) r->buf[h++ % r->size] = ((const unsigned char *)p)[i];
-    __asm__ __volatile__("" ::: "memory");
-    r->head = h;
-    return true;
-}
-/* -1 empty; -2 retired whole because it did not fit */
-static int ring_get(ring_t *r, void *p, unsigned max) {
-    if (r->head == r->tail) return -1;
-    unsigned t = r->tail;
-    unsigned n = r->buf[t++ % r->size];
-    n |= (unsigned)r->buf[t++ % r->size] << 8;
-    if (n > max || !p) { __asm__ __volatile__("" ::: "memory"); r->tail = t + n; return -2; }
-    for (unsigned i = 0; i < n; ++i, ++t) ((unsigned char *)p)[i] = r->buf[t % r->size];
-    __asm__ __volatile__("" ::: "memory");
-    r->tail = t;
-    return (int)n;
-}
-static void ring_clear(ring_t *r) { r->tail = r->head; }
+static ring_t g_rx = {NULL, DEF_RING, 0, 0, 0}, g_tx = {NULL, DEF_RING, 0, 0, 0};
+static int rings_ready(void) { return rings_alloc(&g_rx, &g_tx, DEF_RING); }
 
 /* a received datagram: the peer's port, and its address once known (learnt from the first one) */
 static volatile unsigned g_rx_refused;
@@ -693,6 +668,33 @@ static void copy_str(char *d, size_t n, const char *s) {
     if (s && s[0]) { strncpy(d, s, n - 1); d[n - 1] = 0; }
 }
 
+/* the program's own rings in place of the current ones (lane ql-fix-dc, audit item 4). Only while the link is not in
+   use (off, failed or dropped, no dial or hang-up thread): otherwise the current rings are kept and a line says so.
+   When the link's threads exist (the adapter's stay on after a stop) they never put into a ring of a link that is not
+   up, and a put or get under way finishes within its one datagram copy: one 2 ms sleep lets it, then the pointers
+   change with interrupts off (one CPU: no thread sees half a swap) and the owned memory they replace is freed. */
+static void rings_swap(unsigned char *rx, unsigned rxn, unsigned char *tx, unsigned txn) {
+    const int st = g_state;
+    if ((st != DCQL_LINK_OFF && st != DCQL_LINK_FAILED && st != DCQL_LINK_DROPPED) || dcql_net_busy()) {
+        logf_("dcql: rings kept (link in use, state %d)", st);
+        return;
+    }
+    int threads = 0;
+#if DCQL_NET_HAVE_BBA
+    threads |= g_bthreads;
+#endif
+#if DCQL_NET_HAVE_MODEM
+    threads |= thread_busy(g_ppp_tid);
+#endif
+    if (threads) thd_sleep(2);
+    const irq_mask_t m = irq_disable();
+    unsigned char *const orx = rx ? ring_take(&g_rx, rx, rxn, 0) : NULL;
+    unsigned char *const otx = tx ? ring_take(&g_tx, tx, txn, 0) : NULL;
+    irq_restore(m);
+    if (orx) DCQL_RING_FREE(orx);
+    if (otx) DCQL_RING_FREE(otx);
+}
+
 /* ---- API */
 void dcql_net_config(const dcql_net_config_t *c) {
     if (!c) return;
@@ -707,8 +709,9 @@ void dcql_net_config(const dcql_net_config_t *c) {
     if (c->lport) g_lport = c->lport;
     g_cfg_ip = c->ip; g_cfg_mask = c->mask; g_cfg_gw = c->gw;
     g_dhcp_first = c->dhcp_first;
-    if (c->rx_mem && c->rx_size >= 2048) { g_rx.buf = c->rx_mem; g_rx.size = c->rx_size; g_rx.head = g_rx.tail = 0; }
-    if (c->tx_mem && c->tx_size >= 2048) { g_tx.buf = c->tx_mem; g_tx.size = c->tx_size; g_tx.head = g_tx.tail = 0; }
+    const int rx = c->rx_mem && c->rx_size >= 2048 && c->rx_mem != g_rx.buf;
+    const int tx = c->tx_mem && c->tx_size >= 2048 && c->tx_mem != g_tx.buf;
+    if (rx || tx) rings_swap(rx ? c->rx_mem : NULL, c->rx_size, tx ? c->tx_mem : NULL, c->tx_size);
     g_ppp_wait_ms = c->ppp_wait_ms;
     g_logfn = c->log;
 }

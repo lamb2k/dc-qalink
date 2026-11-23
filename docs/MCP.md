@@ -18,5 +18,8 @@ only the tools at or below its level. Every call is logged with who made it (the
 level in `mcp-calls.log` (`~/.dc-qalink/bridge`), and reaches the bridge's `calls.log` as `X-By: mcp <client>`.
 `grab_screen` answers with a PNG image block and the picture number; every number carries its tier.
 
+Files: `push_build` and `run_and_wait` read a `path` only below `QALINK_MCP_ROOT` (default: the MCP server's working
+folder); any other path is refused (403) before it is read.
+
 Test: `tests/test_mcp.py` (a real MCP client: list, link_status, bad arguments refused, push_build, grab_screen,
 live_summary, list_presets, level read refuses push_build), against the simulated console or a running bridge.

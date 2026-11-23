@@ -2,7 +2,7 @@
  * draws a tiny QA menu: a list of jump-to presets (pad: up/down + A to jump, X to hang up or redial) and a status line
  * that follows the link through its states. BIOS font straight into the framebuffer; no PVR, no assets. MIT licence.
  *
- * Build-time settings (make CFLAGS_EXTRA=...): -DEX_HOST=\"10.0.0.1\" (relay address, default: learn the peer)
+ * Build-time settings (make CFLAGS_EXTRA=...): -DEX_HOST=\"192.0.2.1\" (relay address, default: learn the peer)
  * -DEX_LPORT=52042 (console port; use a different port from the relay's under Flycast's modem emulation). */
 #include <kos.h>
 #include <dc/biosfont.h>
