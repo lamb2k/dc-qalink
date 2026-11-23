@@ -34,8 +34,11 @@ typedef struct {
     int dhcp_first;             /* adapter with ip set: 1 ask DHCP for that address first (as KOS's net_init(ip) does
                                    for dcload-ip), 2 ask DHCP for any address first; the static address only if no DHCP
                                    server answers. 0: the static address alone */
-    unsigned char *rx_mem, *tx_mem;   /* ring memory (static); NULL = the built-in 4 KiB rings, allocated once by the
-                                         first dcql_net_start() (never freed; start fails with err -44 without memory) */
+    unsigned char *rx_mem, *tx_mem;   /* ring memory (the program's, at least 2,048 B each, never freed by the link);
+                                         NULL = keep the current rings, or the built-in 4 KiB rings that the first
+                                         dcql_net_start() allocates (both or neither: start fails with err -44 without
+                                         memory). Rings change only while the link is off, failed or dropped; a change
+                                         frees the built-in rings it replaces. Lifetimes: docs/SIZES.md "Heap" */
     unsigned rx_size, tx_size;
     unsigned ppp_wait_ms;       /* modem: bound on PPP negotiation (0 = unbounded, as dc-qalink 0.1) */
     void (*log)(const char *line);

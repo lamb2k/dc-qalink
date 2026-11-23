@@ -226,6 +226,18 @@ static void link_out_wait(uint8_t type, uint32_t a, uint16_t b, const void *p, u
         thd_sleep(1);
     }
 }
+/* the END path's sender (lane ql-fix-dc, audit item 2): waits for ring room until `until_ms`, and not at all on a link
+   that is not up (its sends are refused at once, so waiting cannot help). 1 queued, 0 not. */
+static int link_out_until(uint8_t type, uint32_t a, uint16_t b, const void *p, uint16_t n, uint64_t until_ms) {
+    uint8_t d[CL_DGRAM_MAX];
+    const size_t len = cl_frame(d, type, H->h.run_id, a, b, p, n);
+    if (!len) return 0;
+    for (;;) {
+        if (dcql_net_send(d, (unsigned)len)) return 1;
+        if (dcql_net_state() != DCQL_LINK_UP || timer_ms_gettime64() >= until_ms) return 0;
+        thd_sleep(1);
+    }
+}
 static int live_send(uint8_t type, uint32_t a, uint16_t b, const void *p, uint16_t n) {
     uint8_t d[CL_DGRAM_MAX];
     const size_t len = cl_frame(d, type, H->h.run_id, a, b, p, n);
@@ -504,6 +516,37 @@ static uint8_t *g_ra;
 static int g_pcf_open;
 static const pcf_t *g_ra_file;
 static uint32_t g_ra_handle, g_ra_off, g_ra_len;
+/* lane ql-fix-dc (audit item 4): a read using the block holds it (g_ra_busy), so it is freed only when no read is
+   under way: at the last close, and on the way out of a program that leaves files open (ra_release from summary() and
+   finish(), threads still running). After the way out begins, reads go to the PC unbuffered. An exception's way out
+   frees nothing (the heap may be what failed; the full restart ends the image). */
+static volatile int g_ra_busy, g_ra_closed;
+static int ra_hold(void) {
+    const irq_mask_t m = irq_disable();
+    const int ok = g_ra && !g_ra_closed;
+    if (ok) ++g_ra_busy;
+    irq_restore(m);
+    return ok;
+}
+static void ra_drop(void) { const irq_mask_t m = irq_disable(); --g_ra_busy; irq_restore(m); }
+/* frees the block when no read holds it: 1 freed now, 0 none to free, -1 kept (a read under way) */
+static int ra_free(void) {
+    const irq_mask_t m = irq_disable();
+    uint8_t *const p = g_ra_busy ? NULL : g_ra;
+    const int held = g_ra_busy && g_ra;
+    if (p) { g_ra = NULL; g_ra_file = NULL; }
+    irq_restore(m);
+    if (p) free(p);
+    return p ? 1 : held ? -1 : 0;
+}
+static int g_ra_exit = 2;   /* ra_release's result: 1 freed at exit, 0 none held, -1 kept, 2 not run */
+static void ra_release(void) {
+    if (g_ra_exit != 2 && g_ra_exit != -1) return;
+    g_ra_closed = 1;
+    for (int i = 0; i < 20 && g_ra_busy; ++i) thd_sleep(10);   /* at most 200 ms for a read under way */
+    const int r = ra_free();
+    if (g_ra_exit != 1) g_ra_exit = r;
+}
 static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
     (void)vfs;
     if ((mode & O_MODE_MASK) != O_RDONLY || (mode & O_DIR)) { errno = EROFS; return NULL; }
@@ -520,7 +563,8 @@ static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
     for (int i = 0; i < 16; ++i)
         if (!g_pcf[i].used) {
             g_pcf[i] = (pcf_t){1, g_req_handle, g_req_size, 0};
-            if (!g_pcf_open++ && !g_ra) g_ra = (uint8_t *)memalign(32, CL_FREAD_MAX);
+            ++g_pcf_open;
+            if (!g_ra && !g_ra_closed) g_ra = (uint8_t *)memalign(32, CL_FREAD_MAX);   /* none: unbuffered reads */
             ++g_st.files_opened;
             return (void *)(intptr_t)(i + 1);
         }
@@ -537,11 +581,7 @@ static int pc_close(void *h) {
     link_out(CL_FCLOSE, f->handle, 0, NULL, 0);
     if (g_ra_file == f) g_ra_file = NULL;
     f->used = 0;
-    if (g_pcf_open > 0 && !--g_pcf_open && g_ra) {
-        g_ra_file = NULL;
-        free(g_ra);
-        g_ra = NULL;
-    }
+    if (g_pcf_open > 0 && !--g_pcf_open) (void)ra_free();
     return 0;
 }
 static ssize_t pc_read(void *h, void *buf, size_t cnt) {
@@ -551,18 +591,19 @@ static ssize_t pc_read(void *h, void *buf, size_t cnt) {
     if (cnt > f->size - f->pos) cnt = f->size - f->pos;
     const uint64_t t0 = timer_ms_gettime64();
     size_t done = 0;
-    if (cnt < CL_FREAD_MAX && g_ra) {
+    if (cnt < CL_FREAD_MAX && ra_hold()) {
         if (!(g_ra_file == f && g_ra_handle == f->handle && f->pos >= g_ra_off && f->pos + cnt <= g_ra_off + g_ra_len)) {
             const uint32_t n = f->size - f->pos < CL_FREAD_MAX ? f->size - f->pos : CL_FREAD_MAX;
             uint8_t pl[12];
             cl_wr32(pl, f->handle); cl_wr32(pl + 4, f->pos); cl_wr32(pl + 8, n);
             g_ra_file = NULL;
-            if (pc_request(CL_FREAD, pl, sizeof(pl), g_ra, n)) { errno = EIO; return -1; }
+            if (pc_request(CL_FREAD, pl, sizeof(pl), g_ra, n)) { ra_drop(); errno = EIO; return -1; }
             g_ra_file = f; g_ra_handle = f->handle; g_ra_off = f->pos; g_ra_len = n;
             ++g_st.reads;
             g_st.read_bytes += n;
         }
         memcpy(buf, g_ra + (f->pos - g_ra_off), cnt);
+        ra_drop();
         f->pos += cnt;
         g_st.read_ms += (unsigned)(timer_ms_gettime64() - t0);
         return (ssize_t)cnt;
@@ -778,9 +819,14 @@ static void end_head(cl_end_t *e, uint32_t tail_max, uint32_t path) {
     e->link_up_ms = g_link_up ? g_link_up_ms : 0;
     e->path = path;
 }
-/* from a thread: the head and the tail through the link's ring, then the PC's ENDACK awaited (about 2 s at most,
-   the whole END sent again once when it misses bytes or does not answer). From the link thread itself the answers
-   are read here. Returns 1 when the PC acknowledged the whole END. */
+/* from a thread: the head and the tail through the link's ring, then the PC's ENDACK awaited (1 s a round, the whole
+   END sent again once when it misses bytes or does not answer). From the link thread itself the answers are read
+   here. Returns 1 when the PC acknowledged the whole END.
+   Exit-time bound (lane ql-fix-dc, audit item 2): the whole of it, both rounds with their waits for ring room and for
+   ENDACK, ends by END_LINK_MS after it starts; on a link that is not up it ends at once (nothing can be sent). So a PC
+   that has gone away delays the full restart by at most END_LINK_MS (plus one 1 ms sleep and one datagram's copy);
+   before, each of the up to 33 datagrams of a round could wait 2,000 x 1 ms for ring room. */
+#define END_LINK_MS 4000u
 static int end_send_link(void) {
     cl_end_t e;
     end_head(&e, END_TAIL_MAX, 1);
@@ -791,15 +837,19 @@ static int end_send_link(void) {
     uint8_t *const d = g_raw;
     const unsigned dmax = CL_DGRAM_MAX + 8;
     const int on_link = thd_get_current() == g_link_thd;
+    const uint64_t until = timer_ms_gettime64() + END_LINK_MS;
     g_endack = 0;
     for (int round = 0; round < 2; ++round) {
-        for (uint32_t off = 0; off < e.sent_len; off += CL_CHUNK) {
+        int ok = 1;
+        for (uint32_t off = 0; ok && off < e.sent_len; off += CL_CHUNK) {
             const uint32_t n = e.sent_len - off < CL_CHUNK ? e.sent_len - off : CL_CHUNK;
-            link_out_wait(CL_END, e.sent_off + off, 0, H->report + e.sent_off + off, (uint16_t)n);
+            ok = link_out_until(CL_END, e.sent_off + off, 0, H->report + e.sent_off + off, (uint16_t)n, until);
         }
-        link_out_wait(CL_END, CL_END_HEAD, (uint16_t)((e.sent_len + CL_CHUNK - 1) / CL_CHUNK), hb, sizeof(hb));
+        if (!ok || !link_out_until(CL_END, CL_END_HEAD, (uint16_t)((e.sent_len + CL_CHUNK - 1) / CL_CHUNK), hb,
+                                   sizeof(hb), until))
+            return 0;   /* the link is down or the time is up */
         const uint64_t t0 = timer_ms_gettime64();
-        while (!g_endack && timer_ms_gettime64() - t0 < 1000) {
+        while (!g_endack && timer_ms_gettime64() - t0 < 1000 && timer_ms_gettime64() < until) {
             if (!on_link) { thd_sleep(10); continue; }
             const int n = dcql_net_recv_wait(d, dmax, 10);   /* only ENDACK is taken now */
             if (n > (int)CL_HDR && cl_unframe(d, (size_t)n) >= 0 && d[3] == CL_ENDACK && cl_rd32(d + 8) == H->h.run_id) {
@@ -868,6 +918,7 @@ static void __attribute__((noreturn)) finish(uint32_t state, int code) {
     if (first) {
         wdt_stop();
         seal(state, code);
+        if (threads_ok) { irq_restore(m); ra_release(); irq_disable(); }   /* the /pc read-ahead block (ql-fix-dc) */
         if (RET_REBOOT && g_link_up) {
             if (threads_ok) { irq_restore(m); end = end_send_link(); irq_disable(); }
             else { end_send_raw(); end = 2; }
@@ -891,6 +942,12 @@ static void __attribute__((noreturn)) finish(uint32_t state, int code) {
 /* the closing lines (not from an exception handler: they format text) */
 static void summary(void) {
     if (g_leaving) return;
+    if (g_st.files_opened) {   /* ql-fix-dc: the read-ahead block's way out, for the Flycast row f-02 */
+        const int open = g_pcf_open;
+        ra_release();
+        cl_report("cl-files: opened %u, open at exit %d, read-ahead %s\n", (unsigned)g_st.files_opened, open,
+                  g_ra_exit == 1 ? "freed at exit" : g_ra_exit == 0 ? "none held at exit" : "kept (a read under way)");
+    }
     cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us; WTCSR at start %02x%s, after arming %02x count %u, "
               "now %02x count %u\n", g_wdt_armed ? "armed (manual reset)" : "measured only", (unsigned)g_wdt_feeds,
               (unsigned)g_wdt_gap_us, g_wdt_csr0,
