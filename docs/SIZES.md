@@ -5,18 +5,21 @@ most **73,728 B** (72 KB). It is measured by the gate (`tools/gate/sizes.py`) fr
 test program `loader/liveprog.c`, over the objects `client.o`, `cl_util.o`, `dcql_return.o`, `dcql_net_bba.o` and
 `dcql_live.o`. Tier: the link map, exact bytes.
 
-## At this head (lane ql-fix-dc, 2026-11-23)
+## At this head (lane ql-fix-dc round 2, 2026-11-23)
 
-| | base v0.2 1990fb9 | head of `v0.2-fix-dc` |
-|---|---|---|
-| fixed memory, link + live | 70,167 B | **70,187 B: inside** (3,541 B to spare) |
-| code and constant data | 20,421 B | 21,313 B (row 49,152) |
-| per object, code / fixed | client 11,497 / 26,922; adapter 4,324 / 24,837 | client 12,073 / 26,934; adapter 4,640 / 24,845 (live, utilities, way back unchanged) |
-| the in-game menu, `dcql_menu.o` (menu-cl.map, reported) | | 10,038 B code and constants (font 2,002 B of it), 3,988 B fixed |
-| a program with the network disc (netdisc.map, reported) | 114,591 B (ql-mem) | 114,627 B fixed, 28,207 B code; `dcql_disc.o` 6,874 / 44,440 |
+| | base v0.2 1990fb9 | round 1, c9b8468 | round 2, `v0.2-fix-dc2` 214a15f |
+|---|---|---|---|
+| fixed memory, link + live | 70,167 B | 70,187 B | **70,211 B: inside** (3,517 B to spare) |
+| code and constant data | 20,421 B | 21,313 B | 21,605 B (row 49,152) |
+| per object, code / fixed | client 11,497 / 26,922; adapter 4,324 / 24,837 | client 12,073 / 26,934; adapter 4,640 / 24,845 | client 11,997 / 26,946; adapter 5,008 / 24,857 (live, utilities, way back unchanged) |
+| the in-game menu, `dcql_menu.o` (menu-cl.map, reported) | | 10,038 B code and constants (font 2,002 B of it), 3,988 B fixed | not re-measured |
+| a program with the network disc (netdisc.map, reported) | 114,591 B (ql-mem) | 114,627 B fixed, 28,207 B code; `dcql_disc.o` 6,874 / 44,440 | not re-measured (the row's objects add 292 B code, 24 B fixed) |
 
-The 20 B: the read-ahead's hold count, its closed flag and its exit result (client), an owned flag per ring
-(adapter). Both columns: `tools/gate/sizes.py` on maps built the same way (`make -C loader`, `make -C example/...`).
+Round 1's 20 B: the read-ahead's hold count, its closed flag and its exit result (client), an owned flag per ring
+(adapter). Round 2's 24 B: the read-ahead's mutex in place of the count (client) and the API mutex (adapter); its
+292 B of code are the ring exclusion around every access, the wrapped copies and the API wrappers. All columns:
+`tools/gate/sizes.py` on maps built the same way (`make -C loader`, `make -C example/...`); round 2 from the gate's
+measuring run on 214a15f.
 
 ## Heap: what is allocated, when, and when it is freed
 
@@ -25,15 +28,23 @@ The 20 B: the read-ahead's hold count, its closed flag and its exit result (clie
 | the client's link thread stack | 16 KiB | `cl_init` starts the link (`thd_create_ex` without a stack pointer: KallistiOS's heap) | with the program image (the full restart or a jump) |
 | the client's grab thread stack | 8 KiB | with the link thread | with the program image |
 | the deadline thread's stack (and `diag=1`'s thread) | KallistiOS's default thread stack size | `cl_init` with a deadline (or `diag=1`) | with the program image |
-| the /pc read-ahead block (`g_ra`) | 8 KiB (`CL_FREAD_MAX`) | the first /pc open (none: small reads go to the PC unbuffered) | the last close; or on the way out of a program that leaves files open (`summary()` and `finish()`, threads still running), when no read holds it (it waits up to 200 ms; a read still waiting for the PC keeps it, and the line says "kept"). After the way out begins, reads are unbuffered. An exception's way out frees nothing (the heap may be what failed); the restart ends the image. |
+| the /pc read-ahead block (`g_ra`, `loader/cl_ra.h`) | 8 KiB (`CL_FREAD_MAX`) | the first /pc open (none: small reads go to the PC unbuffered) | the last close; or on the way out of a program that leaves files open (`summary()` and `finish()`, threads still running), once it can take the block's lock (it waits up to 200 ms; a read still waiting for the PC keeps it, and the line says "kept"). After the way out begins, reads are unbuffered. An exception's way out frees nothing (the heap may be what failed); the restart ends the image. |
 | the built-in rings (`dcql_net.c`) | 2 x 4 KiB | the first `dcql_net_start()`, only for a ring the program did not supply; both or neither (a failed second allocation frees the first; start fails with err -44) | kept across `dcql_net_stop()` and a later start (the adapter's threads stay on); freed when `dcql_net_config()` supplies the program's own rings in their place; otherwise with the program image |
 | the program's own rings | its own | the program's (static) | never by the link: borrowed |
 
 Ring changes (`dcql_net_config()` with `rx_mem` / `tx_mem`) happen only while the link is off, failed or dropped with no
-dial or hang-up thread; otherwise the current rings are kept and a log line says so. The pointers change with
-interrupts off, after a 2 ms sleep that lets a datagram copy already under way on a link thread finish. Checks: the
-host test `lib/test/run.sh` (both-or-neither, the swap frees owned and never borrowed memory; its control, the code at
-1990fb9, must fail) and the Flycast rows f-01 and f-02 (`docs/RELEASE_0.2.md`).
+dial or hang-up thread; otherwise the current rings are kept and a log line says so. `dcql_net_config`, `_start`,
+`_stop` and `_shutdown` run one at a time (a mutex), so no start or stop comes between that check and the swap.
+Every access to a ring (put, get, clear, the queued count) and the swap itself run inside one exclusion, interrupts
+off, each access one datagram copied in at most two `memcpy` runs (`lib/dcql_ring.h`, lane ql-fix-dc round 2). So
+when the swap returns no thread is inside the old memory: the owned rings it replaces are freed at once, and a
+program may free or reuse its own earlier rings as soon as `dcql_net_config()` returns. The /pc read-ahead block has
+one lock over its bookkeeping, its fetch and its copy (a read holds it from its check to its copy), its allocation and
+its free (`loader/cl_ra.h`). Checks: the host tests `lib/test/run.sh`: `host_lib` (both-or-neither, the swap frees
+owned and never borrowed memory; control: the 1990fb9 code) and `host_race` (ThreadSanitizer; 300 rounds of stop /
+reconfigure / start with traffic both ways, three readers through the read-ahead block and the way out; control: the
+2ff9b9d code, which tears datagrams and draws ThreadSanitizer reports), and the Flycast rows f-01 and f-02
+(`docs/RELEASE_0.2.md`).
 
 Close, stop and restart: `close` of the last /pc file frees the read-ahead; `dcql_net_stop()` frees nothing (the
 adapter keeps its socket and threads for a quick restart); `dcql_net_shutdown()` before a jump stops the adapter and
