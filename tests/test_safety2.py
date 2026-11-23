@@ -690,16 +690,20 @@ def b5(R, ctx):
 # ------------------------------------------------------------------------------------------------ B7 (network disc)
 def b7(R, ctx):
     """Back-to-back programs against one disc service (the bridge keeps one for its lifetime), the whole disc from a
-    .gdi, a 1 MiB file read to its end in 4 KiB requests as lib/dcql_disc.c asks (after gate 24cd792, where
+    .gdi, a 2 MiB file read to its end in 4 KiB requests as lib/dcql_disc.c asks (after gate 24cd792, where
     back-to-back network-disc runs stalled)."""
     import hashlib
     dcql_disc, root = ctx['dcql_disc'], ctx['root']
     sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
     import netdisc_testdata as td
     out = os.path.join(root, 'b7')
-    exp = td.make(out, iso=True)
-    big = exp['BIG.BIN']
-    svc = dcql_disc.DiscService(os.path.join(out, 'base.gdi'), os.path.join(out, 'overlay'), whole=True)
+    exp = td.make(out, iso=True, big_mib=2)
+    big = dict(exp['BIG.BIN'])   # the view's BIG.BIN (the overlay's, 2 MiB)
+    base_sha = hashlib.sha256(open(os.path.join(out, 'base', 'NETDISC', 'BIG.BIN'), 'rb').read()).hexdigest()
+    gdi = os.path.join(out, 'base.gdi')
+    services = {'view': dcql_disc.DiscService(gdi, os.path.join(out, 'overlay'), whole=True),
+                'gdi': dcql_disc.DiscService(gdi, None, whole=True)}   # every byte from the .gdi's track
+    svc = services['view']
     lp = FakeLoop()
     req = [1000]
 
@@ -743,16 +747,20 @@ def b7(R, ctx):
         a, _ = program(0x0A0A0A0A, 70)     # the first program leaves 70 files open and its link is never seen to drop
         b, size_b = program(0x0B0B0B0B, 0)  # the next program: mount, then BIG.BIN (1 MiB) whole
         c, _ = program(0x0C0C0C0C, 0)
-        ok = b == 'served' and c == 'served' and size_b == (1 << 20)
+        ok = b == 'served' and c == 'served' and size_b == (2 << 20)
         return ok, 'served' if ok else 'next program refused', {'first': a, 'second': b, 'third': c,
                                                                  'bytes': size_b}
-    R.row('B7.disc_back_to_back', 'one disc service, programs back to back: each is served to the end (1 MiB whole-'
+    R.row('B7.disc_back_to_back', 'one disc service, programs back to back: each is served to the end (2 MiB whole-'
           'disc read) whatever the last left open', back_to_back)
 
     def whole_big():
+        nonlocal svc
+        svc = services['gdi']
+        big['sha256'] = base_sha
         res, size = program(0x0D0D0D0D, 0)
-        return res == 'served' and size == (1 << 20), res, {'bytes': size}
-    R.row('B7.disc_whole_big', 'positive: the whole disc from a .gdi serves a 1 MiB file to its last byte', whole_big)
+        return res == 'served' and size == (2 << 20), res, {'bytes': size}
+    R.row('B7.disc_whole_big', 'positive: the whole disc from a .gdi track serves a 2 MiB file to its last byte',
+          whole_big)
 
 
 # the control set for --controls --control-rev 24cd792 (the round-2 head the gate refused): only the rows of its fix
