@@ -13,6 +13,10 @@ EX_PORT ?= 52040
 EX_LPORT ?= 52040
 EX_IP ?=
 TOP := $(abspath ../..)
+
+# the default goal first: dcql.mk and client.mk below bring rules of their own
+all: $(OUT)/menu.elf $(OUT)/menu-cl.elf
+
 DCQL_DIR := $(TOP)/lib
 DCQL_ENABLE := 1
 DCQL_NET := bba
@@ -24,8 +28,6 @@ include $(TOP)/loader/client.mk
 EX_IPDEF := $(if $(EX_IP),-DEX_IP='"$(EX_IP)"',-DEX_IP=0)
 EX_DEFS := -DEX_SCRIPT=$(EX_SCRIPT) -DEX_PC='"$(EX_PC)"' -DEX_PORT=$(EX_PORT) -DEX_LPORT=$(EX_LPORT) $(EX_IPDEF)
 HDRS := demo.h $(DCQL_DIR)/dcql_menu.h $(DCQL_DIR)/font/spleen8x16.h
-
-all: $(OUT)/menu.elf $(OUT)/menu-cl.elf
 
 $(OUT)/main.o: main.c $(HDRS)
 	@mkdir -p $(OUT)

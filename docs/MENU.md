@@ -77,7 +77,7 @@ speed claim), **estimate**.
 
 | Limit (plan) | Measured | Tier |
 |---|---|---|
-| Code and constant data, link + live + menu: at most 48 KB | menu alone 10,018 B (9.8 KB: code 8,016, constants 2,002 of which the font is 1,520); with the client library's link and live data 27,355 B (26.7 KB): within | map |
+| Code and constant data, link + live + menu: at most 48 KB | menu alone 10,038 B (9.8 KB: code 8,036, constants 2,002 of which the font is 1,520; the whole object, every function kept, 10,780 B); with the client library's link and live data 27,375 B (26.7 KB): within. Measured on the example's default build (`make OUT=<dir>`); the linker keeps only the functions a program calls, so another program's figure differs by a few tens of bytes | map |
 | Fixed memory: at most 72 KB | menu alone 3,988 B (state, log ring 1.2 KB, QR modules 1.4 KB; the font is constant data); with link + live 128,820 B (125.8 KB): over, because the link and live data alone take 124,832 B | map |
 | Heap use after start: none | 0 B change over 100 opens, draws and closes (control: a planted 64-byte allocation in the same loop reads +7,208 B); the menu's object refers to no allocator | Flycast; object |
 | Cost each picture, menu closed: one test, under 0.01 ms | 200.9 ns a call (0.0002 ms; the empty loop 5.0 ns), one compare and branch | Flycast |
