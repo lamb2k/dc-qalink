@@ -5,9 +5,13 @@ it themselves) and HTTP (started by the bridge) behave the same. Every call is l
 here (mcp-calls.log beside the bridge's data) and in the bridge's calls.log (X-By: mcp <client>).
 
 Needs the Python MCP SDK (`pip install mcp`, 2.x)."""
-import base64, hashlib, json, os, re, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, hashlib, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import qlsafe   # noqa: E402  (pc/qlsafe.py: roots and limits, audit 2026-11-23)
+
+PROGRAM_MAX = 16 << 20   # a pushed program, at most (the bridge's HTTP body limit); checked before reading or decoding
 TOOLS_JSON = os.path.join(HERE, 'mcp-tools.json')
 LEVEL_RANK = {'read': 0, 'control': 1, 'run': 2}
 
@@ -63,10 +67,17 @@ def check_args(schema, v, at='arguments'):
     return out
 
 
+def mcp_root():
+    """The folder push_build and run_and_wait may read a `path` below: QALINK_MCP_ROOT, else the MCP's working folder
+    (the project the agent works in)."""
+    return os.environ.get('QALINK_MCP_ROOT') or os.getcwd()
+
+
 class BridgeClient:
-    def __init__(self, base, who):
+    def __init__(self, base, who, root=None):
         self.base = base.rstrip('/')
         self.who = who
+        self.root = root or mcp_root()
 
     def call(self, method, path, body=None, ctype='application/json', raw=False, timeout=60):
         data = json.dumps(body).encode() if (body is not None and ctype == 'application/json') else body
@@ -87,10 +98,20 @@ class BridgeClient:
 
     def push(self, args):
         if args.get('path'):
-            raw = open(args['path'], 'rb').read()
-            name = args.get('name') or os.path.basename(args['path'])
+            p = args['path']
+            real = qlsafe.inside(self.root, p if os.path.isabs(p) else os.path.join(self.root, p))
+            if real is None:
+                return 403, {'error': '%s is not a file below the MCP\'s root %s (QALINK_MCP_ROOT)' % (p, self.root)}
+            try:
+                raw = qlsafe.read_capped(real, PROGRAM_MAX)
+            except qlsafe.Refused as e:
+                return 413, {'error': str(e)}
+            name = args.get('name') or os.path.basename(real)
         elif args.get('base64'):
-            raw = base64.b64decode(args['base64'])
+            try:
+                raw = qlsafe.b64_capped(args['base64'], PROGRAM_MAX)
+            except qlsafe.Refused as e:
+                return 413, {'error': str(e)}
             name = args.get('name') or 'build.elf'
         else:
             return 400, {'error': 'give path (a file on the bridge\'s PC) or base64'}

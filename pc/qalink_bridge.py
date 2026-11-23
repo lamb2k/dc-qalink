@@ -14,18 +14,39 @@ import argparse, os, signal, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+def udp_host(a):
+    """The UDP bind (audit 2026-11-23, item 1): loopback unless a person opted in. --udp-host typed is used as typed;
+    --allow-lan binds every address; a --console that is this PC's own address (Flycast beacons from it) binds that
+    address; else 127.0.0.1. Without --allow-lan the bridge reads only its own PC's senders whatever is bound."""
+    if a.udp_host:
+        return a.udp_host
+    if a.allow_lan:
+        return '0.0.0.0'
+    if a.console and a.console != 'auto':
+        from bridge.core import local_addresses
+        h = a.console.partition(':')[0]
+        if h.startswith('127.') or h in local_addresses():
+            return h
+    return '127.0.0.1'
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port', type=int, default=52080, help='HTTP port on 127.0.0.1 (default 52080)')
     ap.add_argument('--data', default=os.path.join(os.path.expanduser('~'), '.dc-qalink', 'bridge'),
                     help='sessions, stills, reports, bridge.log, calls.log')
-    ap.add_argument('--udp-host', default='0.0.0.0')
+    ap.add_argument('--udp-host', default=None,
+                    help='the address the loader\'s UDP port is bound on. Default: 127.0.0.1, or the address --console '
+                         'names when it is this PC\'s own (Flycast), or every address with --allow-lan. Whatever is '
+                         'bound, without --allow-lan only datagrams from this PC\'s own addresses are read')
     ap.add_argument('--udp-port', type=int, default=52060, help='the loader\'s port, bound while the bridge runs')
     ap.add_argument('--console', default='auto', help='auto (the first loader heard) or the console\'s address')
     ap.add_argument('--device', choices=('flycast', 'console', 'mock'), help='the tier of numbers (default: guessed)')
     ap.add_argument('--files', help='folder served to programs as /pc/ (a run may name a subfolder)')
     ap.add_argument('--selftest', help='the self-test program (dc-qalink\'s testprog.elf)')
     ap.add_argument('--loader-disc', help='folder of the loader disc image served by /v0/loader')
+    ap.add_argument('--asset-root', help='the folder asset path imports and watches may read below (default: --files; '
+                                         'neither: path imports are refused, uploads still work)')
     ap.add_argument('--viewer', help='the console asset viewer (example/viewer\'s viewer.elf) for /v0/assets')
     # the network disc (lane ql-disc): a program that mounts lib/dcql_disc reads /cd from these
     ap.add_argument('--disc', help='the network disc\'s base: the built disc folder, or an image (.gdi with its tracks, .iso)')
@@ -54,10 +75,11 @@ def main(argv=None):
     from bridge.core import Bridge
     from bridge.api import serve
     log = None if a.quiet else (lambda s: print(s, flush=True))
-    b = Bridge(a.data, (a.udp_host, a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
+    b = Bridge(a.data, (udp_host(a), a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
                autoconnect=not a.no_autoconnect, only_local=not a.allow_lan, disc=a.disc, overlay=a.overlay,
                whole=a.whole)
     b.asset_plugins = a.asset_plugins
+    b.asset_root = a.asset_root
     b.viewer_elf = a.viewer
     serve(b, '127.0.0.1', a.port, a.level)
     if a.mcp_http:

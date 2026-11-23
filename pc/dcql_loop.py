@@ -31,6 +31,9 @@ Controls (tests): --corrupt stream|payload|declared sends a damaged image the co
 """
 import argparse, base64, hashlib, json, os, queue, random, shlex, socket, struct, subprocess, sys, threading, time, zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qlsafe   # noqa: E402  (the shared boundaries: roots, limits, the run's ending)
+
 MAGIC = b'CL'
 VERSION = 2
 HDR = 16
@@ -92,7 +95,29 @@ def unframe(d, any_version=False):
     return d[3], session, a, b, d[HDR:HDR + ln], d[2]
 
 
+HELLO_MIN, HELLO_LEN = 96, 164   # the oldest loader's HELLO; the current one (include/dcql_loop.h CL_HELLO_LEN)
+
+
+def decode_hello(d, want_role=None):
+    """The one HELLO decoder for a whole datagram: the frame's length, CRC and protocol version checked
+    (unframe), its type HELLO and a payload of at least HELLO_MIN bytes, then parse_hello. (hello dict, run) or None."""
+    m = unframe(d)
+    if m is None or m[0] != HELLO:
+        return None
+    try:
+        h = parse_hello(m[4])
+    except ValueError:
+        return None
+    if want_role is not None and h['role'] != want_role:
+        return None
+    return h, m[1]
+
+
 def parse_hello(p):
+    """A HELLO payload, every length from the oldest loader's 96 bytes to the current 164: fields a shorter HELLO
+    lacks read as None (or their old defaults). ValueError when it is shorter than HELLO_MIN."""
+    if len(p) < HELLO_MIN:
+        raise ValueError('HELLO of %d bytes, under %d' % (len(p), HELLO_MIN))
     v = struct.unpack_from('<16I', p, 0)
     keys = ('boot_count', 'uptime_ms', 'state', 'session', 'have', 'nchunks', 'rx_bytes', 'rx_bad', 'report_run',
             'report_state', 'report_len', 'report_crc', 'report_exit', 'console_ip', 'max_raw', 'verdict')
@@ -120,6 +145,14 @@ def parse_hello(p):
     else:
         h['stub'] = None
         h['gdemu_ver'] = None
+    # ql-core3 (164 bytes): where the way-back record came through and the rest of it (CL_HELLO_WB). Raw words so
+    # every reader decodes the same values; tools/first_console.py words them
+    if len(p) >= HELLO_LEN:
+        step, entries, gd, err, ver, where, aux, run, sense = struct.unpack_from('<BBHIIIIII', p, 136)
+        h['way_back'] = {'step': step, 'entries': entries, 'gdemu': gd, 'err': err, 'gdemu_ver': ver, 'where': where,
+                         'aux': aux, 'run': run, 'sense': sense}
+    else:
+        h['way_back'] = None
     return h
 
 
@@ -432,12 +465,11 @@ class FileService:
         self.next = 1
         self.stats = {'opened': 0, 'refused': 0, 'reads': 0, 'bytes': 0, 'first_at': None, 'last_at': None, 'files': {}}
 
+    OPEN_MAX = 32    # open files a program may hold at once (each is a descriptor on this PC)
+
     def path(self, rel):
-        rel = rel.replace('\\', '/').lstrip('/')
-        if not self.root or not rel or any(p in ('..', '') for p in rel.split('/')):
-            return None
-        p = os.path.join(self.root, *rel.split('/'))
-        return p if os.path.isfile(p) else None
+        """The real path of /pc/<rel> when its target, links followed, is a file below the root; else None."""
+        return qlsafe.confine(self.root, rel)
 
     def on_open(self, loop, run, req, payload):
         rel = payload.decode('latin-1', 'replace')
@@ -451,6 +483,11 @@ class FileService:
             return
         key = os.path.normcase(p)
         h = next((k for k, v in self.handles.items() if v[2] == key and v[3] == req), None)
+        if h is None and len(self.handles) >= self.OPEN_MAX:   # a cap on descriptors, before one more is opened
+            self.stats['refused'] += 1
+            self.stats['too_many'] = self.stats.get('too_many', 0) + 1
+            loop.send(FINFO, run, req, 0, struct.pack('<iIII', -24, 0, 0, 0))
+            return
         if h is None:   # a repeated FOPEN (lost answer) keeps its handle
             h = self.next
             self.next += 1
@@ -492,20 +529,51 @@ class FileService:
         return s
 
 
+PIX_RGB565 = 1
+STILL_W_MAX, STILL_H_MAX = 1024, 1024        # the loader sends at most 640 x 480 (loader/client.c still_send)
+STILL_PENDING = 4                            # stills being received at once, per receiver
+STILL_PENDING_BYTES = 4 << 20                # and their bytes together
+
+
+def still_head(payload):
+    """A STILL head (cl_still_head_t) checked before anything is allocated for it: 32 bytes, RGB565, a picture of
+    1..1024 x 1..1024 whose byte count is exactly width x height x 2. A dict, or None."""
+    if len(payload) < 32:
+        return None
+    index, picture, w, h, fmt, nbytes, crc, req = struct.unpack_from('<8I', payload, 0)
+    if fmt != PIX_RGB565 or not 0 < w <= STILL_W_MAX or not 0 < h <= STILL_H_MAX or nbytes != w * h * 2:
+        return None
+    return {'index': index, 'picture': picture, 'w': w, 'h': h, 'bytes': nbytes, 'crc': crc, 'req': req}
+
+
+def still_room(cur, nbytes, replacing=None):
+    """Whether one more still of nbytes fits the pending budget (count and bytes), `replacing` not counted."""
+    live = [s for k, s in cur.items() if k != replacing and not s['done']]
+    return len(live) < STILL_PENDING and sum(s['bytes'] for s in live) + nbytes <= STILL_PENDING_BYTES
+
+
 class StillSink:
     def __init__(self, out, run, log):
         self.out, self.run, self.log = out, run, log
         self.cur = {}
         self.saved = []
+        self.refused = 0
 
     def on_still(self, loop, a, b, payload):
         idx = b
         st = self.cur.get(idx)
         if a == STILL_HEAD:
-            index, picture, w, h, fmt, nbytes, crc, _ = struct.unpack('<8I', payload[:32])
-            if st is None or st['bytes'] != nbytes:
-                self.cur[idx] = st = {'picture': picture, 'w': w, 'h': h, 'bytes': nbytes, 'crc': crc,
-                                      'data': bytearray(nbytes), 'have': set(), 't0': time.time(), 'done': False}
+            hd = still_head(payload)
+            if hd is None:
+                self.refused += 1
+                return
+            if st is None or st['bytes'] != hd['bytes']:
+                if not still_room(self.cur, hd['bytes'], idx):
+                    self.refused += 1
+                    return
+                self.cur[idx] = st = {'picture': hd['picture'], 'w': hd['w'], 'h': hd['h'], 'bytes': hd['bytes'],
+                                      'crc': hd['crc'], 'data': bytearray(hd['bytes']), 'have': set(),
+                                      't0': time.time(), 'done': False}
             return
         if st is None:
             return
@@ -522,6 +590,7 @@ class StillSink:
                     os.makedirs(self.out, exist_ok=True)
                     png_rgb565(os.path.join(self.out, name), st['w'], st['h'], bytes(st['data']))
                 st['done'] = True
+                st['data'] = None   # held as a PNG now: only its block set stays, for a repeated END
                 self.saved.append({'index': idx, 'picture': st['picture'], 'crc_ok': ok, 'file': name if ok else None,
                                    'seconds': round(time.time() - st['t0'], 3), 'bytes': st['bytes']})
                 self.log('still %d (picture %d) %s, %d bytes in %.2f s' % (idx, st['picture'], 'saved' if ok else
@@ -529,7 +598,7 @@ class StillSink:
             loop.send(STILLACK, self.run, idx, min(missing, 0xFFFF), bytes(bits[:DGRAM_MAX - HDR - 4]))
             return
         k = a // CHUNK
-        if a % CHUNK == 0 and a + len(payload) <= st['bytes']:
+        if not st['done'] and a % CHUNK == 0 and a + len(payload) <= st['bytes']:
             st['data'][a:a + len(payload)] = payload
             st['have'].add(k)
 
@@ -1060,6 +1129,44 @@ def session_main(a, loop, stamp):
     return rc
 
 
+def end_on(asm, loop, session, a, pl, stamp, t0):
+    """One END datagram into the run's assembler; a head is answered with ENDACK (b = declared tail bytes not yet held
+    as one non-overlapping cover). Shared by the CLI and the bridge."""
+    first = asm.head is None
+    got = asm.on(session, a, pl)
+    if got != 'head':
+        return got
+    e = asm.head
+    if first:
+        asm.at = time.time()
+        stamp('END from the program %.2f s after EXEC: %s exit %d, report %d bytes (%d in this END), %s' % (
+            asm.at - t0, RUN_STATES.get(e['state'], e['state']), e['exit'], e['report_len'], e['sent_len'],
+            'sent from an exception' if e['path'] == 2 else 'from its thread'))
+    loop.send(ENDACK, session, session, min(0xFFFF, asm.missing()))
+    return got
+
+
+def end_report(asm, session, out):
+    """The run's result from its END (None without a head): written to <out>/report-<run>.txt when out is set."""
+    r0 = asm.result()
+    if r0 is None:
+        return None
+    e, tail = r0['end'], r0['tail']
+    path = os.path.join(out, 'report-%08x.txt' % session) if out else None
+    if path:
+        os.makedirs(out, exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(tail)
+    st = RUN_STATES.get(e['state'], e['state'])
+    r = {'run': '%08x' % session, 'state': st, 'exit': e['exit'], 'bytes': e['report_len'], 'tail_bytes': len(tail),
+         'complete': r0['complete'], 'whole': r0['whole'], 'overlap': r0['overlap'], 'crc_ok': r0['crc_ok'],
+         'path': path, 'by': 'END over the link', 'end': e}
+    if st == 'CRASHED':
+        r['crash'] = {'event': '%03x' % e['crash_evt'], 'pc': '%08x' % e['crash_pc'], 'pr': '%08x' % e['crash_pr'],
+                      'sp': '%08x' % e['crash_sp']}
+    return r
+
+
 def collect(a, loop, stamp, session, result, h):
     """After EXEC: serve the program (files, lines, stills), RESET it if asked, wait for the loader, take the report."""
     b0 = (loop.hello or {}).get('boot_count')
@@ -1104,45 +1211,14 @@ def collect(a, loop, stamp, session, result, h):
         elif typ == END:
             end_datagram(aa, pl)
     loop.on_other = other
-    ending = {'head': None, 'bytes': {}, 'at': None}
+    ending = qlsafe.EndAssembler(session)
 
     def end_datagram(aa, pl):
         """ql-core4: the run's ending, sent by the program before its full restart (include/dcql_loop.h CL_END)."""
-        if aa != END_HEAD:
-            ending['bytes'][aa] = bytes(pl)
-            return
-        if len(pl) < 64:
-            return
-        k = ('state', 'exit', 'crash_evt', 'crash_pc', 'crash_pr', 'crash_sp', 'report_len', 'report_crc', 'sent_off',
-             'sent_len', 'flags', 'uptime_ms', 'wdt_feeds', 'wdt_gap_us', 'link_up_ms', 'path')
-        e = dict(zip(k, struct.unpack_from('<IiIIIIIIIIIIIIII', pl, 0)))
-        if ending['head'] is None:
-            ending['at'] = time.time()
-            stamp('END from the program %.2f s after EXEC: %s exit %d, report %d bytes (%d in this END), %s' % (
-                ending['at'] - t0, RUN_STATES.get(e['state'], e['state']), e['exit'], e['report_len'], e['sent_len'],
-                'sent from an exception' if e['path'] == 2 else 'from its thread'))
-        ending['head'] = e
-        held = sum(len(v) for o, v in ending['bytes'].items() if e['sent_off'] <= o < e['sent_off'] + e['sent_len'])
-        loop.send(ENDACK, session, session, max(0, min(0xFFFF, e['sent_len'] - held)))
+        end_on(ending, loop, session, aa, pl, stamp, t0)
 
     def end_result():
-        e = ending['head']
-        if e is None:
-            return None
-        tail = b''.join(ending['bytes'][o] for o in sorted(ending['bytes']) if o >= e['sent_off'])[:e['sent_len']]
-        whole = e['sent_off'] == 0 and len(tail) == e['report_len']
-        crc_ok = whole and (zlib.crc32(tail) & 0xFFFFFFFF) == e['report_crc']
-        path = os.path.join(a.out, 'report-%08x.txt' % session) if a.out else None
-        if path:
-            with open(path, 'wb') as f:
-                f.write(tail)
-        st = RUN_STATES.get(e['state'], e['state'])
-        r = {'run': '%08x' % session, 'state': st, 'exit': e['exit'], 'bytes': e['report_len'], 'tail_bytes': len(tail),
-             'whole': whole, 'crc_ok': crc_ok, 'path': path, 'by': 'END over the link', 'end': e}
-        if st == 'CRASHED':
-            r['crash'] = {'event': '%03x' % e['crash_evt'], 'pc': '%08x' % e['crash_pc'], 'pr': '%08x' % e['crash_pr'],
-                          'sp': '%08x' % e['crash_sp']}
-        return r
+        return end_report(ending, session, a.out)
 
     def back(m):
         if m[0] == HELLO and parse_hello(m[4])['role'] != 2 and loop.hello and \
@@ -1175,10 +1251,10 @@ def collect(a, loop, stamp, session, result, h):
         result['report'] = er
         return 6 if a.reset_after is not None else 4
     result['back_after_s'] = round(time.time() - t0, 3)
-    if ending['at'] is not None:   # ql-core4: the program's end to the loader's first beacon heard again
-        result['end_to_beacon_s'] = round(time.time() - ending['at'], 3)
+    if ending.at is not None:   # ql-core4: the program's end to the loader's first beacon heard again
+        result['end_to_beacon_s'] = round(time.time() - ending.at, 3)
         stamp('end to beacon %.2f s (END at %.2f s after EXEC, loader up %.1f s at its beacon)' % (
-            result['end_to_beacon_s'], ending['at'] - t0, hb['uptime_ms'] / 1000.0))
+            result['end_to_beacon_s'], ending.at - t0, hb['uptime_ms'] / 1000.0))
     if hb['report_run'] != session or hb['report_state'] in (0, 1) or (er and not hb['report_len']):
         if er:   # ql-core4: back by the full restart, the run's ending already in hand: the result is the END's
             stamp('loader back after %.2f s by the full restart; the run\'s result from its END: %s exit %d, report %d '

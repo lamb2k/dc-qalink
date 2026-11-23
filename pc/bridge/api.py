@@ -69,10 +69,14 @@ def make_handler(bridge, level='run'):
             keep-alive connection became the start of the next request, so the app's CORS preflight after
             POST /v0/selftest got a 400 with no CORS headers (Flycast run f4, 2026-11-22)."""
             if getattr(self, '_body', None) is None:
-                n = int(self.headers.get('Content-Length') or 0)
-                if n > MAX_BODY:
+                cl_ = (self.headers.get('Content-Length') or '0').strip()
+                # a length is digits only and at most MAX_BODY (a negative or signed one read to the end of the
+                # stream: audit 2026-11-23, item 3); refused before any read, and the connection closed
+                if not cl_.isdigit() or int(cl_) > MAX_BODY:
                     self.close_connection = True
-                    raise ValueError('body over %d bytes' % MAX_BODY)
+                    self._body = b''
+                    raise ValueError('Content-Length %r refused (0..%d bytes)' % (cl_[:20], MAX_BODY))
+                n = int(cl_)
                 self._body = self.rfile.read(n) if n else b''
             return self._body
 

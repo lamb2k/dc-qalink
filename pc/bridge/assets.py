@@ -10,6 +10,10 @@ one: ql-disc's L2b item 7).
 The converters need numpy (Pillow optional); without it these endpoints answer 501 and the rest of the bridge runs."""
 import base64, hashlib, itertools, json, math, os, re, threading, time
 
+import qlsafe   # pc/qlsafe.py: roots and limits (audit 2026-11-23)
+
+ASSET_MAX = 16 << 20   # one imported file (a path or base64), the HTTP body limit
+
 VIEWER_PROGRAM = 'viewer.elf'
 STATES = {0: 'none', 1: 'loading', 2: 'ready', 3: 'refused', 4: 'error'}
 
@@ -275,10 +279,25 @@ class Assets:
         return 200, {k: x for k, x in v.items() if k != 'console_still_png'}
 
     # ------------------------------------------------------------------ watching files
+    def root(self):
+        """The folder path imports and watches may read below: --asset-root, else --files; None refuses them."""
+        return getattr(self.b, 'asset_root', None) or self.b.files_root
+
+    def confined(self, path):
+        """(real path, None) for a file below the asset root, or (None, (code, error))."""
+        root = self.root()
+        if not root:
+            return None, (403, 'path imports need a folder: start the bridge with --asset-root (or --files)')
+        real = qlsafe.inside(root, path) if path else None
+        if real is None:
+            return None, (403 if path and os.path.exists(path) else 404,
+                          '%s is not a file below the asset root' % (path or '(no path)'))
+        return real, None
+
     def watch(self, path, body):
-        path = os.path.abspath(path)
-        if not os.path.isfile(path):
-            return 404, {'error': 'no file %s' % path}
+        path, why = self.confined(path)
+        if path is None:
+            return why[0], {'error': why[1]}
         if path in self.watches:
             return 200, {'watching': path, 'asset': self.watches[path]['asset']}
         rec = self.add_path(path, body)
@@ -289,8 +308,11 @@ class Assets:
 
     def add_path(self, path, body):
         from assets import model
-        data = open(path, 'rb').read()
-        return self.add(os.path.basename(path), data, model.folder_resolver(os.path.dirname(path)),
+        real, why = self.confined(path)
+        if real is None:
+            raise PermissionError(why[1])
+        data = qlsafe.read_capped(real, ASSET_MAX)
+        return self.add(os.path.basename(real), data, model.folder_resolver(os.path.dirname(real), self.root()),
                         body.get('format', 'auto'), body.get('mips', True), path)
 
     def _watch(self, path, w):
@@ -350,7 +372,7 @@ def _decode_body(h):
         return os.path.basename(body['path']), None, body, body['path']
     if not body.get('base64') or not body.get('name'):
         raise ValueError('POST /v0/assets: {name, base64} or {path}, or multipart with an "asset" file')
-    return body['name'], base64.b64decode(body['base64']), body, None
+    return body['name'], qlsafe.b64_capped(body['base64'], ASSET_MAX), body, None
 
 
 def handle(h, bridge, method, p, q):
@@ -411,10 +433,15 @@ def handle(h, bridge, method, p, q):
             return True
         name, raw, body, path = _decode_body(h)
         if path:
-            if not os.path.isfile(path):
-                h.err(404, 'no file %s' % path)
+            real, why = a.confined(path)
+            if real is None:
+                h.err(why[0], why[1])
                 return True
-            rec = a.add_path(path, body)
+            try:
+                rec = a.add_path(real, body)
+            except qlsafe.Refused as e:
+                h.err(413, str(e))
+                return True
         else:
             rec = a.add(name, raw, None, body.get('format', 'auto'), body.get('mips', True))
         bridge.audit_call(who, 'control', 'POST /v0/assets %s' % name, '%s %s' % (rec['id'], rec['state']))

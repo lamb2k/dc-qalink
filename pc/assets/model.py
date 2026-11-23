@@ -325,8 +325,23 @@ def load(name, data, resolve=None):
     raise ValueError('%s: models are OBJ, glTF or GLB' % name)
 
 
-def folder_resolver(folder):
+DEP_MAX = 16 << 20   # one file a model names (its .mtl, a texture, a .bin), at most
+
+
+def folder_resolver(folder, root=None, limit=DEP_MAX):
+    """Files a model names, read beside it: each target (links followed) must be a file below `root` (default the
+    model's own folder) and at most `limit` bytes, or it reads as absent (audit 2026-11-23, item 2)."""
+    import qlsafe   # pc/qlsafe.py (pc/ is on the path wherever pc/assets is imported)
+    root = root or folder
+
     def r(rel):
-        p = os.path.join(folder, rel.replace('\\', '/'))
-        return open(p, 'rb').read() if os.path.isfile(p) else None
+        if not rel or '\0' in rel:
+            return None
+        p = qlsafe.inside(root, os.path.join(folder, rel.replace('\\', '/')))
+        if p is None:
+            return None
+        try:
+            return qlsafe.read_capped(p, limit)
+        except (qlsafe.Refused, OSError):
+            return None
     return r

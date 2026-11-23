@@ -7,6 +7,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import dcql_loop as cl   # noqa: E402
 import dcql_disc         # noqa: E402  (the network disc, lane ql-disc)
+import qlsafe            # noqa: E402  (the shared boundaries: roots, limits, the run's ending)
 from . import wire       # noqa: E402
 from .live import Session   # noqa: E402
 
@@ -44,7 +45,8 @@ class BridgeUdp:
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         cl.big_buffers(self.s)
         self.s.bind((bind_host, bind_port))
-        self.port = self.s.getsockname()[1]
+        self.bound = self.s.getsockname()       # the socket's actual address (status shows it)
+        self.port = self.bound[1]
         self.fixed = None
         if console and console != 'auto':
             h, _, p = console.partition(':')
@@ -101,11 +103,11 @@ class BridgeUdp:
 
     def choose(self, ip, why='link'):
         with self.lock:
-            if ip not in self.seen and not self.fixed:
-                raise KeyError(ip)
-            if self.only_local and not self.is_local(ip):
+            if self.only_local and not self.is_local(ip):   # first: a LAN console is never even heard (unparsed)
                 self.remote_refused += 1
                 raise PermissionError('this bridge talks only to this PC (--only-local): %s is not' % ip)
+            if ip not in self.seen and not self.fixed:
+                raise KeyError(ip)
             self.chosen_ip = ip
             self.peer = self.seen[ip]['addr'] if ip in self.seen else self.fixed
             h = (self.seen.get(ip) or {}).get('hello')
@@ -161,6 +163,11 @@ class BridgeUdp:
         except OSError:
             time.sleep(min(timeout, 0.05))
             return None
+        if self.only_local and not self.is_local(a[0]):
+            # only-local (the default): a datagram from off this PC is dropped before any parsing, so a LAN peer's
+            # bytes never reach the frame decoder, the HELLO parser or discovery (audit 2026-11-23, item 1)
+            self.remote_refused += 1
+            return None
         m = cl.unframe(d, any_version=True)
         if m is None:
             return d if a[0] == self.chosen_ip else None   # counted as bad by the loop
@@ -170,10 +177,10 @@ class BridgeUdp:
             # onto the PC's address), so a source address alone cannot decide (first console run, 2026-11-22).
             self.echoes += 1
             return None
-        if m[0] == cl.HELLO and len(m[4]) >= 96:
+        if m[0] == cl.HELLO and len(m[4]) >= cl.HELLO_MIN:
             try:
                 h = cl.parse_hello(m[4])
-            except struct.error:
+            except (struct.error, ValueError):
                 h = None
             if h:
                 with self.lock:
@@ -235,15 +242,23 @@ class Stills:
         self.cur = {}
         self.meta = {}           # id -> json
         self.waiters = {}        # grab request id -> list of still ids (filled when held)
+        self.refused = 0         # heads refused: malformed, or over the pending budget
 
     def on_still(self, loop, run, a, b, payload, tier, emit):
         key = (run, b)
         st = self.cur.get(key)
         if a == cl.STILL_HEAD:
-            index, picture, w, h, fmt, nbytes, crc, req = struct.unpack('<8I', payload[:32])
-            if st is None or st['bytes'] != nbytes or st['done']:
-                self.cur[key] = {'picture': picture, 'w': w, 'h': h, 'bytes': nbytes, 'crc': crc, 'req': req,
-                                 'data': bytearray(nbytes), 'have': set(), 't0': time.time(), 'done': False}
+            hd = cl.still_head(payload)   # checked before anything is allocated (audit 2026-11-23, item 3)
+            if hd is None:
+                self.refused += 1
+                return
+            if st is None or st['bytes'] != hd['bytes'] or st['done']:
+                if not cl.still_room(self.cur, hd['bytes'], key):
+                    self.refused += 1
+                    return
+                self.cur[key] = {'picture': hd['picture'], 'w': hd['w'], 'h': hd['h'], 'bytes': hd['bytes'],
+                                 'crc': hd['crc'], 'req': hd['req'], 'data': bytearray(hd['bytes']), 'have': set(),
+                                 't0': time.time(), 'done': False}
             return
         if st is None:
             return
@@ -310,6 +325,8 @@ class Run:
         self.stills = []
         self.transfer = None
         self.summary = None
+        self.ending = None       # how the result came by END (audit 2026-11-23): bytes, tail, complete, whole, crc_ok
+        self.t_exec = None
         self.reset_flag = threading.Event()
         self.done = threading.Event()
 
@@ -323,6 +340,8 @@ class Run:
             j['crash'] = self.crash
         if self.transfer:
             j['transfer'] = self.transfer
+        if self.ending:
+            j['ending'] = self.ending
         return j
 
 
@@ -389,7 +408,7 @@ class LinkLock:
 
 
 class Bridge:
-    def __init__(self, data_dir, bind=('0.0.0.0', cl.PORT), console='auto', device_kind=None, files_root=None,
+    def __init__(self, data_dir, bind=('127.0.0.1', cl.PORT), console='auto', device_kind=None, files_root=None,
                  selftest=None, loader_disc=None, level='run', log=None, autoconnect=True, only_local=True,
                  disc=None, overlay=None, whole=False):
         self.data_dir = os.path.abspath(data_dir)
@@ -427,6 +446,7 @@ class Bridge:
         self.def_parts = {}
         self.declaration = None
         self.files = {}              # run -> FileService
+        self.endings = {}            # run -> qlsafe.EndAssembler (the active run's END, before the full restart)
         self.cmd_n = itertools.count(1)
         self.cmd_wait = {}
         self.grab_n = itertools.count(int(time.time()) & 0xFFFF << 8 | 1)
@@ -458,8 +478,9 @@ class Bridge:
         threading.Thread(target=self._pump, daemon=True, name='bridge-pump').start()
         threading.Thread(target=self._worker, daemon=True, name='bridge-runs').start()
         threading.Thread(target=self._ticker, daemon=True, name='bridge-status').start()
-        self.log('%s, contract %d, udp %s:%d, console %s, data %s' % (BRIDGE_VERSION, CONTRACT, bind[0], self.t.port,
-                                                                    console, self.data_dir))
+        self.log('%s, contract %d, udp %s:%d%s, console %s, data %s' % (
+            BRIDGE_VERSION, CONTRACT, self.t.bound[0], self.t.port,
+            " (only this PC's own senders)" if only_local else ' (LAN allowed)', console, self.data_dir))
 
     # ------------------------------------------------------------------ plumbing
     def log(self, s):
@@ -517,6 +538,7 @@ class Bridge:
                 'queue': [r.id for r in list(self.queue.queue)], 'active_run': a.id if a is not None else None,
                 'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
                 'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build_id,
+                'udp_bind': '%s:%d' % self.t.bound[:2],
                 'disc': self.disc.manifest()['mode'] if self.disc else None}
 
     # ------------------------------------------------------------------ builds (lane ql-disc)
@@ -720,6 +742,18 @@ class Bridge:
                 w['ev'].set()
         elif typ == cl.RESETACK:
             self.record({'t': 'reset', 'run': '%08x' % a, 'rung': 'stub', 'acknowledged': True}, s)
+        elif typ == cl.END:
+            act = self.active
+            asm = self.endings.get(run)
+            if asm is None and act is not None and act.sid == run:   # only the active run's ending is assembled
+                asm = self.endings[run] = qlsafe.EndAssembler(run)
+                while len(self.endings) > 4:
+                    self.endings.pop(next(iter(self.endings)))
+            if asm is not None:
+                if cl.end_on(asm, self.loop, run, a, pl, self.log,
+                             (act.t_exec if act is not None and act.t_exec else time.time())) == 'head':
+                    self.record({'t': 'end', 'run': '%08x' % run, 'state': cl.RUN_STATES.get(asm.head['state']),
+                                 'missing': asm.missing()}, s)
 
     def client_left(self, why):
         if self.client is None:
@@ -737,8 +771,8 @@ class Bridge:
             r = self.runs.get('%08x' % run)
             root = self.files_root
             if r is not None and r.files and self.files_root:
-                cand = os.path.join(self.files_root, r.files)
-                root = cand if os.path.isdir(cand) else self.files_root
+                cand = qlsafe.confine(self.files_root, r.files, want='dir')
+                root = cand or self.files_root
             fs = self.files[run] = cl.FileService(root, self.log)
         return fs
 
@@ -854,7 +888,8 @@ class Bridge:
                 run.state, run.error = 'refused', res['verdict_text']
                 return
             b0 = (loop.hello or {}).get('boot_count')
-            t_exec = time.time()
+            t_exec = run.t_exec = time.time()
+            self.endings.pop(run.sid, None)
             rv = loop.run_verified(run.sid)
             if rv not in ('exec', 'no answer'):
                 run.state, run.error = 'refused', rv
@@ -886,10 +921,19 @@ class Bridge:
             run.files_stats = self.file_service(run.sid).summary()
             if self.disc is not None:
                 run.files_stats = dict(run.files_stats, disc=self.disc.summary())
+            asm = self.endings.get(run.sid)
+            er = cl.end_report(asm, run.sid, None) if asm is not None else None
             if hb is None:
+                if er is not None:   # the END is in hand: the run's result, though the loader is not back
+                    return self._end_result(run, er, session, t_start, 'the loader did not come back within %d s' %
+                                            wait_s)
                 run.state, run.error = 'lost', 'the loader did not come back within %d s' % wait_s
                 return
-            if hb['report_run'] != run.sid or hb['report_state'] in (0, 1):
+            if hb['report_run'] != run.sid or hb['report_state'] in (0, 1) or (er is not None and not hb['report_len']):
+                if er is not None:
+                    # ql-core4 / audit 2026-11-23 item 3: back by the full restart, which cleared the saved report; the
+                    # run's END arrived before it, so its result is the END's (as the CLI does), not a lost run
+                    return self._end_result(run, er, session, t_start, None)
                 run.state = 'lost'
                 run.error = 'loader back without this run (power cycle?)'
                 return
@@ -907,6 +951,36 @@ class Bridge:
             run.times['total_s'] = round(time.time() - t_start, 3)
             session.add({'t': 'end', 'n': session.max_n, 'reason': '%s, exit %s' % (run.state, rep['exit'])})
             session.flush()
+
+    def _end_result(self, run, er, session, t_start, note):
+        """A run's result from its END (the report tail it carried), when the loader has no report for it."""
+        tail = self.endings[run.sid].result()['tail']
+        path = os.path.join(self.data_dir, 'reports', 'report-%s.txt' % run.id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(tail)
+        run.report = tail
+        run.report_crc_ok = er['crc_ok']
+        run.state = RUN_STATE_OF.get(er['state'], 'lost')
+        run.way_back = run.way_back or 'full restart'
+        run.ending = {k: er[k] for k in ('bytes', 'tail_bytes', 'complete', 'whole', 'crc_ok', 'by')}
+        if not er['complete']:
+            run.error = "the END's tail is incomplete (%d of %d bytes held)" % (er['tail_bytes'],
+                                                                               er['end']['sent_len'])
+        elif note:
+            run.error = note
+        text = tail.decode('latin-1')
+        run.summary = parse_summary(text, run.state, er['exit'], run.times.get('run_s'), self.tier(), session)
+        if er.get('crash'):
+            run.crash = run.summary.get('crash') or er['crash']
+        elif 'crash' in run.summary:
+            run.crash = run.summary['crash']
+        run.times['total_s'] = round(time.time() - t_start, 3)
+        self.log('run %s: result from its END (%s exit %d, tail %d of %d bytes, %s)' % (
+            run.id, er['state'], er['exit'], er['tail_bytes'], er['bytes'], 'whole, crc ok' if er['crc_ok'] else
+            'complete tail' if er['complete'] else 'INCOMPLETE tail'))
+        session.add({'t': 'end', 'n': session.max_n, 'reason': '%s, exit %s (from its END)' % (run.state, er['exit'])})
+        session.flush()
 
     # ------------------------------------------------------------------ control
     def command(self, c, who='api'):

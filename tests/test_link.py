@@ -145,14 +145,18 @@ class CutTest(unittest.TestCase):
 
 class PiSetupTest(unittest.TestCase):
     def test_parse_arp_windows_and_linux(self):
-        win = '  192.0.2.16          b8-27-eb-12-34-56     dynamic\n  192.0.2.255         ff-ff-ff-ff-ff-ff     static'
-        lin = '? (192.0.2.20) at dc:a6:32:00:11:22 [ether] on wlan0\n192.0.2.30 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE'
+        # fixtures (audit 2026-11-23, item 5): the vendor-prefix rows use the Raspberry Pi prefixes pi_setup documents
+        # (PI_OUIS: b8:27:eb, dc:a6:32) with synthetic lower bytes 00:00:0x; every other MAC is a synthetic locally
+        # administered one (02:...); none is a real device's
+        win = '  192.0.2.16          b8-27-eb-00-00-01     dynamic\n  192.0.2.255         ff-ff-ff-ff-ff-ff     static'
+        lin = '? (192.0.2.20) at dc:a6:32:00:00:02 [ether] on wlan0\n192.0.2.30 dev eth0 lladdr 02:00:00:00:00:30 REACHABLE'
         got = pi_setup.parse_arp(win + '\n' + lin)
-        self.assertIn(('192.0.2.16', 'b8:27:eb:12:34:56'), got)
-        self.assertIn(('192.0.2.20', 'dc:a6:32:00:11:22'), got)
-        self.assertIn(('192.0.2.30', '00:11:22:33:44:55'), got)
+        self.assertIn(('192.0.2.16', 'b8:27:eb:00:00:01'), got)
+        self.assertIn(('192.0.2.20', 'dc:a6:32:00:00:02'), got)
+        self.assertIn(('192.0.2.30', '02:00:00:00:00:30'), got)
         self.assertFalse(any(ip.endswith('.255') for ip, _ in got))
-        self.assertTrue(pi_setup.is_pi_mac('b8:27:eb:12:34:56'))
+        self.assertTrue(pi_setup.is_pi_mac('b8:27:eb:00:00:01'))
+        self.assertFalse(pi_setup.is_pi_mac('02:00:00:00:00:30'))   # control: a synthetic MAC is no Pi
 
     def test_ssh_config_idempotent(self):
         t1 = pi_setup.update_ssh_config('Host other\n    HostName x\n', 'dreampi', '10.0.0.5', 'pi', '/k')
