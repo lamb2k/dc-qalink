@@ -77,15 +77,15 @@ speed claim), **estimate**.
 
 | Limit (plan) | Measured | Tier |
 |---|---|---|
-| Code and constant data, link + live + menu: at most 48 KB | menu alone 9,914 B (9.7 KB: code 7,912, constants 2,002 of which the font is 1,520); with the client library's link and live data 27,251 B (26.6 KB): within | map |
-| Fixed memory: at most 72 KB | menu alone 3,980 B (state, log ring 1.2 KB, QR modules 1.4 KB; the font is constant data); with link + live 128,812 B (125.8 KB): over, because the link and live data alone take 124,832 B | map |
+| Code and constant data, link + live + menu: at most 48 KB | menu alone 9,966 B (9.7 KB: code 7,964, constants 2,002 of which the font is 1,520); with the client library's link and live data 27,303 B (26.7 KB): within | map |
+| Fixed memory: at most 72 KB | menu alone 3,984 B (state, log ring 1.2 KB, QR modules 1.4 KB; the font is constant data); with link + live 128,816 B (125.8 KB): over, because the link and live data alone take 124,832 B | map |
 | Heap use after start: none | 0 B change over 100 opens, draws and closes (control: a planted 64-byte allocation in the same loop reads +7,208 B); the menu's object refers to no allocator | Flycast; object |
 | Cost each picture, menu closed: one test, under 0.01 ms | 200.9 ns a call (0.0002 ms; the empty loop 5.0 ns), one compare and branch | Flycast |
-| Cost each picture, menu open | way (a), the example's PVR sprites: 1.28 to 1.99 ms of CPU a picture (worst 1.99 ms), 748 to 1,167 sprites, 48 to 75 KB of vertex data; way (b), into the displayed frame buffer: 8.3 to 8.9 ms a full redraw (worst 11.2 ms), done only when something changes | Flycast |
+| Cost each picture, menu open | way (a), the example's PVR sprites: 1.29 to 2.01 ms of CPU a picture (worst 2.01 ms), 748 to 1,167 sprites, 48 to 75 KB of vertex data; way (b), into the displayed frame buffer: 8.3 to 8.9 ms a full redraw (worst 11.2 ms), done only when something changes | Flycast |
 | Network or disc access inside a picture: none | none referenced by the menu's object (symbol check; the control, dcql_net.o, fails it) | object |
 | Graphics memory: none | none (no texture or `pvr_mem` call); way (a) uses vertex-buffer room only | object |
 
-The timing control: a planted 2,000 us busy wait reads 1,995 us (run f2) and 2,003 us (run f1). Flycast times are
+The timing control: a planted 2,000 us busy wait reads 1,998 us (run f3), 1,995 us (f2) and 2,003 us (f1). Flycast times are
 the emulator's, not the console's: the calibrated tier needs a console-like Flycast with the adapter, and the
 console's own figures (store-queue writes of the sprites, uncached frame-buffer writes, the chip's sort and fill of
 about a thousand sprites) are for the console run.
