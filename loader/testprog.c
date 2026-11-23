@@ -3,8 +3,8 @@
 
      report     (default) a few lines and DONE through cl_exit
      ret        back to the loader at once, the link never started (exec and the way back alone; ql-core2)
-     gdreboot   hand in DONE, then the disc switch alone: the loader's GDEMU image selected, a BIOS reboot (console:
-                does GDEMU boot the loader's image, or openMenu under reset_goto = 1?)
+     gdreboot   hand in DONE through cl_exit (END to the PC first), then the disc switch alone: the loader's GDEMU image
+                selected, a BIOS reboot (the full restart even under "return stub")
      stubfail   control: the stub's copy of LOADER.BIN's SHA-256 spoilt, so its check refuses and its fallback (GDEMU
                 image, reboot) must bring the loader back; the loader then shows "STUB: STEP 7 ERR 400"
      diag=1     every step of the client and of the stub held on screen about a second (large text / screen colour)
@@ -24,7 +24,7 @@
                 resets the CPU; otherwise only a power cycle returns
      reboot     BIOS reboot without a hand-in: shows what the BIOS boots after a soft reboot (loader -> LOST)
      preload0   no loader preload when no stub is armed
-     wdt=1      arm the SH-4 watchdog (reset mode, fed by the vertical blank)
+     wdt=1      arm the SH-4 watchdog (reset mode, fed by the vertical blank; off by default since ql-core5)
 
    It shows its state on screen so a photo tells which path ran. */
 #include <kos.h>
@@ -36,6 +36,7 @@
 #include <malloc.h>
 #include "cl_client.h"
 #include "dcql_loop.h"
+#include "dcql_hw.h"
 
 void dcql_bios_reboot(void) __attribute__((noreturn));   /* lib/dcql_return.c: the GDEMU image, then a reboot */
 int __real_cdrom_read_toc(cd_toc_t *toc, bool hd);
@@ -91,6 +92,11 @@ int main(int argc, char **argv) {
     const int active = cl_init((has(args0, "preload0") ? CL_NO_PRELOAD : 0) | (word(args0, "ret") ? CL_NO_LINK : 0));
     const char *args = cl_args();
     char line[64];
+    if (active && has(args, "nosave")) {   /* lab arm (ql-core4): the full restart keeps nothing in RAM; END alone tells */
+        cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
+        w->h.flags |= CL_F_NOSAVE;
+        cl_handoff_seal(w);
+    }
     say(0, "CONTROL LOOP TEST PROGRAM");
     snprintf(line, sizeof(line), "RUN %08X  ACTIVE %d", (unsigned)cl_run_id(), active);
     say(1, line);
@@ -214,6 +220,11 @@ int main(int argc, char **argv) {
     }
     if (has(args, "hangoff")) {
         say(4, "HANG WITH INTERRUPTS OFF");
+        /* ql-core5: the watchdog as the hang starts, on the TV: armed and counting = CSR C7 and a count under 256 */
+        snprintf(line, sizeof(line), "WDT CSR %02X CNT %3u%s", dcql_wdt_csr(), dcql_wdt_cnt(),
+                 (dcql_wdt_csr() & DCQL_WT_TME) ? " ARMED: RESET IN 21 MS" : " NOT ARMED: POWER CYCLE");
+        say(5, line);
+        cl_report("hangoff: %s\n", line);
         thd_sleep(500);
         irq_disable();
         for (;;) {}
@@ -226,14 +237,16 @@ int main(int argc, char **argv) {
     }
     if (word(args, "gdreboot")) {   /* the disc switch alone: the loader's GDEMU image selected, then a BIOS reboot */
         say(4, "DISC SWITCH: IMAGE, THEN REBOOT");
-        cl_report("gdreboot: GDEMU image %u, then a BIOS reboot\n", (unsigned)h->h.reserved[CL_RSV_GDEMU_SLOT]);
+        cl_report("gdreboot: GDEMU image %u, then a BIOS reboot, its END first\n",
+                  (unsigned)h->h.reserved[CL_RSV_GDEMU_SLOT]);
         thd_sleep(1500);
+        /* ql-core5: through the client's own ending, like every other ending, so the END goes to the PC before the
+           restart (the console's first-run8: this arm called dcql_bios_reboot itself and no END came). The full
+           restart is forced even under "return stub": the flag makes cl_exit take dcql_bios_reboot (image, reboot). */
         cl_handoff_t *w = (cl_handoff_t *)CL_HANDOFF_ADDR;
-        w->h.state = CL_RUN_DONE;   /* handed in first: a loader that comes back reads this run as DONE */
-        w->h.report_crc = cl_crc32(0, w->report, w->h.report_len);
+        w->h.flags |= CL_F_RET_REBOOT;
         cl_handoff_seal(w);
-        dcache_flush_range(CL_HANDOFF_ADDR, CL_HANDOFF_SIZE);
-        dcql_bios_reboot();
+        cl_exit(0);
     }
     if (word(args, "stubfail")) {   /* control: the stub's SHA-256 check must refuse, and its fallback take over */
         say(4, "STUB FAIL: WRONG SHA, FALLBACK");

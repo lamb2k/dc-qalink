@@ -18,6 +18,14 @@
      port 52060   lport 52060   number 1111111 (modem)
      slot 158                (the GDEMU image this loader boots from: every way back selects it, so a reboot lands here,
                              not in openMenu; GDEMU cannot be asked which image it serves)
+     return reboot|stub      (ql-core4; default reboot, owner 2026-11-22: every ending of a program sends its END to the
+                             PC and restarts the console into this loader. stub: the quick in-RAM return stub, armed
+                             only when asked)
+     dhcp always             (ql-core4: DHCP even when the last run's saved record carries the address; by default a
+                             loader that finds the record starts at once on that address, the fast way back)
+     guard 1                 (ql-core4: the SH-4 watchdog over this loader's own start, until its link is up or
+                             90 s: a start that hangs restarts the console. Off by default: no emulator shows the
+                             watchdog's reset, and a false one here would be a boot loop)
 
    Autoconnect: once picked in openMenu it needs nobody. It beacons once a second until a PC answers and shows LINKED;
    when no PC has answered for 10 s (none yet, or the PC went away or changed address) it beacons to the whole network
@@ -33,6 +41,7 @@
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
 #include <dc/cdrom.h>
+#include <dc/vblank.h>
 #include <arpa/inet.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -100,7 +109,7 @@ static cl_platform_t g_plat;
 static int g_pushed;
 
 /* ---------------------------------------------------------------- settings: /cd/LINK.TXT */
-typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20], dhcp[8]; unsigned port, lport, slot; } settings_t;
+typedef struct { char number[24], host[32], net[8], ip[20], mask[20], gw[20], dhcp[8], ret[8]; unsigned port, lport, slot, guard; } settings_t;
 static void read_settings(settings_t *s) {
     FILE *f = fopen("/cd/LINK.TXT", "r");
     if (!f) f = fopen("/cd/link.txt", "r");
@@ -118,6 +127,8 @@ static void read_settings(settings_t *s) {
         else if (!strcmp(k, "port")) s->port = (unsigned)atoi(v);
         else if (!strcmp(k, "lport")) s->lport = (unsigned)atoi(v);
         else if (!strcmp(k, "slot")) s->slot = (unsigned)atoi(v);
+        else if (!strcmp(k, "return")) snprintf(s->ret, sizeof(s->ret), "%s", v);
+        else if (!strcmp(k, "guard")) s->guard = (unsigned)atoi(v);
     }
     fclose(f);
 }
@@ -205,7 +216,20 @@ static void early_read_crumbs(void) {
         dcql_copy_words(DCQL_SAVE_RAM, DCQL_SAVE_SND, CL_STUB_OFF, 0);
         g_save_from = 2;
     }
+    /* the adapter's own memory (ql-core4): only while its bridge is there and still set up (dcql_hw.h), before
+       KallistiOS's adapter driver clears it */
+    const int gaps = dcql_gaps_ready();
+    if (!g_save_from && gaps && save_looks_whole(DCQL_SAVE_BBA)) {
+        uint32_t rep = ((const volatile cl_handoff_hdr_t *)DCQL_SAVE_BBA)->report_len;
+        const uint32_t room = DCQL_SAVE_BBA_SIZE - DCQL_SAVE_BBA_REPORT;
+        if (rep > room) rep = room;   /* the report's head only: its check then fails, the header stands */
+        dcql_copy_words(DCQL_SAVE_RAM + CL_REPORT_OFF, DCQL_SAVE_BBA + DCQL_SAVE_BBA_REPORT, (rep + 3) & ~3u, 0);
+        dcql_copy_words(DCQL_SAVE_RAM, DCQL_SAVE_BBA, CL_STUB_OFF, 0);
+        g_save_from = 3;
+    }
+    dcql_g2_fifo_wait();
     ((volatile cl_handoff_hdr_t *)DCQL_SAVE_SND)->magic = 0;
+    if (gaps) { dcql_g2_fifo_wait(); ((volatile cl_handoff_hdr_t *)DCQL_SAVE_BBA)->magic = 0; }
 }
 KOS_INIT_EARLY(early_read_crumbs);
 /* CL_HELLO_WB bits: 0 hand-off, 1 main RAM, 2 sound RAM, 3 video RAM (the record); 4 / 5: the area itself was lost and
@@ -217,7 +241,7 @@ static uint32_t restore_handoff(void) {
     if (g_save_from && !cl_handoff_valid(H) && cl_handoff_valid(s)) {
         memcpy((uint8_t *)H + CL_REPORT_OFF, (const uint8_t *)s + CL_REPORT_OFF, (s->h.report_len + 3) & ~3u);
         memcpy(H, s, CL_STUB_OFF);
-        r = g_save_from == 1 ? 0x10u : 0x20u;
+        r = g_save_from == 1 ? 0x10u : g_save_from == 2 ? 0x20u : 0x40u;
     }
     if (g_save_from) s->h.magic = 0;
     return r;
@@ -275,9 +299,15 @@ static void draw(unsigned frame, uint32_t rate_Bps) {
         line_at(6, GREY, "EXIT %d   REPORT %u BYTES", (int)h->exit_code, (unsigned)h->report_len);
     unsigned tx, rx, txd, rxd;
     dcql_net_counters(&tx, &rx, &txd, &rxd);
-    if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "BACK S%u R%u ERR %08X AUX %08X %c%c%c%c",
+    if (g_stub_seen && g_stub_step >= CL_STUB_STEP_RUNNING)   /* the full restart's crumb (ql-core4) */
+        line_at(7, g_stub_step == CL_STUB_STEP_RESTART ? GREEN : RED, "RESTART %s RUN %08X %s %c%c%c%c%c",
+                g_stub_step == CL_STUB_STEP_RESTART ? "TAKEN" : "NO ENDING", (unsigned)g_stub_run,
+                g_stub_step == CL_STUB_STEP_RESTART ? run_state_name(g_stub_err < 7 ? g_stub_err : 7) : "",
+                g_wb_where & 0x70 ? 'P' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
+                g_wb_where & 8 ? 'V' : '-', g_wb_where & 0x40 ? 'B' : '-');
+    else if (g_stub_seen) line_at(7, g_stub_step == CL_STUB_STEP_JUMP ? GREEN : RED, "BACK S%u R%u ERR %08X AUX %08X %c%c%c%c",
                              (unsigned)g_stub_step, (unsigned)g_stub_rung, (unsigned)g_stub_err, (unsigned)g_stub_aux,
-                             g_wb_where & 1 ? 'H' : g_wb_where & 0x30 ? 'P' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
+                             g_wb_where & 1 ? 'H' : g_wb_where & 0x70 ? 'P' : '-', g_wb_where & 2 ? 'R' : '-', g_wb_where & 4 ? 'S' : '-',
                              g_wb_where & 8 ? 'V' : '-');
     else line_at(7, GREY, "LINK BYTES OUT %u IN %u DROPS %u/%u", tx, rx, txd, rxd);
     /* the last five log lines (rows 8 to 12: the screen's bottom) */
@@ -295,8 +325,36 @@ static int pad_a(void) {
     return s && (s->buttons & CONT_A);
 }
 
+/* ---------------------------------------------------------------- the start guard (LINK.TXT "guard 1", ql-core4) */
+/* The SH-4 watchdog in reset mode (as the client's: 256 counts of Pck/4096, about 21 ms), fed from the vertical blank
+   only while the guard's time is not spent: a start that stops with interrupts off (no vertical blank) or that never
+   gets its link up (the time runs out) restarts the console through the BIOS, like any way back. */
+/* ql-core5: the registers from dcql_hw.h (WTCSR is 0xffc0000c; this guard wrote 0xffc00004, STBCR, until then) */
+static volatile uint64_t g_guard_until;
+static volatile int g_guard_on;
+static void guard_feed(uint32_t code, void *data) {
+    (void)code; (void)data;
+    if (g_guard_on && timer_ms_gettime64() < g_guard_until) dcql_wdt_feed();
+}
+static void guard_start(unsigned seconds) {
+    if (vblank_handler_add(guard_feed, NULL) < 0) return;
+    g_guard_until = timer_ms_gettime64() + seconds * 1000ull;
+    g_guard_on = 1;
+    dcql_wdt_arm();
+    loader_log("start guard: the watchdog for %u s (WTCSR %02x)", seconds, dcql_wdt_csr());
+}
+static void guard_stop(const char *why) {
+    if (!g_guard_on) return;
+    dcql_wdt_off();
+    g_guard_on = 0;
+    loader_log("start guard off: %s", why);
+}
+
 /* ---------------------------------------------------------------- the jump */
+static int g_ret_stub;   /* LINK.TXT "return stub": the quick way back armed; else the full restart (the default) */
+int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
 static void do_exec(void) {
+    guard_stop("jumping");
     cl_core_t *c = &g_core;
     loader_log("exec %08x: %u bytes%s", (unsigned)c->session, (unsigned)c->raw_len, c->exec_loader ? " (loader)" : "");
     line_at(5, 0xffe0, "RUNNING %08X: %u BYTES", (unsigned)c->session, (unsigned)c->raw_len);
@@ -317,14 +375,26 @@ static void do_exec(void) {
         H->h.reserved[3] = PUSH_MAGIC;
         memcpy(&H->h.reserved[4], c->sha, 8);
     }
-    cl_arm_stub(H);
+    if (g_ret_stub) cl_arm_stub(H);
+    else {   /* the full restart: no stub armed, so nothing can take it by mistake */
+        H->h.stub_bytes = 0;
+        H->h.flags |= CL_F_RET_REBOOT;
+    }
+    cl_handoff_seal(H);
     arch_exec_at(c->raw, (c->raw_len + 3) & ~3u, CL_LOAD_ADDR);
 }
 
+/* the start's steps on the TV (ql-core4): until the main loop's first picture the screen was black, so a start that
+   stopped (the console after the stub's jump, 2026-11-22) showed nothing; now the last step reached stays on screen */
+static void start_step(const char *what) {
+    big_at(0, 0xffe0, "START: %s", what);
+    dbglog(DBG_INFO, "loader: start: %s\n", what);
+}
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     vid_set_mode(DM_640x480, PM_RGB565);
     vid_clear(0, 0, 0);
+    start_step("1 SETTINGS (DISC)");
     settings_t s;
     memset(&s, 0, sizeof(s));
     strcpy(s.number, "1111111");
@@ -332,11 +402,15 @@ int main(int argc, char **argv) {
     strcpy(s.net, "auto");
     s.port = s.lport = CL_PORT;
     read_settings(&s);
+    start_step("2 GDEMU");
     /* GDEMU's version (nothing answers on a GD-ROM drive or in Flycast: bounded, harmless), before any disc work */
     irq_mask_t im = irq_disable();
     const uint32_t gver = dcql_gdemu_version();
     if (!gver) (void)dcql_gd_req_error();   /* refused: the drive's "illegal request" read, so no later command sees it */
     irq_restore(im);
+    g_ret_stub = !strcmp(s.ret, "stub");
+    if (s.guard) guard_start(90);   /* after the probe: its bounded waits run with interrupts off */
+    start_step("3 LAST RUN");
     memset(&g_plat, 0, sizeof(g_plat));
     g_plat.send = p_send; g_plat.now_ms = p_now; g_plat.alloc = p_alloc; g_plat.free = p_free; g_plat.log = p_log;
     g_plat.handoff = H;
@@ -345,8 +419,9 @@ int main(int argc, char **argv) {
     /* the area lost on a BIOS reboot: put back from its saved copy (header and report) */
     const int top_ok = cl_handoff_valid(H);
     const uint32_t restored = restore_handoff();
-    if (restored) loader_log("hand-off lost on the reboot: put back from the copy in %s RAM (run %08x, report %u B)",
-                             restored == 0x10u ? "main" : "sound", (unsigned)H->h.run_id, (unsigned)H->h.report_len);
+    if (restored) loader_log("hand-off lost on the reboot: put back from the copy in %s (run %08x, report %u B)",
+                             restored == 0x10u ? "main RAM" : restored == 0x20u ? "sound RAM" : "the adapter's memory",
+                             (unsigned)H->h.run_id, (unsigned)H->h.report_len);
     else if (g_save_from && !top_ok) loader_log("hand-off lost and its saved copy not whole: fresh");
     /* the last way back: the hand-off header's words first, else the first place that kept the record */
     const int in_hdr = cl_handoff_valid(H) && H->h.tramp[CL_STUBW_MAGIC] == CL_STUB_MAGIC;
@@ -383,6 +458,23 @@ int main(int argc, char **argv) {
     const uint32_t wb[4] = {g_wb_where, g_stub_aux, g_stub_run, g_stub_sense};
     memcpy(g_plat.wb, wb, sizeof(wb));
     cl_core_init(&g_core, &g_plat);   /* reads the last run's hand-off before anything grows */
+    /* the full restart lost the area and every saved copy, but the run's crumb names it (ql-core4): the run is handed
+       in as the crumb says (step 17: the ending it took, without its report; step 16: it ended without a word, the
+       watchdog, a reset or the power), so the PC tool learns which run came back and how */
+    if (!top_ok && !restored && !in_hdr && g_stub_seen && g_stub_run &&
+        (g_stub_step == CL_STUB_STEP_RUNNING || g_stub_step == CL_STUB_STEP_RESTART)) {
+        H->h.run_id = g_stub_run;
+        H->h.state = g_stub_step == CL_STUB_STEP_RUNNING || g_stub_err < CL_RUN_DONE || g_stub_err > CL_RUN_RESET
+                     ? CL_RUN_LOST : g_stub_err;
+        H->h.exit_code = g_stub_step == CL_STUB_STEP_RESTART ? (int32_t)g_stub_aux : 0;
+        H->h.report_len = 0;
+        H->h.report_crc = 0;
+        cl_handoff_seal(H);
+        if (g_stub_step == CL_STUB_STEP_RUNNING) g_wb_where |= 0x80u;
+        g_core.p.wb[0] = g_wb_where;
+        loader_log("run %08x named by its crumb only: %s", (unsigned)g_stub_run,
+                   g_stub_step == CL_STUB_STEP_RUNNING ? "ended without a word (watchdog, reset, power)" : run_state_name(H->h.state));
+    }
     g_pushed = cl_handoff_valid(H) && H->h.reserved[3] == PUSH_MAGIC;
     uint8_t pushed_sha8[8];
     memcpy(pushed_sha8, &H->h.reserved[4], 8);
@@ -393,10 +485,21 @@ int main(int argc, char **argv) {
     if (gver) loader_log("GDEMU %u.%u.%u, loader image %u", (unsigned)(gver >> 16), (unsigned)((gver >> 8) & 255),
                          (unsigned)(gver & 255), s.slot);
     else loader_log("no GDEMU answered; image %u%s", s.slot, s.slot ? " (selected anyway on the way back)" : "");
+    start_step("4 LOADER.BIN (DISC)");
     const int hr = cl_arm_find();
     if (hr) loader_log("no way back by the stub: LOADER.BIN %d", hr);
     else loader_log("LOADER.BIN at sector %u, %u bytes", (unsigned)cl_arm_lba(), (unsigned)cl_arm_len());
-    cl_arm_stub(H);
+    if (g_ret_stub) cl_arm_stub(H);
+    else { H->h.stub_bytes = 0; cl_handoff_seal(H); }
+    loader_log("way back: %s", g_ret_stub ? "the return stub (LINK.TXT return stub)" : "full restart (BIOS reboot)");
+    /* the fast start (ql-core4): the address, mask and gateway the last run's saved record carries (this loader held
+       them seconds before the restart, and the program used them since), set at once without DHCP. No DHCP fallback:
+       asking DHCP on the live adapter afterwards lost the link in Flycast (ev\f1); the address was proven seconds ago,
+       and autoconnect still finds a PC that moved. Without a record: DHCP as before ("dhcp no" + "ip" is static) */
+    unsigned fast_ip = 0, fast_mask = 0, fast_gw = 0;
+    if (restored && H->h.net_kind == CL_NET_BBA && H->h.console_ip && strcmp(s.dhcp, "always")) {
+        fast_ip = H->h.console_ip; fast_mask = H->h.net_mask; fast_gw = H->h.net_gw;
+    }
     static uint8_t rx_mem[65536], tx_mem[16384];
     dcql_net_config_t nc;
     memset(&nc, 0, sizeof(nc));
@@ -408,12 +511,21 @@ int main(int argc, char **argv) {
     nc.lport = (unsigned short)s.lport;
     nc.ip = parse_ip(s.ip); nc.mask = parse_ip(s.mask); nc.gw = parse_ip(s.gw);
     nc.dhcp_first = strcmp(s.dhcp, "no") ? 2 : 0;   /* "ip" in LINK.TXT: the fallback when no DHCP server answers */
+    if (fast_ip) {
+        nc.ip = fast_ip; nc.mask = fast_mask; nc.gw = fast_gw;
+        nc.dhcp_first = 0;
+        g_wb_where |= 0x100u;
+        g_core.p.wb[0] = g_wb_where;
+        const unsigned char *fp = (const unsigned char *)&fast_ip;
+        loader_log("fast start on %u.%u.%u.%u (the saved record), no DHCP", fp[0], fp[1], fp[2], fp[3]);
+    }
     nc.rx_mem = rx_mem; nc.rx_size = sizeof(rx_mem);
     nc.tx_mem = tx_mem; nc.tx_size = sizeof(tx_mem);
     nc.ppp_wait_ms = 45000;
     nc.log = net_log;
     dcql_net_config(&nc);
     loader_log("net %s host %s port %u lport %u", s.net, s.host, s.port, s.lport);
+    start_step("5 LINK");
     dcql_net_start();
     g_core.p.net_kind = (uint32_t)dcql_net_kind();
     g_core.p.number = dcql_net_number();
@@ -438,6 +550,10 @@ int main(int argc, char **argv) {
                 dcql_net_mac(g_core.p.mac);
                 was_up = 1;
                 up_ms = now;
+                guard_stop("link up");
+                loader_log("link up %u ms after start", (unsigned)now);
+                const unsigned hst = dcql_net_host();   /* the PC's ARP asked at once: the first beacon is not lost */
+                if (net_default_dev && hst && hst != 0xffffffffu) net_arp_query(net_default_dev, (const uint8_t *)&hst);
             }
             g_core.p.link_host = dcql_net_host();   /* learnt from the PC's first datagram */
             int n;
@@ -454,6 +570,7 @@ int main(int argc, char **argv) {
                 dcql_net_relearn();
             }
         } else {
+            if (st == DCQL_LINK_FAILED) guard_stop("link failed: the loader waits");
             g_linked = 0;
             was_up = 0;
             if (!dcql_net_busy() && (st == DCQL_LINK_OFF || st == DCQL_LINK_FAILED || st == DCQL_LINK_DROPPED)) {

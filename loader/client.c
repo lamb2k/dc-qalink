@@ -1,10 +1,16 @@
 /* client.c: the control loop's client library (dc-qalink 0.2; first written for the RE4 Dreamcast console loop, lane
    eng-loop, 2026-11-19). API and use: cl_client.h. Wire format and hand-off area: include/dcql_loop.h. MIT licence.
 
-   The way back to the loader, in order: (1) the resident return stub the loader armed in the hand-off area
-   (lib/dcql_return.c jumps to it; it reads LOADER.BIN from the mounted disc with the BIOS's disc calls and checks its
-   SHA-256); (2) without one, the loader image preloaded at cl_init, copied down with KallistiOS's exec trampoline
-   from the hand-off area's scratch words; (3) a BIOS reboot. All work from an exception handler: no disc access, no
+   The way back to the loader. The standard (LINK.TXT "return reboot", hand-off flag CL_F_RET_REBOOT; owner
+   2026-11-22): every ending (exit, deadline, crash, abort, RESET) first sends the run's ending to the PC over the link
+   (CL_END: state, exit code, crash registers, the report's tail; from a thread it waits up to about 2 s for the PC's
+   ENDACK, from an exception it sends raw frames), then the full restart (lib/dcql_return.c dcql_bios_reboot: the
+   area saved, the adapter stopped, the GDEMU image selected, the BIOS). A hang with interrupts on: the deadline
+   thread (TIMEOUT, END sent). A hang with interrupts off: the SH-4 watchdog with "wdt=1" (off by default since
+   ql-core5, until the console shows its reset comes back) resets the console (no ending; the loader reads the crumb).
+   With "return stub" (kept for later work), in order: (1) the resident return stub the loader armed in the hand-off
+   area; (2) without one, the loader image preloaded at cl_init, copied down with KallistiOS's exec trampoline from
+   the hand-off area's scratch words; (3) a BIOS reboot. All work from an exception handler: no disc access, no
    allocation, interrupts off. */
 #include <kos.h>
 #include <arch/arch.h>
@@ -42,6 +48,7 @@ void dcql_jump_stub(void) __attribute__((noreturn));      /* lib/dcql_return.c *
 void dcql_bios_reboot(void) __attribute__((noreturn));
 
 #define H ((cl_handoff_t *)CL_HANDOFF_ADDR)
+#define RET_REBOOT ((H->h.flags & CL_F_RET_REBOOT) != 0)
 static int g_active;
 static uint8_t *g_loader;
 static uint32_t g_loader_len;
@@ -79,16 +86,20 @@ void cl_report(const char *fmt, ...) {
     if (n > 0) cl_report_bytes(b, (size_t)n < sizeof(b) ? (size_t)n : sizeof(b) - 1);
 }
 
-/* ---------------------------------------------------------------- the SH-4 watchdog, fed from the vertical blank */
-#define WTCNT (*(volatile uint16_t *)0xffc00008)
-#define WTCSR (*(volatile uint16_t *)0xffc00004)
+/* ---------------------------------------------------------------- the SH-4 watchdog, fed from the vertical blank
+   (ql-core5) Registers in include/dcql_hw.h: until ql-core5 WTCSR was written at 0xffc00004 (STBCR), so the watchdog
+   never counted and the console's `hangoff` row froze. Off by default now: "wdt=1" arms it (the console test arm) until
+   a console run shows its reset brings the loader back and good programs never reach its 21 ms (the vertical blank's
+   longest gap on the console was 19.35 ms, first-run7). g_wdt_csr0: WTCSR as this program found it (WOVF set = the
+   last reset was the watchdog's, if the BIOS left it); g_wdt_csr1: read back right after arming (0xc7 = counting). */
 static volatile uint32_t g_wdt_feeds, g_wdt_gap_us;
 static volatile uint64_t g_wdt_last_us;
 static volatile int g_wdt_armed;
+static uint8_t g_wdt_csr0, g_wdt_csr1, g_wdt_cnt1;
 static int g_vbl_handle = -1;
 static void vbl_feed(uint32_t code, void *data) {
     (void)code; (void)data;
-    if (g_wdt_armed) WTCNT = 0x5a00;
+    if (g_wdt_armed) dcql_wdt_feed();
     const uint64_t now = timer_us_gettime64();
     if (g_wdt_last_us && g_wdt_feeds > 1) {
         const uint64_t gap = now - g_wdt_last_us;
@@ -100,15 +111,15 @@ static void vbl_feed(uint32_t code, void *data) {
 static void wdt_start(int arm) {
     g_vbl_handle = vblank_handler_add(vbl_feed, NULL);
     if (!arm || g_vbl_handle < 0) return;
-    WTCSR = 0xa500 | 0x40 | 7;   /* watchdog mode, power-on reset, Pck/4096 (TME off while CKS is set) */
-    WTCNT = 0x5a00;
-    WTCSR = 0xa500 | 0x80 | 0x40 | 7;   /* TME: 256 counts of Pck/4096, about 21 ms at 50 MHz */
+    dcql_wdt_arm();   /* watchdog mode, power-on reset, 256 counts of Pck/4096: about 21 ms at 50 MHz */
+    g_wdt_csr1 = dcql_wdt_csr();
+    g_wdt_cnt1 = dcql_wdt_cnt();
     g_wdt_armed = 1;
     H->h.flags |= CL_F_WDT_ARMED;
     cl_handoff_seal(H);
 }
 static void wdt_stop(void) {
-    if (g_wdt_armed) { WTCSR = 0xa500; g_wdt_armed = 0; }
+    if (g_wdt_armed) { dcql_wdt_off(); g_wdt_armed = 0; }
     H->h.wdt_feeds = g_wdt_feeds;
     H->h.wdt_gap_us = g_wdt_gap_us;
 }
@@ -192,11 +203,10 @@ static int g_diag;                  /* args "diag=1": the link's first datagrams
    serial line ("cl-step"). Only on a 640-wide RGB565 screen; never from an exception handler. */
 static unsigned g_diag_row;
 static uint64_t g_t0_ms;
-static void diag_text(uint16_t colour, const char *b) {
+static void diag_text_at(unsigned y0, uint16_t colour, const char *b) {
     if (!vid_mode || vid_mode->pm != PM_RGB565 || vid_mode->width != 640 || vid_mode->height < 480) return;
-    static uint16_t g[BFONT_HEIGHT * BFONT_THIN_WIDTH];
-    const unsigned row = g_diag_row++ % 5;
-    uint16_t *base = vram_s + (250 + row * 46) * 640;
+    uint16_t g[BFONT_HEIGHT * BFONT_THIN_WIDTH];
+    uint16_t *base = vram_s + y0 * 640;
     for (int y = 0; y < 2 * BFONT_HEIGHT + 2; ++y)
         for (int x = 0; x < 640; ++x) base[y * 640 + x] = 0x0008;   /* the row cleared (dark blue) */
     for (int k = 0; k < 26 && b[k]; ++k) {
@@ -210,6 +220,7 @@ static void diag_text(uint16_t colour, const char *b) {
             }
     }
 }
+static void diag_text(uint16_t colour, const char *b) { diag_text_at(250 + (g_diag_row++ % 5) * 46, colour, b); }
 static void diag_step(uint16_t colour, const char *fmt, ...) {
     if (!g_diag) return;
     char b[64];
@@ -223,6 +234,9 @@ static void diag_step(uint16_t colour, const char *fmt, ...) {
     thd_sleep(1000);
 }
 static volatile uint32_t g_rx_seen, g_rx_bad;
+static volatile int g_endack;                 /* the PC answered this run's END */
+static volatile uint32_t g_endack_missing;    /* report bytes it still misses */
+static kthread_t *volatile g_link_thd;
 static void on_datagram(const uint8_t *d, int n) {
     const int len = cl_unframe(d, (size_t)n);
     ++g_rx_seen;
@@ -236,6 +250,9 @@ static void on_datagram(const uint8_t *d, int n) {
     const uint8_t *pl = d + CL_HDR;
     switch (type) {
     case CL_PING: client_hello(); break;
+    case CL_ENDACK:
+        if (a == H->h.run_id) { g_endack_missing = b; g_endack = 1; }
+        break;
     case CL_RESET:
         if (session && session != H->h.run_id) break;
         link_out(CL_RESETACK, H->h.run_id, 0, NULL, 0);
@@ -297,6 +314,8 @@ static void on_datagram(const uint8_t *d, int n) {
    line, no report). Returns the ms it took, or -1 when nothing answered (the link is then used anyway). */
 int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
 static int g_path_ms = -2;
+static uint8_t g_hop_mac[6];        /* the PC's (or the gateway's) MAC from the ARP answer: END's raw frames go to it */
+static volatile int g_hop_ok;
 static int path_wait(void) {
     netif_t *nif = net_default_dev;
     uint32_t host = H->h.link_host, me, mask, gw;
@@ -308,16 +327,21 @@ static int path_wait(void) {
     uint8_t ip[4], mac[6];
     memcpy(ip, &host, 4);
     const uint64_t t0 = timer_ms_gettime64();
-    for (int i = 0; i < 120; ++i) {
-        if (net_arp_lookup(nif, ip, mac, NULL, NULL, 0) == 0) return (int)(timer_ms_gettime64() - t0);
-        if (i % 4 == 3) net_arp_query(nif, ip);
-        thd_sleep(250);
+    for (int i = 0; i < 300; ++i) {   /* asked at once and every 0.5 s (ql-core4: was first at 0.75 s, every 1 s) */
+        if (net_arp_lookup(nif, ip, mac, NULL, NULL, 0) == 0) {
+            memcpy(g_hop_mac, mac, 6);
+            g_hop_ok = 1;
+            return (int)(timer_ms_gettime64() - t0);
+        }
+        if (i % 5 == 0) net_arp_query(nif, ip);
+        thd_sleep(100);
     }
     return -1;
 }
 static void *link_thread(void *arg) {
     (void)arg;
     static uint8_t d[CL_DGRAM_MAX + 8];
+    g_link_thd = thd_get_current();
     while (dcql_net_state() != DCQL_LINK_UP) {
         if (dcql_net_state() == DCQL_LINK_FAILED) {
             cl_report("cl-link: adapter failed %d after %u ms\n", dcql_net_err(), (unsigned)(timer_ms_gettime64() - g_t0_ms));
@@ -564,6 +588,14 @@ static void *diag_thread(void *arg) {
         dbgio_printf("cl-diag %d: state %d tx %u rx %u drops %u/%u seen %u bad %u req %u status %d got %u/%u\n", i,
                      dcql_net_state(), tx, rx, txd, rxd, (unsigned)g_rx_seen, (unsigned)g_rx_bad, (unsigned)g_req_id,
                      (int)g_req_status, (unsigned)g_req_got, (unsigned)g_req_blocks);
+        /* the watchdog on the TV each second (ql-core5): armed and counting = CSR C7 and a count that changes (0 to
+           about 205 between two vertical blanks); not armed = CSR 00 */
+        if (g_leaving) break;
+        char w[40];
+        const unsigned cnt = dcql_wdt_cnt(), csr = dcql_wdt_csr();
+        snprintf(w, sizeof(w), "WDT %s CNT %3u CSR %02X", g_wdt_armed ? "ON " : "OFF", cnt, csr);
+        dbgio_printf("cl-wdt %d: %s gap %u us\n", i, w, (unsigned)g_wdt_gap_us);
+        diag_text_at(198, g_wdt_armed ? 0x07e0 : 0x8410, w);
     }
     return NULL;
 }
@@ -574,11 +606,13 @@ static void link_start(void) {
     c.host = H->h.link_host;
     c.port = (unsigned short)H->h.link_port;
     c.lport = (unsigned short)H->h.link_lport;
-    /* the loader's address, asked of DHCP first (the static address if no server answers). Lab arms: "static=1" sets
-       it without DHCP (in Flycast that console then receives nothing), "dhcp=1" asks DHCP for any address */
+    /* the loader's address, mask and gateway, set at once without DHCP (ql-core4: the loader held that address
+       moments ago, so DHCP's round trips and its 4 s resends are pure wait; the path to the PC is proven by ARP before
+       the link counts as up). Lab arms: "dhcpfirst=1" asks DHCP for that address first (the old default, the console
+       took 15 to 19 s), "dhcp=1" asks DHCP for any address; "static=1" is the default now */
     if (!has_arg("dhcp=1")) {
         c.ip = H->h.console_ip; c.mask = H->h.net_mask; c.gw = H->h.net_gw;
-        c.dhcp_first = !has_arg("static=1");
+        c.dhcp_first = has_arg("dhcpfirst=1");
     }
     c.rx_mem = g_rx_mem; c.rx_size = sizeof(g_rx_mem);
     c.tx_mem = g_tx_mem; c.tx_size = sizeof(g_tx_mem);
@@ -649,20 +683,127 @@ static void __attribute__((noreturn)) jump_preloaded(void) {
     for (;;) {}
 }
 
+/* ---- the run's ending to the PC over the link, before the full restart (ql-core4) */
+#define END_TAIL_MAX (32u * 1024u)       /* report bytes an END carries from a thread (its tail) */
+#define END_TAIL_RAW (4u * 1024u)        /* ... and from an exception */
+static void end_head(cl_end_t *e, uint32_t tail_max, uint32_t path) {
+    memset(e, 0, sizeof(*e));
+    const uint32_t rep = H->h.report_len <= CL_REPORT_MAX ? H->h.report_len : CL_REPORT_MAX;
+    e->state = H->h.state; e->exit_code = H->h.exit_code;
+    e->crash_evt = H->h.crash_evt; e->crash_pc = H->h.crash_pc; e->crash_pr = H->h.crash_pr; e->crash_sp = H->h.crash_sp;
+    e->report_len = rep; e->report_crc = H->h.report_crc;
+    e->sent_len = rep < tail_max ? rep : tail_max;
+    e->sent_off = rep - e->sent_len;
+    e->flags = H->h.flags;
+    e->uptime_ms = (uint32_t)(timer_ms_gettime64() - g_t0_ms);
+    e->wdt_feeds = H->h.wdt_feeds; e->wdt_gap_us = H->h.wdt_gap_us;
+    e->link_up_ms = g_link_up ? g_link_up_ms : 0;
+    e->path = path;
+}
+/* from a thread: the head and the tail through the link's ring, then the PC's ENDACK awaited (about 2 s at most,
+   the whole END sent again once when it misses bytes or does not answer). From the link thread itself the answers
+   are read here. Returns 1 when the PC acknowledged the whole END. */
+static int end_send_link(void) {
+    cl_end_t e;
+    end_head(&e, END_TAIL_MAX, 1);
+    uint8_t hb[CL_END_LEN];
+    memcpy(hb, &e, sizeof(hb));   /* both ends little-endian */
+    static uint8_t d[CL_DGRAM_MAX + 8];
+    const int on_link = thd_get_current() == g_link_thd;
+    g_endack = 0;
+    for (int round = 0; round < 2; ++round) {
+        for (uint32_t off = 0; off < e.sent_len; off += CL_CHUNK) {
+            const uint32_t n = e.sent_len - off < CL_CHUNK ? e.sent_len - off : CL_CHUNK;
+            link_out_wait(CL_END, e.sent_off + off, 0, H->report + e.sent_off + off, (uint16_t)n);
+        }
+        link_out_wait(CL_END, CL_END_HEAD, (uint16_t)((e.sent_len + CL_CHUNK - 1) / CL_CHUNK), hb, sizeof(hb));
+        const uint64_t t0 = timer_ms_gettime64();
+        while (!g_endack && timer_ms_gettime64() - t0 < 1000) {
+            if (!on_link) { thd_sleep(10); continue; }
+            const int n = dcql_net_recv_wait(d, sizeof(d), 10);   /* only ENDACK is taken now */
+            if (n > (int)CL_HDR && cl_unframe(d, (size_t)n) >= 0 && d[3] == CL_ENDACK && cl_rd32(d + 8) == H->h.run_id) {
+                g_endack_missing = cl_rd16(d + 14);
+                g_endack = 1;
+            }
+        }
+        if (g_endack && !g_endack_missing) return 1;
+        if (round == 0 && g_endack) g_endack = 0;   /* bytes missing: everything once more */
+    }
+    return 0;
+}
+/* from an exception (no threads, no sockets): UDP frames built here and handed to the adapter's driver, which sends by
+   PIO from an interrupt (KallistiOS bba_rtx). Each frame twice: an answer cannot be read here. Best effort: a frame is
+   dropped when the driver's transmit lock was held by the thread the exception stopped. */
+static uint8_t g_raw[14 + 20 + 8 + CL_DGRAM_MAX + 32] __attribute__((aligned(32)));
+static uint16_t g_raw_id;
+static void raw_out(netif_t *nif, uint8_t type, uint32_t a, uint16_t b, const void *p, uint16_t n) {
+    uint8_t *f = g_raw;
+    const size_t len = cl_frame(f + 42, type, H->h.run_id, a, b, p, n);
+    if (!len) return;
+    memcpy(f, g_hop_mac, 6);
+    memcpy(f + 6, nif->mac_addr, 6);
+    f[12] = 0x08; f[13] = 0x00;
+    uint8_t *ip = f + 14;
+    const uint16_t tot = (uint16_t)(20 + 8 + len);
+    ip[0] = 0x45; ip[1] = 0; ip[2] = (uint8_t)(tot >> 8); ip[3] = (uint8_t)tot;
+    ++g_raw_id;
+    ip[4] = (uint8_t)(g_raw_id >> 8); ip[5] = (uint8_t)g_raw_id; ip[6] = 0x40; ip[7] = 0;   /* don't fragment */
+    ip[8] = 64; ip[9] = 17; ip[10] = ip[11] = 0;
+    memcpy(ip + 12, nif->ip_addr, 4);
+    memcpy(ip + 16, &H->h.link_host, 4);   /* network order */
+    uint32_t sum = 0;
+    for (int i = 0; i < 20; i += 2) sum += (uint32_t)(ip[i] << 8 | ip[i + 1]);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    sum = ~sum & 0xffff;
+    ip[10] = (uint8_t)(sum >> 8); ip[11] = (uint8_t)sum;
+    uint8_t *u = ip + 20;
+    const uint16_t sp = (uint16_t)H->h.link_lport, dp = (uint16_t)H->h.link_port, ul = (uint16_t)(8 + len);
+    u[0] = (uint8_t)(sp >> 8); u[1] = (uint8_t)sp; u[2] = (uint8_t)(dp >> 8); u[3] = (uint8_t)dp;
+    u[4] = (uint8_t)(ul >> 8); u[5] = (uint8_t)ul; u[6] = u[7] = 0;   /* no UDP checksum (allowed on IPv4) */
+    for (int t = 0; t < 2; ++t)
+        for (int i = 0; i < 20000; ++i)   /* the driver answers "again" while its transmit buffer is still owned */
+            if (nif->if_tx(nif, f, (int)(14 + tot), NETIF_NOBLOCK) == 0) break;
+}
+static void end_send_raw(void) {
+    netif_t *nif = net_default_dev;
+    if (!nif || !nif->if_tx || !g_hop_ok || !H->h.link_host) return;
+    cl_end_t e;
+    end_head(&e, END_TAIL_RAW, 2);
+    uint8_t hb[CL_END_LEN];
+    memcpy(hb, &e, sizeof(hb));
+    raw_out(nif, CL_END, CL_END_HEAD, (uint16_t)((e.sent_len + CL_CHUNK - 1) / CL_CHUNK), hb, sizeof(hb));
+    for (uint32_t off = 0; off < e.sent_len; off += CL_CHUNK) {
+        const uint32_t n = e.sent_len - off < CL_CHUNK ? e.sent_len - off : CL_CHUNK;
+        raw_out(nif, CL_END, e.sent_off + off, 0, H->report + e.sent_off + off, (uint16_t)n);
+    }
+    raw_out(nif, CL_END, CL_END_HEAD, (uint16_t)((e.sent_len + CL_CHUNK - 1) / CL_CHUNK), hb, sizeof(hb));
+}
+
 static void __attribute__((noreturn)) finish(uint32_t state, int code) {
-    irq_disable();
-    if (!g_leaving) {   /* the first way out wins; a fault on the way out does not rewrite it */
-        g_leaving = 1;
+    const irq_mask_t m = irq_disable();
+    const int first = !g_leaving;   /* the first way out wins; a fault on the way out does not rewrite it */
+    g_leaving = 1;
+    const int threads_ok = !irq_inside_int() && ((m >> 4) & 15) == 0;   /* called with interrupts on, not a handler */
+    int end = -1;
+    if (first) {
         wdt_stop();
         seal(state, code);
+        if (RET_REBOOT && g_link_up) {
+            if (threads_ok) { irq_restore(m); end = end_send_link(); irq_disable(); }
+            else { end_send_raw(); end = 2; }
+        }
     }
     wdt_disable();
-    dbgio_printf("\ncl: way out: %s, state %u exit %d\n", cl_stub_armed(H) ? "return stub" : g_loader ? "preloaded loader"
-                 : "BIOS reboot (GDEMU image selected first)", (unsigned)H->h.state, H->h.exit_code);
+    dbgio_printf("\ncl: way out: %s, state %u exit %d, END %s\n", RET_REBOOT ? "full restart (BIOS reboot)" :
+                 cl_stub_armed(H) ? "return stub" : g_loader ? "preloaded loader" : "BIOS reboot (GDEMU image selected first)",
+                 (unsigned)H->h.state, (int)H->h.exit_code, end == 1 ? "acknowledged" : end == 0 ? "not acknowledged" :
+                 end == 2 ? "sent raw" : "not sent");
     if (g_diag && state != CL_RUN_CRASHED) {   /* no font calls from a crash handler */
-        diag_text(0xffe0, cl_stub_armed(H) ? "CL 7 BACK: STUB" : g_loader ? "CL 7 BACK: PRELOADED" : "CL 7 BACK: REBOOT");
+        diag_text(0xffe0, RET_REBOOT ? (end == 1 ? "CL 7 END ACKED, RESTART" : "CL 7 RESTART") : cl_stub_armed(H)
+                  ? "CL 7 BACK: STUB" : g_loader ? "CL 7 BACK: PRELOADED" : "CL 7 BACK: REBOOT");
         dcql_wait_vbl(60);
     }
+    if (RET_REBOOT) dcql_bios_reboot();
     if (cl_stub_armed(H)) dcql_jump_stub();
     jump_preloaded();
 }
@@ -670,8 +811,12 @@ static void __attribute__((noreturn)) finish(uint32_t state, int code) {
 /* the closing lines (not from an exception handler: they format text) */
 static void summary(void) {
     if (g_leaving) return;
-    cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us (the watchdog resets after about 20970 us)\n",
-              g_wdt_armed ? "armed" : "measured only", (unsigned)g_wdt_feeds, (unsigned)g_wdt_gap_us);
+    cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us (the watchdog resets after about %u us); WTCSR at "
+              "start %02x%s, after arming %02x count %u, now %02x count %u\n",
+              g_wdt_armed ? "armed" : "measured only", (unsigned)g_wdt_feeds, (unsigned)g_wdt_gap_us,
+              (unsigned)DCQL_WDT_LIMIT_US, g_wdt_csr0,
+              (g_wdt_csr0 & DCQL_WT_WOVF) ? " (WOVF: the last reset was the watchdog's)" : "", g_wdt_csr1, g_wdt_cnt1,
+              dcql_wdt_csr(), dcql_wdt_cnt());
     if (g_link_up) cl_report("cl-link: up %u ms after start (path to the PC: %s %d ms)\n", (unsigned)g_link_up_ms,
                              g_path_ms >= 0 ? "ARP answered after" : "no ARP answer in", g_path_ms >= 0 ? g_path_ms : 30000);
     if (g_link)
@@ -774,7 +919,11 @@ int cl_init(unsigned flags) {
     if (g_diag) H->h.flags |= CL_F_DIAG;   /* the stub holds its colours too */
     cl_handoff_seal(H);
     diag_step(0xffff, "CL 1 START RUN %08X", (unsigned)H->h.run_id);
-    if (!cl_stub_armed(H) && !(flags & CL_NO_PRELOAD)) preload();
+    if (!RET_REBOOT && !cl_stub_armed(H) && !(flags & CL_NO_PRELOAD)) preload();
+    if (RET_REBOOT) {   /* the run's crumb: after a restart with no ending (watchdog, reset) the loader still names it */
+        dcql_crumb_t c = {0, H->h.run_id, CL_STUB_STEP_RUNNING, CL_RUN_RUNNING, 0, H->h.boot_count, 0, 0};
+        dcql_crumb_put(&c);
+    }
     irq_set_handler(EXC_UNHANDLED_EXC, crash_handler, NULL);
     irq_set_handler(EXC_DOUBLE_FAULT, crash_handler, NULL);
     atexit(at_exit);
@@ -787,7 +936,16 @@ int cl_init(unsigned flags) {
         a.label = "cl-deadline";
         thd_create_ex(&a, deadline, NULL);
     }
-    wdt_start(has_arg("wdt=1"));
+    /* the watchdog (ql-core5): off by default, "wdt=1" arms it (the console test arm). ql-core4 armed it by default
+       with the full restart, but its writes missed WTCSR, so the console never ran it; until a console run shows its
+       reset comes back to the loader (the SH-4 keeps WTCSR across its own reset: the BIOS must stop it) and that good
+       programs stay inside its 21 ms (the vertical blank's longest gap on the console was 19.35 ms), it stays an arm.
+       WTCSR as found first: a set WOVF says the last reset was the watchdog's (cleared here so the next run reads its
+       own). On a 50 Hz picture (a vertical blank every 20 ms against 21 ms) "wdt=1" is the caller's risk. */
+    g_wdt_csr0 = dcql_wdt_csr();
+    if (g_wdt_csr0 & (DCQL_WT_TME | DCQL_WT_WOVF)) dcql_wdt_off();
+    if (g_wdt_csr0 & DCQL_WT_WOVF) dbgio_printf("cl: WTCSR %02x at start: the last reset was the watchdog's\n", g_wdt_csr0);
+    wdt_start(has_arg("wdt=1") && !has_arg("wdt=0"));
     if (H->h.net_kind == CL_NET_BBA && !(flags & CL_NO_LINK) && !has_arg("net=0")) link_start();
     else diag_step(0x8410, "CL 2 NO LINK (NOT ASKED)");
     return 1;

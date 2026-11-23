@@ -21,6 +21,34 @@
 #define DCQL_HW_R16(a) (*(volatile uint16_t *)(a))
 #define DCQL_HW_R8(a) (*(volatile uint8_t *)(a))
 
+/* ---------------------------------------------------------------- the SH-4 watchdog (ql-core5)
+ * WTCNT at 0xffc00008, WTCSR at 0xffc0000c (the SH-4's clock pulse generator; KallistiOS hardware/wdt.c: WDT_BASE
+ * 0xffc00008, WTCSR at +4). Written 16 bits wide with a key in the high byte (0x5a WTCNT, 0xa5 WTCSR), read 8 bits
+ * wide. 0xffc00004 is STBCR (module stop and standby), not WTCSR: until ql-core5 every watchdog write here went to
+ * 0xffc00004, so the watchdog never ran (the console's frozen `hangoff` row, 2026-11-22).
+ * WTCSR: bit 7 TME (count), 6 WT/IT (1 = watchdog mode: a reset on overflow), 5 RSTS (0 = power-on reset), 4 WOVF
+ * (the watchdog overflowed), 3 IOVF, 2..0 CKS (7 = Pck/4096: one count 81.92 us at Pck 50 MHz, 256 counts 20.97 ms).
+ * The SH-4 does not clear WTCNT and WTCSR on the watchdog's own reset (only the RESET pin does): after it the counter
+ * keeps counting until the boot code stops it, and WOVF stays set for the next program to read. */
+#define DCQL_WTCNT 0xffc00008u
+#define DCQL_WTCSR 0xffc0000cu
+#define DCQL_WT_TME 0x80u
+#define DCQL_WT_WTIT 0x40u
+#define DCQL_WT_WOVF 0x10u
+#define DCQL_WT_CKS4096 7u
+#define DCQL_WDT_LIMIT_US 20971u
+static inline void dcql_wdt_feed(void) { DCQL_HW_R16(DCQL_WTCNT) = 0x5a00; }
+/* watchdog mode, power-on reset, Pck/4096; TME off while the clock is chosen (WOVF cleared), the counter at 0, TME */
+static inline void dcql_wdt_arm(void) {
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_WTIT | DCQL_WT_CKS4096);
+    DCQL_HW_R16(DCQL_WTCNT) = 0x5a00;
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_TME | DCQL_WT_WTIT | DCQL_WT_CKS4096);
+}
+/* stopped: TME and the mode bit cleared (no reset, no interrupt) */
+static inline void dcql_wdt_off(void) { DCQL_HW_R16(DCQL_WTCSR) = 0xa500; }
+static inline uint8_t dcql_wdt_csr(void) { return DCQL_HW_R8(DCQL_WTCSR); }
+static inline uint8_t dcql_wdt_cnt(void) { return DCQL_HW_R8(DCQL_WTCNT); }
+
 /* ---------------------------------------------------------------- the GD-ROM's ATA registers (G1 bus, P2) */
 #define DCQL_ATA_ALTSTATUS 0xa05f7018u
 #define DCQL_ATA_DATA 0xa05f7080u
@@ -248,6 +276,33 @@ static inline void dcql_save_handoff(uint32_t area_p2, uint32_t hdr_bytes, uint3
         dcql_copy_words(base + rep_off, area_p2 + rep_off, rep_bytes, k);
         dcql_copy_words(base, area_p2, hdr_bytes, k);
     }
+}
+
+/* ---------------------------------------------------------------- the broadband adapter at the way back (ql-core4) */
+/* The adapter's PCI bridge ("GAPS") and its RTL8139, on the G2 bus. A BIOS reboot does not know the adapter, so its
+   32 KiB of memory (KallistiOS's receive ring and transmit buffers, 0x01840000) is a fourth place a saved hand-off may
+   outlive the reboot in, where main and sound RAM did not (the console, 2026-11-22). Read only when the bridge says it
+   is there and still set up (its ID, and the "ready" bit KallistiOS's gaps_init waits for), so a console without an
+   adapter, or one whose bridge was reset, reads nothing from it. */
+#define DCQL_GAPS_ID 0xa1001400u
+#define DCQL_GAPS_READY 0xa1001418u
+#define DCQL_BBA_NIC 0xa1001700u
+#define DCQL_SAVE_BBA 0xa1840000u      /* header at +0 (CL_STUB_OFF bytes), the report from +0x1000 */
+#define DCQL_SAVE_BBA_REPORT 0x1000u
+#define DCQL_SAVE_BBA_SIZE 0x8000u
+static inline int dcql_gaps_ready(void) {
+    static const char id[16] = {'G', 'A', 'P', 'S', 'P', 'C', 'I', '_', 'B', 'R', 'I', 'D', 'G', 'E', '_', '2'};
+    for (int i = 0; i < 16; ++i)
+        if (DCQL_HW_R8(DCQL_GAPS_ID + i) != (uint8_t)id[i]) return 0;
+    return (DCQL_HW_R32(DCQL_GAPS_READY) & 1u) != 0;
+}
+/* the adapter stopped from anywhere (interrupts off, no KallistiOS): receiver and transmitter off, its interrupts
+   masked, so nothing it receives is written into its memory or raises an interrupt across the reboot */
+static inline void dcql_bba_quiet(void) {
+    if (!dcql_gaps_ready()) return;
+    DCQL_HW_R16(DCQL_BBA_NIC + 0x3c) = 0;        /* RT_INTRMASK */
+    DCQL_HW_R8(DCQL_BBA_NIC + 0x37) = 0;         /* RT_CHIPCMD: rx and tx off */
+    DCQL_HW_R16(DCQL_BBA_NIC + 0x3e) = 0xffff;   /* RT_INTRSTATUS cleared */
 }
 
 /* ---------------------------------------------------------------- three words as bars on the TV */
