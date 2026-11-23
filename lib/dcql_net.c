@@ -433,9 +433,6 @@ static volatile int g_bthreads, g_bdown;
 
 /* the datagram buffers live on their threads' static stacks (lane ql-mem: 2,616 B less fixed memory; the stacks'
    high-water marks are reported by dcql_net_stack_use()) */
-/* a socket the receive thread has left (dcql_net_move_lport): closed by the next move, by which time no thread can be
-   in it (the send thread reads g_sock once a datagram) */
-static volatile int g_sock_dead = -1;
 static void bba_rx_loop(void) {
     unsigned char pkt_rx[DCQL_NET_DGRAM + 208] __attribute__((aligned(4)));
     while (!g_bdown) {
@@ -445,7 +442,6 @@ static void bba_rx_loop(void) {
         if (s < 0) break;
         const int n = recvfrom(s, pkt_rx, sizeof(pkt_rx) - 1, 0, (struct sockaddr *)&from, &fl);
         if (g_bdown) break;
-        if (s != g_sock) { g_sock_dead = s; continue; }   /* dcql_net_move_lport(): woken out of the old socket */
         if (n <= 0) { if (n < 0) thd_sleep(10); continue; }
         g_rx_bytes += n;
         if (!accept_from(&from, fl, n) || g_state != DCQL_LINK_UP) { ++g_rx_drops; continue; }
@@ -781,49 +777,6 @@ void dcql_net_shutdown(void) {
 }
 int dcql_net_start(void) { const int l = api_lock(); const int r = net_start(); api_unlock(l); return r; }
 void dcql_net_stop(void) { const int l = api_lock(); net_stop(); api_unlock(l); }
-
-/* the adapter link's own UDP port moved to `port` (lane ql-fix-dc round 3; the loader calls it while no PC answers).
-   Why: Flycast on Windows maps each port the console sends from onto a PC socket of the same port; the first datagram
-   it sends to a PC port nobody listens on brings back an ICMP "port unreachable", Windows reports that as an error on
-   the next receive, and Flycast (core/network/picoppp.cpp UdpSocket::readAsync) stops receiving on that socket for the
-   rest of the session. So a loader that beacons before the PC tool starts never hears the PC on that port. A real
-   console's KallistiOS only logs that ICMP (kernel/net/net_icmp.c). A new port starts clean; the PC answers the port
-   the beacons come from (the bridge and the CLI follow it). The new socket takes over at once, the receive thread is
-   woken out of the old one through KallistiOS's loopback, and the old socket is closed by the next move. 1 = moved. */
-int dcql_net_move_lport(unsigned port) {
-    int ok = 0;
-#if DCQL_NET_HAVE_BBA
-    const int l = api_lock();
-    const int old = g_sock;
-    const unsigned oldport = g_lport;
-    if (g_kind == DCQL_NET_BBA && g_state == DCQL_LINK_UP && old >= 0 && g_bthreads && !g_bdown && port &&
-        port < 65536 && port != oldport) {
-        if (g_sock_dead >= 0) { close(g_sock_dead); g_sock_dead = -1; }
-        const int s = socket(AF_INET, SOCK_DGRAM, 0);
-        struct sockaddr_in me;
-        memset(&me, 0, sizeof(me));
-        me.sin_family = AF_INET;
-        me.sin_port = htons((unsigned short)port);
-        me.sin_addr.s_addr = INADDR_ANY;
-        if (s >= 0 && bind(s, (struct sockaddr *)&me, sizeof(me)) == 0) {
-            g_sock = s;
-            g_lport = (unsigned short)port;
-            struct sockaddr_in to;   /* wakes the receive thread waiting on the old socket */
-            memset(&to, 0, sizeof(to));
-            to.sin_family = AF_INET;
-            to.sin_port = htons((unsigned short)oldport);
-            to.sin_addr.s_addr = htonl(0x7f000001u);
-            sendto(s, "w", 1, 0, (struct sockaddr *)&to, sizeof(to));
-            logf_("dcql: own port %u -> %u", oldport, port);
-            ok = 1;
-        } else if (s >= 0) close(s);
-    }
-    api_unlock(l);
-#else
-    (void)port;
-#endif
-    return ok;
-}
 int dcql_net_state(void) { return g_state; }
 int dcql_net_kind(void) { return g_kind; }
 int dcql_net_busy(void) {
