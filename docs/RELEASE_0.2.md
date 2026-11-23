@@ -68,8 +68,8 @@ gate, it is never resolved there), then:
    broken-implementation controls, and the three safety suites, each a positive row and a historical control row
    whose pinned rows must fail with their named discrepancy on the code the audit read:
    `test_safety` (21 pinned rows, 16 controls against 1990fb9), `test_safety2` (34 pinned rows, 27 controls against
-   2ff9b9d and 1 against 24cd792) and `test_safety3` (24 pinned rows, 22 controls against ac45161: the round-3
-   blockers);
+   2ff9b9d and 1 against 24cd792), `test_safety3` (24 pinned rows, 22 controls against ac45161: the round-3
+   blockers) and `test_safety4` (13 pinned rows, 12 controls against df476a2: the round-4 confirmation items);
 3. measures the size rows below from the link map and checks what the head adds to the repository (no blob over
    300 KB, no build outputs, no game data, no dot-folders but `.github`);
 4. runs one Flycast suite (`tools/gate/flysuite.py`, `suite.json`): it first listens and refuses to start if a loader
@@ -175,6 +175,10 @@ From the pre-tag audit (2026-11-23, "What a console run should still check"), wi
 - The smart-plug power rung of the reset ladder.
 - Calibrated performance figures (every cost row on the calibrated tier).
 - The optional return stub stays **experimental** until a console run shows it working.
+- Windows directory windows of the /pc grant: Windows has no directory descriptors, so a served folder is
+  re-checked by identity before each open and a run's subfolder is checked by name before it is anchored; a folder
+  swapped in between those two steps by someone who can write in the served root is not caught there (Linux opens
+  both from the anchored descriptor).
 - The bridge auto-selects a HELLO before the version check (discovery only; the session decoder refuses an
   incompatible peer).
 

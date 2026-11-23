@@ -18,12 +18,19 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 ## Shape
 - HTTP/1.1 with JSON bodies on **127.0.0.1:52080** only (the bridge refuses any other address). The hosted relay
   (QA Link Cloud, L3b) carries the same paths with a token.
-- `/pc` (the program's file service) answers only the run the bridge is running or the program whose link is up (its
-  HELLO); any other run ID is refused, never given the served root. A run's folder is anchored when its service
-  starts (its identity, and a directory descriptor where the system has one); every file is opened relative to it and
+- `/pc` (the program's file service) answers only the run the bridge is running, or, when no pushed run is active,
+  the program whose link is up (its HELLO); any other run ID is refused, never given the served root. Ownership is
+  checked on every request (a service made earlier is retired when its run is no longer the owner), and a program
+  that links under another ID retires the previous link's service. While a pushed run is active no other program
+  ID gets /pc. A run's folder is anchored when its service
+  starts (its identity, and a directory descriptor where the system has one; a run's subfolder is opened from the
+  served root's descriptor, not looked up again by name); every file is opened relative to it and
   checked on the opened descriptor (a regular file below the anchor), so a folder replaced or relinked afterwards is
   never served. Where the system cannot say what an open file is, the open is refused. Asset imports, watched
-  reimports, a model's dependencies, MCP build reads and session export read through the descriptor they checked.
+  reimports, a model's dependencies, MCP build reads, the session listing and session export read through the
+  descriptor they checked; an export is streamed from it, never read whole into memory. Where the system has no
+  directory descriptors (Windows) a folder is re-checked by identity before each open: that window is on the
+  deferred list in RELEASE_0.2.md.
 - A request body's `Content-Length` must be digits only and at most 16 MiB; anything else is answered **413** before
   the body is read.
 - Paths under **`/v0/`**. Every JSON answer carries **`contract: 1`**. A client sends `X-Contract: 1` (or
@@ -77,11 +84,11 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `GET /v0/runs` | read | `{runs: [run]}`, newest first |
 | `GET /v0/runs/{id}` | read | The run with `report` (text) |
 | `GET /v0/runs/{id}/report` | read | The report, `text/plain`; `X-Report-CRC-OK: 1` |
-| `GET /v0/runs/{id}/serial` | read | The serial lines in order, a gap marked `[gap: n lines lost]`; the last 20,000 lines of a run are held in memory (`serial_lines` counts every line; the session file keeps them all) |
+| `GET /v0/runs/{id}/serial` | read | The serial lines in order, a gap marked `[gap: n lines lost]`; exactly the last 20,000 lines of a run are held in memory (older ones dropped one at a time) (`serial_lines` counts every line; the session file keeps them all) |
 | `POST /v0/selftest` | run | Push and run the bridge's test program (`--selftest`, dc-qalink's `testprog.elf`) with `report screen:1`; 202 with the run; 501 if none is set up |
-| `POST /v0/stills` | control | **Grab now**: `{timeout_s?}`. The linked program sends its displayed picture (a program with live data is paused for the read and resumed). Answers the still's JSON; 409 no program linked, 504 no answer (a program without the live additions), 410 the program left, 502 CRC mismatch |
+| `POST /v0/stills` | control | **Grab now**: `{timeout_s?}`. The linked program sends its displayed picture (a program with live data is paused for the read and resumed). Answers the still's JSON (200); **502** when the picture failed its CRC (after 3 full copies, or when the program stopped sending for 3 s after a failed copy: one failed record per capture, `crc_ok: false`, `crc_failures`); **504** when nothing arrived by `timeout_s` (default 20 s; an absolute deadline, extended by nothing); in every case a program paused for the read is resumed; 409 no program linked, 504 no answer (a program without the live additions), 410 the program left, 502 CRC mismatch |
 | `GET /v0/stills` | read | `{stills: [still]}` |
-| `GET /v0/stills/{id}` | read | The PNG. `GET /v0/stills/{id}.json`: `id`, `run`, `index`, `picture`, `width`, `height`, `format` (`rgb565`), `crc_ok`, `bytes`, `seconds`, `request`, `tier`, `at` |
+| `GET /v0/stills/{id}` | read | The PNG. `GET /v0/stills/{id}.json`: `id`, `run`, `index`, `picture`, `width`, `height`, `format` (`rgb565`), `crc_ok`, `bytes`, `seconds`, `request`, `tier`, `at` (and `crc_failures` on a failed one); at most 4,096 still records are held in memory, held and failed alike |
 | `POST /v0/command` | control | One endpoint: `{cmd: pause}`, `{cmd: resume}`, `{cmd: step, count}`, `{cmd: warp, preset}`, `{cmd: option, name, value}`, `{cmd: pad, state | steps}`, `{cmd: reset, level: return|watchdog|power}`. Answers `{ok, id, n, error}` (`n` the picture it took effect at); reset answers `rung` (`reset` / `watchdog wait` / `power` / `none`; `power` when the ladder ran out under a running program and only a power cycle is left; `none needed` when no program runs) and `way_back` (below). **409** no program linked; **501** what the loader or the program cannot do yet (a program without the live additions; `memory`) |
 | `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: the rung tried, `reset` / `watchdog wait` / `power` / `none`; `way_back`: how the loader came back, below; `seconds`); the last rung (`done`, `say`) |
 | `GET /v0/summary?slowest=k` | read | The current session: `session`, `label`, `device`, `tier`, `pictures`, `measured`, `missing` (pictures never received), `window`, `phases[]` {`key`, `label`, `budget`, `mean`, `p95`, `p99`, `worst`, `worstAt`, `over`, `tier`}, `guards[]` {`key`, `name`, `value`, `tier`}, `slowest[]` {`n`, `total` (busy: the phases that are not the total), `phases`}, `trace_lost` |
@@ -94,8 +101,8 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `POST /v0/memory/read`, `POST /v0/assets` | - | **501** in this loader (memory reads: plan L5; live assets: plan L5b) |
 
 A **run**: `id`, `program` {`name`, `sha256`, `bytes`} (a finished run keeps the count, not the program's bytes; at
-most 512 runs are kept in memory, counted over every run after insertion: the oldest finished runs go first, and a run
-still queued or running is never dropped, so the count can pass 512 only by the at most 9 runs not finished), `args`, `state` (`queued` / `sending` / `running` / `done` /
+most 512 runs are kept in memory, counted over every run after insertion (each one): the oldest finished runs go first; a
+run still queued or running is never dropped, and there are at most 9 of those, so the count never passes 512), `args`, `state` (`queued` / `sending` / `running` / `done` /
 `crashed` / `timeout` / `reset` / `lost` / `refused`), `times` {`push_s`, `run_s`, `report_s`, `total_s`}, `way_back`
 (from evidence only: `stub` when the loader's HELLO carries the stub's record of a jump, `full restart` when it
 carries the full restart's own record, `full restart (inferred)` when the loader is back with neither (no record says
