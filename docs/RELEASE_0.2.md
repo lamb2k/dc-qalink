@@ -172,6 +172,8 @@ From the pre-tag audit (2026-11-23, "What a console run should still check"), wi
 - The smart-plug power rung of the reset ladder.
 - Calibrated performance figures (every cost row on the calibrated tier).
 - The optional return stub stays **experimental** until a console run shows it working.
+- The bridge auto-selects a HELLO before the version check (discovery only; the session decoder refuses an
+  incompatible peer).
 
 Closed since the first version of this list: fixed memory under its row (ql-mem, 70,151 B, then 70,167 B, 70,187 B
 and the figure above); the in-game menu (ql-menu) and the network disc (ql-disc) are built and measured above.
