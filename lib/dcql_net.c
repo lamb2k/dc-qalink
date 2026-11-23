@@ -474,11 +474,53 @@ static void bba_rx_loop(void) {
         else sem_signal(&g_rx_sem);
     }
 }
+/* the next hop's MAC (lane ql-mem). KallistiOS queues a datagram whose next hop is not in its ARP cache and asks once;
+   when that one question goes unanswered (Flycast, just after the adapter came up: the loader's first HELLO after a
+   fast start reached the PC 5.0 s late, end to beacon 10.24 s instead of 5.24 s) it asks again only after 5 s
+   (net_arp.c net_arp_gc). So the link asks for it as it comes up, and the send thread asks again every 100 ms while
+   the answer is missing, for at most 3 s; the link counts as up at once, as before. */
+int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
+static uint8_t g_hop_ip[4];
+static volatile int g_hop_watch;          /* 1 while the next hop's MAC is being asked for */
+static uint64_t g_hop_t0;
+static void hop_watch_start(void) {
+    netif_t *nif = net_default_dev;
+    unsigned hop = g_host, me, mask, gw;
+    if (!nif || !hop || hop == 0xFFFFFFFFu) return;   /* no fixed peer: it is learnt from its first datagram */
+    memcpy(&me, nif->ip_addr, 4);
+    memcpy(&mask, nif->netmask, 4);
+    memcpy(&gw, nif->gateway, 4);
+    if (mask && (hop & mask) != (me & mask) && gw) hop = gw;
+    memcpy(g_hop_ip, &hop, 4);
+    uint8_t mac[6];
+    if (net_arp_lookup(nif, g_hop_ip, mac, NULL, NULL, 0) == 0) return;   /* known; otherwise this asked once */
+    g_hop_t0 = timer_ms_gettime64();
+    g_hop_watch = 1;
+    sem_signal(&g_tx_sem);   /* the send thread starts its 100 ms rounds now, not at the first datagram */
+}
+static void hop_watch_tick(void) {   /* the send thread, every 100 ms while watching */
+    netif_t *nif = net_default_dev;
+    uint8_t mac[6];
+    const unsigned ms = (unsigned)(timer_ms_gettime64() - g_hop_t0);
+    if (!nif) { g_hop_watch = 0; return; }
+    if (net_arp_lookup(nif, g_hop_ip, mac, NULL, NULL, 0) == 0) {
+        g_hop_watch = 0;
+        logf_("dcql: next hop %u.%u.%u.%u answered in %u ms", g_hop_ip[0], g_hop_ip[1], g_hop_ip[2], g_hop_ip[3], ms);
+    } else if (ms >= 3000) {
+        g_hop_watch = 0;
+        logf_("dcql: next hop %u.%u.%u.%u silent for 3 s", g_hop_ip[0], g_hop_ip[1], g_hop_ip[2], g_hop_ip[3]);
+    } else net_arp_query(nif, g_hop_ip);
+}
 static void *dcql_bba_tx_thd(void *arg) {
     (void)arg;
     unsigned char pkt_tx[DCQL_NET_DGRAM + 8] __attribute__((aligned(4)));
+    uint64_t tick = 0;
     while (!g_bdown) {
-        sem_wait(&g_tx_sem);
+        if (g_hop_watch) {
+            sem_wait_timed(&g_tx_sem, 100);
+            const uint64_t now = timer_ms_gettime64();
+            if (g_hop_watch && !g_bdown && now - tick >= 100) { tick = now; hop_watch_tick(); }
+        } else sem_wait(&g_tx_sem);
         int n;
         while (!g_bdown && g_sock >= 0 && (n = ring_get(&g_tx, pkt_tx, sizeof(pkt_tx))) >= 0)
             if (n > 0) send_to_peer(pkt_tx, n);
@@ -486,32 +528,6 @@ static void *dcql_bba_tx_thd(void *arg) {
     return NULL;
 }
 static void set4(unsigned char *d, unsigned v) { memcpy(d, &v, 4); }
-
-/* the next hop's MAC asked for before the link counts as up (lane ql-mem). KallistiOS queues a datagram whose next hop
-   is not in its ARP cache and asks once; when that one question goes unanswered (Flycast, just after the adapter came
-   up: the loader's first HELLO after a fast start reached the PC 5.0 s late, end to beacon 10.24 s instead of 5.24 s),
-   it asks again only after 5 s (net_arp.c). Asked here every 250 ms, at most 1 s, so the first datagram finds the
-   MAC. Returns the ms it took, -1 when nothing answered (the link is used anyway, as before), -2 when there is no
-   fixed peer to ask for (a peer learnt from its first datagram). */
-int net_arp_query(netif_t *nif, const uint8_t ip[4]);   /* kernel/net/net_arp.c */
-static int next_hop_known(void) {
-    netif_t *nif = net_default_dev;
-    unsigned hop = g_host, me, mask, gw;
-    if (!nif || !hop || hop == 0xFFFFFFFFu) return -2;
-    memcpy(&me, nif->ip_addr, 4);
-    memcpy(&mask, nif->netmask, 4);
-    memcpy(&gw, nif->gateway, 4);
-    if (mask && (hop & mask) != (me & mask) && gw) hop = gw;
-    uint8_t ip[4], mac[6];
-    memcpy(ip, &hop, 4);
-    const uint64_t t0 = timer_ms_gettime64();
-    for (int i = 0; i < 40; ++i) {   /* 40 x 25 ms */
-        if (net_arp_lookup(nif, ip, mac, NULL, NULL, 0) == 0) return (int)(timer_ms_gettime64() - t0);
-        if (i && i % 10 == 0) net_arp_query(nif, ip);   /* the first lookup asked already */
-        thd_sleep(25);
-    }
-    return -1;
-}
 
 /* returns 1 when this (dial) thread is to stay on as the receive thread */
 static int bba_main(void) {
@@ -580,11 +596,10 @@ static int bba_main(void) {
         g_bthreads = 1;
         stay = 1;   /* this thread receives from now on (dial_main) */
     }
-    const int arp_ms = next_hop_known();
+    hop_watch_start();
     g_state = g_stop ? DCQL_LINK_OFF : DCQL_LINK_UP;
-    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s; next hop %s %d ms)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
-          g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP",
-          arp_ms >= 0 ? "answered ARP in" : arp_ms == -1 ? "silent for" : "not asked,", arp_ms >= 0 ? arp_ms : arp_ms == -1 ? 1000 : 0);
+    logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
+          g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP");
     return stay;
 }
 /* a later dcql_net_start() on a running adapter link (after dcql_net_stop()): what bba_main does when the address,
