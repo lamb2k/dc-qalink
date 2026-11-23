@@ -511,40 +511,25 @@ typedef struct { int used; uint32_t handle, size, pos; } pcf_t;
 static pcf_t g_pcf[16];
 /* one read-ahead block: a C library's small buffered reads (1 KiB each through newlib's FILE) cost one round trip per
    CL_FREAD_MAX, not per call. Lane ql-mem: only a program that reads /pc files needs it, so it is allocated when the
-   first file opens and freed when the last one closes (no allocation: small reads go to the PC as asked, unbuffered) */
-static uint8_t *g_ra;
+   first file opens and freed when the last one closes (no allocation: small reads go to the PC as asked, unbuffered).
+   Lane ql-fix-dc round 2 (audit item 2): cl_ra.h, one lock over the block's bookkeeping, its fetch and its copy (a
+   read holds it from its check to its copy), its allocation and its free. It is freed at the last close, and on the way
+   out of a program that leaves files open (ra_release from summary() and finish(), threads still running; at most
+   200 ms for a read under way). After the way out begins, reads go to the PC unbuffered. An exception's way out frees
+   nothing (the heap may be what failed; the full restart ends the image). */
+#include "cl_ra.h"
+static cl_ra_t g_ra = CL_RA_INIT(CL_FREAD_MAX);
 static int g_pcf_open;
-static const pcf_t *g_ra_file;
-static uint32_t g_ra_handle, g_ra_off, g_ra_len;
-/* lane ql-fix-dc (audit item 4): a read using the block holds it (g_ra_busy), so it is freed only when no read is
-   under way: at the last close, and on the way out of a program that leaves files open (ra_release from summary() and
-   finish(), threads still running). After the way out begins, reads go to the PC unbuffered. An exception's way out
-   frees nothing (the heap may be what failed; the full restart ends the image). */
-static volatile int g_ra_busy, g_ra_closed;
-static int ra_hold(void) {
-    const irq_mask_t m = irq_disable();
-    const int ok = g_ra && !g_ra_closed;
-    if (ok) ++g_ra_busy;
-    irq_restore(m);
-    return ok;
-}
-static void ra_drop(void) { const irq_mask_t m = irq_disable(); --g_ra_busy; irq_restore(m); }
-/* frees the block when no read holds it: 1 freed now, 0 none to free, -1 kept (a read under way) */
-static int ra_free(void) {
-    const irq_mask_t m = irq_disable();
-    uint8_t *const p = g_ra_busy ? NULL : g_ra;
-    const int held = g_ra_busy && g_ra;
-    if (p) { g_ra = NULL; g_ra_file = NULL; }
-    irq_restore(m);
-    if (p) free(p);
-    return p ? 1 : held ? -1 : 0;
+static int ra_fetch(void *ctx, uint32_t handle, uint32_t pos, uint8_t *dst, uint32_t n) {
+    (void)ctx;
+    uint8_t pl[12];
+    cl_wr32(pl, handle); cl_wr32(pl + 4, pos); cl_wr32(pl + 8, n);
+    return pc_request(CL_FREAD, pl, sizeof(pl), dst, n);
 }
 static int g_ra_exit = 2;   /* ra_release's result: 1 freed at exit, 0 none held, -1 kept, 2 not run */
 static void ra_release(void) {
     if (g_ra_exit != 2 && g_ra_exit != -1) return;
-    g_ra_closed = 1;
-    for (int i = 0; i < 20 && g_ra_busy; ++i) thd_sleep(10);   /* at most 200 ms for a read under way */
-    const int r = ra_free();
+    const int r = cl_ra_release(&g_ra, 200);
     if (g_ra_exit != 1) g_ra_exit = r;
 }
 static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
@@ -564,7 +549,7 @@ static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
         if (!g_pcf[i].used) {
             g_pcf[i] = (pcf_t){1, g_req_handle, g_req_size, 0};
             ++g_pcf_open;
-            if (!g_ra && !g_ra_closed) g_ra = (uint8_t *)memalign(32, CL_FREAD_MAX);   /* none: unbuffered reads */
+            cl_ra_open(&g_ra);   /* no memory: unbuffered reads */
             ++g_st.files_opened;
             return (void *)(intptr_t)(i + 1);
         }
@@ -579,9 +564,9 @@ static int pc_close(void *h) {
     pcf_t *f = pcf(h);
     if (!f) return -1;
     link_out(CL_FCLOSE, f->handle, 0, NULL, 0);
-    if (g_ra_file == f) g_ra_file = NULL;
+    cl_ra_forget(&g_ra, f);
     f->used = 0;
-    if (g_pcf_open > 0 && !--g_pcf_open) (void)ra_free();
+    if (g_pcf_open > 0 && !--g_pcf_open) (void)cl_ra_free(&g_ra);
     return 0;
 }
 static ssize_t pc_read(void *h, void *buf, size_t cnt) {
@@ -591,22 +576,16 @@ static ssize_t pc_read(void *h, void *buf, size_t cnt) {
     if (cnt > f->size - f->pos) cnt = f->size - f->pos;
     const uint64_t t0 = timer_ms_gettime64();
     size_t done = 0;
-    if (cnt < CL_FREAD_MAX && ra_hold()) {
-        if (!(g_ra_file == f && g_ra_handle == f->handle && f->pos >= g_ra_off && f->pos + cnt <= g_ra_off + g_ra_len)) {
-            const uint32_t n = f->size - f->pos < CL_FREAD_MAX ? f->size - f->pos : CL_FREAD_MAX;
-            uint8_t pl[12];
-            cl_wr32(pl, f->handle); cl_wr32(pl + 4, f->pos); cl_wr32(pl + 8, n);
-            g_ra_file = NULL;
-            if (pc_request(CL_FREAD, pl, sizeof(pl), g_ra, n)) { ra_drop(); errno = EIO; return -1; }
-            g_ra_file = f; g_ra_handle = f->handle; g_ra_off = f->pos; g_ra_len = n;
-            ++g_st.reads;
-            g_st.read_bytes += n;
+    if (cnt < CL_FREAD_MAX) {
+        uint32_t fetched;
+        const int r = cl_ra_read(&g_ra, f, f->handle, f->pos, f->size, buf, (uint32_t)cnt, ra_fetch, NULL, &fetched);
+        if (r == -1) { errno = EIO; return -1; }
+        if (r >= 0) {
+            if (fetched) { ++g_st.reads; g_st.read_bytes += fetched; }
+            f->pos += cnt;
+            g_st.read_ms += (unsigned)(timer_ms_gettime64() - t0);
+            return (ssize_t)cnt;
         }
-        memcpy(buf, g_ra + (f->pos - g_ra_off), cnt);
-        ra_drop();
-        f->pos += cnt;
-        g_st.read_ms += (unsigned)(timer_ms_gettime64() - t0);
-        return (ssize_t)cnt;
     }
     while (done < cnt) {
         const uint32_t n = cnt - done < CL_FREAD_MAX ? (uint32_t)(cnt - done) : CL_FREAD_MAX;
@@ -822,10 +801,13 @@ static void end_head(cl_end_t *e, uint32_t tail_max, uint32_t path) {
 /* from a thread: the head and the tail through the link's ring, then the PC's ENDACK awaited (1 s a round, the whole
    END sent again once when it misses bytes or does not answer). From the link thread itself the answers are read
    here. Returns 1 when the PC acknowledged the whole END.
-   Exit-time bound (lane ql-fix-dc, audit item 2): the whole of it, both rounds with their waits for ring room and for
-   ENDACK, ends by END_LINK_MS after it starts; on a link that is not up it ends at once (nothing can be sent). So a PC
-   that has gone away delays the full restart by at most END_LINK_MS (plus one 1 ms sleep and one datagram's copy);
-   before, each of the up to 33 datagrams of a round could wait 2,000 x 1 ms for ring room. */
+   Exit-time retry budget (lane ql-fix-dc, audit item 2; wording per the round-2 audit): both rounds, with their waits
+   for ring room and for ENDACK, share one budget of END_LINK_MS from the start; no new retry or wait begins after it
+   runs out, and on a link that is not up the path gives up at once (nothing can be sent). It is a budget checked
+   between steps, not a hard wall-clock bound on the whole exit: a step under way when it runs out finishes first (a
+   wait for ring room reads the clock after a failed enqueue and its 1 ms sleep; a receive poll takes up to 10 ms).
+   So a PC that has gone away delays the full restart by about END_LINK_MS. Before, each of the up to 33 datagrams of
+   a round could wait 2,000 x 1 ms for ring room. */
 #define END_LINK_MS 4000u
 static int end_send_link(void) {
     cl_end_t e;

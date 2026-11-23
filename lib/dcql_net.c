@@ -91,7 +91,7 @@ static bool thread_busy(tid_t id) {
     return busy;
 }
 
-/* ---- single-producer single-consumer rings of datagrams (dcql_ring.h, with who owns their memory)
+/* ---- rings of datagrams (dcql_ring.h: who owns their memory, and the one exclusion every access takes)
    The program's own ring memory (dcql_net_config: borrowed, never freed here), or the built-in 4 KiB rings (owned),
    allocated by dcql_net_start() only when the program supplied none (lane ql-mem: a program with its own rings carries
    no unused built-in rings). Lifetimes (docs/SIZES.md "Heap"): owned rings stay across dcql_net_stop() and a later
@@ -176,9 +176,9 @@ static void pump(void) {
         if (n < 0) break;
         g_rx_bytes += n;
         if (!accept_from(&from, fl, n)) { ++g_rx_drops; continue; }
-        if (!ring_put(&g_rx, g_pkt, (unsigned)n)) ++g_rx_drops;
+        if (!ringx_put(&g_rx, g_pkt, (unsigned)n)) ++g_rx_drops;
     }
-    if ((n = ring_get(&g_tx, g_pkt, sizeof(g_pkt))) > 0) {
+    if ((n = ringx_get(&g_tx, g_pkt, sizeof(g_pkt))) > 0) {
         if (!g_tx_fault && !g_retiring && !g_stop) send_to_peer(g_pkt, n);
         else ++g_tx_drops;
     }
@@ -329,7 +329,7 @@ static bool hang_up(void) {
     g_retiring = true;
     const int s = g_sock;
     g_sock = -1;          /* the pump stops */
-    ring_clear(&g_tx);
+    ringx_clear(&g_tx);
     modem_shutdown();     /* the line drops: a blocked modem write returns */
     if (s >= 0) close(s);
     if (g_ppp_init) _ppp_enter_phase(PPP_PHASE_DEAD);
@@ -341,7 +341,7 @@ static bool hang_up(void) {
         g_ppp_init = false;
     }
     timer_down();
-    ring_clear(&g_rx);
+    ringx_clear(&g_rx);
     return true;
 }
 
@@ -379,8 +379,8 @@ static bool dial_once(void) {
     me.sin_addr.s_addr = INADDR_ANY;
     if (bind(s, (struct sockaddr *)&me, sizeof(me)) < 0) { close(s); g_err = -12; return false; }
     if (fcntl(s, F_SETFL, O_NONBLOCK) < 0) { close(s); g_err = -13; return false; }
-    ring_clear(&g_rx);   /* no datagram from an earlier call may be taken */
-    ring_clear(&g_tx);
+    ringx_clear(&g_rx);   /* no datagram from an earlier call may be taken */
+    ringx_clear(&g_tx);
     g_sock = s;
     logf_("dcql: up ip=%u.%u.%u.%u", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
     return true;
@@ -445,7 +445,7 @@ static void bba_rx_loop(void) {
         if (n <= 0) { if (n < 0) thd_sleep(10); continue; }
         g_rx_bytes += n;
         if (!accept_from(&from, fl, n) || g_state != DCQL_LINK_UP) { ++g_rx_drops; continue; }
-        if (!ring_put(&g_rx, pkt_rx, (unsigned)n)) ++g_rx_drops;
+        if (!ringx_put(&g_rx, pkt_rx, (unsigned)n)) ++g_rx_drops;
         else sem_signal(&g_rx_sem);
     }
 }
@@ -497,7 +497,7 @@ static void *dcql_bba_tx_thd(void *arg) {
             if (g_hop_watch && !g_bdown && now - tick >= 100) { tick = now; hop_watch_tick(); }
         } else sem_wait(&g_tx_sem);
         int n;
-        while (!g_bdown && g_sock >= 0 && (n = ring_get(&g_tx, pkt_tx, sizeof(pkt_tx))) >= 0)
+        while (!g_bdown && g_sock >= 0 && (n = ringx_get(&g_tx, pkt_tx, sizeof(pkt_tx))) >= 0)
             if (n > 0) send_to_peer(pkt_tx, n);
     }
     return NULL;
@@ -556,8 +556,8 @@ static int bba_main(void) {
         if (bind(s, (struct sockaddr *)&me, sizeof(me)) < 0) { close(s); g_err = -12; g_state = DCQL_LINK_FAILED; return 0; }
         g_sock = s;
     }
-    ring_clear(&g_rx);
-    ring_clear(&g_tx);
+    ringx_clear(&g_rx);
+    ringx_clear(&g_tx);
     int stay = 0;
     if (!g_bthreads) {
         kthread_attr_t a;
@@ -588,8 +588,8 @@ static int bba_restart(void) {
     g_attempt = 1;
     g_host = g_configured_host;
     memcpy(g_peer, &g_host, 4);
-    ring_clear(&g_rx);
-    ring_clear(&g_tx);
+    ringx_clear(&g_rx);
+    ringx_clear(&g_tx);
     g_state = DCQL_LINK_UP;
     logf_("dcql: up ip=%u.%u.%u.%u (adapter, again)", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
     return 1;
@@ -668,36 +668,40 @@ static void copy_str(char *d, size_t n, const char *s) {
     if (s && s[0]) { strncpy(d, s, n - 1); d[n - 1] = 0; }
 }
 
-/* the program's own rings in place of the current ones (lane ql-fix-dc, audit item 4). Only while the link is not in
-   use (off, failed or dropped, no dial or hang-up thread): otherwise the current rings are kept and a line says so.
-   When the link's threads exist (the adapter's stay on after a stop) they never put into a ring of a link that is not
-   up, and a put or get under way finishes within its one datagram copy: one 2 ms sleep lets it, then the pointers
-   change with interrupts off (one CPU: no thread sees half a swap) and the owned memory they replace is freed. */
+/* the program's own rings in place of the current ones (lane ql-fix-dc, audit item 4; round 2). Refused while the link
+   is in use (not off, failed or dropped, or a dial or hang-up thread running): the current rings are kept and a line
+   says so. The rule is checked and the swap made under g_api_mx, so no start or stop comes between them. The swap is
+   rings_replace() (dcql_ring.h): inside the ring exclusion that every put, get and clear also takes (interrupts off),
+   so when it returns no thread is inside the old memory and none can reach it: owned memory is freed at once, and a
+   program may free or reuse its own earlier rings as soon as dcql_net_config() returns. No sleep, no guess. */
 static void rings_swap(unsigned char *rx, unsigned rxn, unsigned char *tx, unsigned txn) {
     const int st = g_state;
     if ((st != DCQL_LINK_OFF && st != DCQL_LINK_FAILED && st != DCQL_LINK_DROPPED) || dcql_net_busy()) {
         logf_("dcql: rings kept (link in use, state %d)", st);
         return;
     }
-    int threads = 0;
-#if DCQL_NET_HAVE_BBA
-    threads |= g_bthreads;
-#endif
-#if DCQL_NET_HAVE_MODEM
-    threads |= thread_busy(g_ppp_tid);
-#endif
-    if (threads) thd_sleep(2);
-    const irq_mask_t m = irq_disable();
-    unsigned char *const orx = rx ? ring_take(&g_rx, rx, rxn, 0) : NULL;
-    unsigned char *const otx = tx ? ring_take(&g_tx, tx, txn, 0) : NULL;
-    irq_restore(m);
-    if (orx) DCQL_RING_FREE(orx);
-    if (otx) DCQL_RING_FREE(otx);
+    unsigned char *old[2];
+    rings_replace(&g_rx, rx, rxn, &g_tx, tx, txn, old);
+    if (old[0]) DCQL_RING_FREE(old[0]);
+    if (old[1]) DCQL_RING_FREE(old[1]);
 }
 
-/* ---- API */
+/* ---- API
+   dcql_net_config, dcql_net_start, dcql_net_stop and dcql_net_shutdown run one at a time (g_api_mx; round 2): a
+   reconfiguration's check of the link state and its ring swap see no start or stop between them. None of the link's
+   own threads calls them. From an interrupt handler they run without the lock (a mutex cannot be taken there). */
+static mutex_t g_api_mx = MUTEX_INITIALIZER;
+static int api_lock(void) { if (irq_inside_int()) return 0; mutex_lock(&g_api_mx); return 1; }
+static void api_unlock(int held) { if (held) mutex_unlock(&g_api_mx); }
+
+static void net_config(const dcql_net_config_t *c);
 void dcql_net_config(const dcql_net_config_t *c) {
     if (!c) return;
+    const int l = api_lock();
+    net_config(c);
+    api_unlock(l);
+}
+static void net_config(const dcql_net_config_t *c) {
     g_cfg_net = c->net;
     copy_str(g_number, sizeof(g_number), c->number);
     copy_str(g_user, sizeof(g_user), c->user);
@@ -716,7 +720,7 @@ void dcql_net_config(const dcql_net_config_t *c) {
     g_logfn = c->log;
 }
 
-int dcql_net_start(void) {
+static int net_start(void) {
     if (g_state == DCQL_LINK_UP) return 0;
     if (!rings_ready()) { g_state = DCQL_LINK_FAILED; g_err = -44; return -1; }   /* no memory for the built-in rings */
 #if DCQL_NET_HAVE_BBA
@@ -742,11 +746,11 @@ int dcql_net_start(void) {
 #endif
     g_stop = 0; g_err = 0; g_attempt = 0;
     g_state = mode ? DCQL_LINK_STOPPING : DCQL_LINK_DIAL;
-    ring_clear(&g_rx);
+    ringx_clear(&g_rx);
     if (!spawn_dial(mode)) { g_state = DCQL_LINK_FAILED; g_err = -30; return -1; }
     return 0;
 }
-void dcql_net_stop(void) {
+static void net_stop(void) {
     g_stop = 1;   /* a dial in progress stops after its current step */
     if (g_dial_running) { g_state = DCQL_LINK_STOPPING; return; }
 #if DCQL_NET_HAVE_MODEM
@@ -760,6 +764,7 @@ void dcql_net_stop(void) {
 }
 void dcql_net_shutdown(void) {
 #if DCQL_NET_HAVE_BBA
+    const int l = api_lock();
     if (g_kind == DCQL_NET_BBA && g_net_ready) {
         g_bdown = 1;
         g_state = DCQL_LINK_OFF;
@@ -767,8 +772,11 @@ void dcql_net_shutdown(void) {
         g_net_ready = false;
         g_sock = -1;
     }
+    api_unlock(l);
 #endif
 }
+int dcql_net_start(void) { const int l = api_lock(); const int r = net_start(); api_unlock(l); return r; }
+void dcql_net_stop(void) { const int l = api_lock(); net_stop(); api_unlock(l); }
 int dcql_net_state(void) { return g_state; }
 int dcql_net_kind(void) { return g_kind; }
 int dcql_net_busy(void) {
@@ -779,11 +787,9 @@ int dcql_net_busy(void) {
 }
 int dcql_net_send(const void *p, unsigned n) {
     if (g_state != DCQL_LINK_UP) return 0;
-    /* any thread may send (a program's main thread, its link thread, a stills thread): the ring has one producer at a
-       time with interrupts off for the copy (at most 1.5 KB) */
-    const irq_mask_t irq = irq_disable();
-    const bool ok = n <= DCQL_NET_DGRAM && ring_put(&g_tx, p, n);
-    irq_restore(irq);
+    /* any thread may send (a program's main thread, its link thread, a stills thread): ringx_put copies with
+       interrupts off (the ring exclusion, dcql_ring.h), at most 1,202 B as two memcpy runs at most */
+    const bool ok = n <= DCQL_NET_DGRAM && ringx_put(&g_tx, p, n);
     if (!ok) { ++g_tx_drops; return 0; }
 #if DCQL_NET_HAVE_BBA
     if (g_kind == DCQL_NET_BBA) sem_signal(&g_tx_sem);
@@ -791,7 +797,7 @@ int dcql_net_send(const void *p, unsigned n) {
     return 1;
 }
 int dcql_net_recv(void *p, unsigned max) {
-    const int n = ring_get(&g_rx, p, max);
+    const int n = ringx_get(&g_rx, p, max);
     if (n == -2) ++g_rx_drops;
     return n;
 }
@@ -808,7 +814,7 @@ int dcql_net_recv_wait(void *p, unsigned max, int timeout_ms) {
         thd_sleep(4);
     }
 }
-unsigned dcql_net_tx_queued(void) { return ring_used(&g_tx); }
+unsigned dcql_net_tx_queued(void) { return ringx_used(&g_tx); }
 void dcql_net_relearn(void) { g_learn = 1; }
 int dcql_net_learning(void) { return g_learn; }
 int dcql_net_mac(unsigned char out[6]) {

@@ -33,7 +33,10 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
   `calls.log` in the data folder with who made it (`X-By`, else the client address) and its level.
 - The UDP port of the loader (52060) stays bound while the bridge runs. **It is bound on 127.0.0.1 by default**
   (ql-fix-pc, after the 2026-11-23 audit); on the address `--console` names when that is this PC's own (Flycast); on
-  every address (0.0.0.0) only with `--allow-lan`; a typed `--udp-host` is used as typed. Whatever is bound, without
+  every address (0.0.0.0) only with `--allow-lan`. **Any bind that is not loopback needs `--allow-lan`**, a typed
+  `--udp-host` included (ql-fix-pc round 2: without it the bridge refuses to start, exit 2, and binds nothing). The
+  one exception is local Flycast: `--console <this PC's own address>` binds that one address, never every address,
+  because Flycast's emulated adapter speaks from this PC's LAN address. Whatever is bound, without
   `--allow-lan` only datagrams from this PC's own addresses are read. `status.udp_bind` says what is bound
   (`address:port`). The console is learnt only from a loader's HELLO; a PC-to-console datagram (our own broadcast
   looped back) is dropped.
@@ -64,7 +67,7 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `GET /v0/devices` | read | `{devices: [device]}` (one device per bridge) |
 | `GET /v0/discovery` | read | `listening`, `port`, `seen[]`: `id`, `console_ip`, `address`, `port`, `kind` (flycast when the beacon comes from this PC), `transport`, `loader`, `protocol`, `beacons`, `last_s_ago`, `chosen`, `ident`, `remembered`, `at`, `mac`, `gdemu_slot`, `gdemu_version`, `stub`, `stub_text` |
 | `POST /v0/link` | control | `{console_ip}` (or `device` id): talk to that loader; answers the status. 404 if none was heard there |
-| `POST /v0/runs` | run | Push and run. **multipart/form-data**: `program` (file: ELF or raw image), `sha256` (required; a mismatch is 400 and nothing is queued), `name`, `args`, `deadline_s`, `files` (a folder name below the bridge's `--files`, never a path), `reset_after_s`. Scripts may send `application/octet-stream` with `X-Build-Sha256`, `X-Build-Name`, `X-Args`. Answers **202** with the run |
+| `POST /v0/runs` | run | Push and run. **multipart/form-data**: `program` (file: ELF or raw image), `sha256` (required; a mismatch is 400 and nothing is queued), `name`, `args`, `deadline_s`, `files` (a folder name below the bridge's `--files`, never a path; one that is not a folder below the served /pc root is **400**, and that run is never given the whole root), `reset_after_s`. Scripts may send `application/octet-stream` with `X-Build-Sha256`, `X-Build-Name`, `X-Args`. Answers **202** with the run; **429** when the queue is full (at most 8 runs waiting, 64 MiB of their programs together) |
 | `GET /v0/runs` | read | `{runs: [run]}`, newest first |
 | `GET /v0/runs/{id}` | read | The run with `report` (text) |
 | `GET /v0/runs/{id}/report` | read | The report, `text/plain`; `X-Report-CRC-OK: 1` |
@@ -73,20 +76,25 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `POST /v0/stills` | control | **Grab now**: `{timeout_s?}`. The linked program sends its displayed picture (a program with live data is paused for the read and resumed). Answers the still's JSON; 409 no program linked, 504 no answer (a program without the live additions), 410 the program left, 502 CRC mismatch |
 | `GET /v0/stills` | read | `{stills: [still]}` |
 | `GET /v0/stills/{id}` | read | The PNG. `GET /v0/stills/{id}.json`: `id`, `run`, `index`, `picture`, `width`, `height`, `format` (`rgb565`), `crc_ok`, `bytes`, `seconds`, `request`, `tier`, `at` |
-| `POST /v0/command` | control | One endpoint: `{cmd: pause}`, `{cmd: resume}`, `{cmd: step, count}`, `{cmd: warp, preset}`, `{cmd: option, name, value}`, `{cmd: pad, state | steps}`, `{cmd: reset, level: return|watchdog|power}`. Answers `{ok, id, n, error}` (`n` the picture it took effect at); reset answers the rung. **409** no program linked; **501** what the loader or the program cannot do yet (a program without the live additions; `memory`) |
-| `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: `stub` / `watchdog` / `none`, `seconds`); the last rung (`done`, `say`) |
+| `POST /v0/command` | control | One endpoint: `{cmd: pause}`, `{cmd: resume}`, `{cmd: step, count}`, `{cmd: warp, preset}`, `{cmd: option, name, value}`, `{cmd: pad, state | steps}`, `{cmd: reset, level: return|watchdog|power}`. Answers `{ok, id, n, error}` (`n` the picture it took effect at); reset answers `rung` (`reset` / `watchdog wait` / `none`) and `way_back` (below). **409** no program linked; **501** what the loader or the program cannot do yet (a program without the live additions; `memory`) |
+| `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: the rung tried, `reset` / `watchdog wait` / `none`; `way_back`: how the loader came back, below; `seconds`); the last rung (`done`, `say`) |
 | `GET /v0/summary?slowest=k` | read | The current session: `session`, `label`, `device`, `tier`, `pictures`, `measured`, `missing` (pictures never received), `window`, `phases[]` {`key`, `label`, `budget`, `mean`, `p95`, `p99`, `worst`, `worstAt`, `over`, `tier`}, `guards[]` {`key`, `name`, `value`, `tier`}, `slowest[]` {`n`, `total` (busy: the phases that are not the total), `phases`}, `trace_lost` |
 | `GET /v0/trace?from&to&lane&limit` | read | `from`, `to`, `events[]` {`lane`, `n`, `d`, `label`}, `truncated`, `lost` |
 | `GET /v0/log?from&to&level&q&limit` | read | `from`, `to`, `lines[]` {`n`, `lv`, `msg`}, `truncated` (the newest when over the limit; `warn` includes `err`) |
 | `GET /v0/presets` | read | What the running program declared: `program`, `presets[]` {`id`, `group`, `label`}, `options[]` {`name`, `type` bool/int/enum, `min`, `max`, `values`, `value`, `label`}, `scripts` (none yet), `linked` |
 | `GET /v0/sessions` | read | `{sessions: [{id, label, device, started, recorded, ended, pictures, tier, bytes}]}` |
 | `GET /v0/sessions/{id}` | read | The session file, `application/x-ndjson` (below) |
-| `GET /v0/loader` | read | The loader disc folder (`--loader-disc`) as one zip (`Content-Disposition` names it); 501 if none |
+| `GET /v0/loader` | read | The loader disc folder (`--loader-disc`) as one zip (`Content-Disposition` names it); only files that open inside the folder; **413** over 64 MiB; 501 if none |
 | `POST /v0/memory/read`, `POST /v0/assets` | - | **501** in this loader (memory reads: plan L5; live assets: plan L5b) |
 
-A **run**: `id`, `program` {`name`, `sha256`, `bytes`}, `args`, `state` (`queued` / `sending` / `running` / `done` /
+A **run**: `id`, `program` {`name`, `sha256`, `bytes`} (a finished run keeps the count, not the program's bytes; at
+most 512 runs are kept in memory), `args`, `state` (`queued` / `sending` / `running` / `done` /
 `crashed` / `timeout` / `reset` / `lost` / `refused`), `times` {`push_s`, `run_s`, `report_s`, `total_s`}, `way_back`
-(`stub` / `watchdog` / `power`), `by`, `queued_at`, `ended_at`, `device`, `tier`, `deadline_s`, `files` (the file
+(from evidence only, ql-fix-pc round 2: `stub` when the loader's HELLO carries the stub's record of a jump, `full
+restart` when the loader is back without it, null when it is not back), `reset_rung` (only when the ladder ran: the
+rung tried, `reset` / `watchdog wait` / `power`; a request, not how the console came back), `evidence` {`end` (the
+END's state), `loader_back` (true/false), `loader_report` (`none` / `crc ok` / `bad crc` / `failed: ...`)}: a whole END
+with its CRC right is the run's result even when the loader's report fails or the ladder runs out, `by`, `queued_at`, `ended_at`, `device`, `tier`, `deadline_s`, `files` (the file
 service's totals), `stills`, `serial_lines`, `error`, `transfer` (the push's numbers), `crash` {`event`, `pc`, `pr`, `sp`},
 **`ending`** when the result came by END before the console's restart (ql-fix-pc: `bytes`, `tail`, `complete`,
 `whole`, `crc_ok`; the run is kept even when the loader's saved report is empty afterwards) and the parsed
@@ -114,7 +122,7 @@ no build.
 | `GET /v0/disc` | read | The network disc: `mode` (`overlay` / `whole`, or null with a `note` when none is served), `files[]` {`path`, `size`, `sha256`, `side` (`pc` served / `disc` read from GDEMU), `source` (`base` / `overlay`), `changed`, `new`, `base_sha256`}, `sha256` (the manifest's), `count`, `served`, `base`, `overlay`, `stats` (requests, resent requests, pieces, bytes, the console's round trip `request_ms` {`n`, `mean`, `p50`, `p99`, `worst`}, `program_reads` per side {`records`, `bytes`, `ms`, `MBps`}) |
 | `GET /v0/disc/reads?limit` | read | `{reads: [disc read record], total}` |
 | `GET /v0/disc/file?path=` | read | A disc file's bytes as the console sees it with the network disc on (overlay first), for the Assets workspace |
-| `GET /v0/plugins`, `GET /v0/plugins/{name}.js` | read | Asset decoder plugins (ES modules) from `--asset-plugins DIR`, a folder outside any repository: a game's own formats |
+| `GET /v0/plugins`, `GET /v0/plugins/{name}.js` | read | Asset decoder plugins (ES modules) from `--asset-plugins DIR`, a folder outside any repository: a game's own formats; only a file that opens inside the folder; **413** over 4 MiB |
 
 Bridge options: `--disc <folder | .gdi | .iso>` the base, `--overlay <folder>` the changed files, `--whole` serve the
 whole disc, `--asset-plugins <folder>`. `pc/dcql_loop.py run|serve` take `--disc`, `--overlay`, `--whole` too and write

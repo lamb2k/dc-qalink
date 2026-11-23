@@ -40,8 +40,9 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
 - **The way back is a full restart** (the default, `LINK.TXT` `return reboot`): every ending (normal exit,
   deadline, exception, `abort`/`assert`, RESET) first sends the run's END (its state and the tail of its report) to
   the PC, then selects the loader's GDEMU image and reboots through the BIOS, so the console comes back to the loader
-  without a power cycle. A PC that has gone away delays the restart by at most 4 s, and a link that is down not at
-  all (code reading and Flycast; `docs/RELEASE_0.2.md`). A copy of the run's record is also kept for the loader to read after the
+  without a power cycle. When the PC has gone away, END's retries share a 4 s budget (no new retry starts after it;
+  a step under way finishes first, so it is about 4 s, not a hard bound on the whole exit), and a link that is down
+  gives up at once (code reading and Flycast; `docs/RELEASE_0.2.md`). A copy of the run's record is also kept for the loader to read after the
   reboot. The quick in-RAM return stub (`return stub`) is **optional and experimental**: on the console (2026-11-22)
   it froze after its jump, and it is not the default until a console run brings it back.
 - **The SH-4 watchdog is opt-in** (`wdt=1` in the run's arguments): reset mode, fed by TMU1 every 1 ms. On the
@@ -171,11 +172,12 @@ that must be refused, the protocol-version refusal both ways, the file service a
 fault come with a control that must fail (a damaged image, an old implementation); not every positive case has one.
 The gate runs the full `test_loop` (with its modem-rate transfer), `test_assets` with its four controls and
 `test_safety` (20 tests, 5 control rows) as rows of their own. `sh lib/test/run.sh` checks the console library's directory-entry and ring-ownership rules with AddressSanitizer, and
-its control (the code before the fix) must fail. No game and no console needed.
+with ThreadSanitizer the rings under stop / reconfigure / start with traffic and the /pc read-ahead block under
+several readers; each control (the code before the fix) must fail. No game and no console needed.
 
 The PC side is Python 3.10 or newer, standard library only, except: the MCP server needs the Python MCP SDK
 (`pip install mcp`), and the asset pipeline (`pc/assets`, the bridge's asset routes and `tests/test_assets.py`) needs
-numpy, with Pillow for image formats other than PNG.
+numpy, with Pillow for image formats other than PNG. `THIRD_PARTY.md` names each file that needs a package.
 
 ## Licence
 

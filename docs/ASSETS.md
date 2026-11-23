@@ -24,6 +24,8 @@ QA Link Cloud Assets workspace          bridge (pc/bridge/assets.py)            
 Python: the converters need **numpy**; Pillow is optional (JPEG and better resizing; PNG is read without it). Without
 numpy the bridge runs and `/v0/assets` answers 501 with the reason. Install them into the interpreter's own
 site-packages: a bridge started with `python -I` (as the desktop app starts it) does not see `pip install --user`.
+A picture with more pixels than 4096 x 4096 (16,777,216) is refused from its header, before anything is inflated or
+allocated; a PNG must also inflate to exactly the size its header declares (ql-fix-pc round 2).
 
 Game formats never enter this repository: a game's own decoders are private plugins (QA Link Cloud loads them from a
 folder outside the tree) that hand the bridge PNG and OBJ/glTF, or a ready DQA1 file.
