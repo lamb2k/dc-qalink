@@ -26,28 +26,60 @@
  * 0xffc00008, WTCSR at +4). Written 16 bits wide with a key in the high byte (0x5a WTCNT, 0xa5 WTCSR), read 8 bits
  * wide. 0xffc00004 is STBCR (module stop and standby), not WTCSR: until ql-core5 every watchdog write here went to
  * 0xffc00004, so the watchdog never ran (the console's frozen `hangoff` row, 2026-11-22).
- * WTCSR: bit 7 TME (count), 6 WT/IT (1 = watchdog mode: a reset on overflow), 5 RSTS (0 = power-on reset), 4 WOVF
- * (the watchdog overflowed), 3 IOVF, 2..0 CKS (7 = Pck/4096: one count 81.92 us at Pck 50 MHz, 256 counts 20.97 ms).
- * The SH-4 does not clear WTCNT and WTCSR on the watchdog's own reset (only the RESET pin does): after it the counter
- * keeps counting until the boot code stops it, and WOVF stays set for the next program to read. */
+ * WTCSR: bit 7 TME (count), 6 WT/IT (1 = watchdog mode: a reset on overflow), 5 RSTS (0 = power-on reset, 1 = manual
+ * reset), 4 WOVF (the watchdog overflowed), 3 IOVF (the interval timer overflowed), 2..0 CKS (7 = the slowest, /4096).
+ * The count clock (ql-core6) is NOT Pck: the divider is fed with the CPU's 200 MHz clock, so /4096 is one count in
+ * 20.5 us and the overflow (256 counts) comes after 5.25 ms, the longest it can be (KallistiOS dc/wdt.h, tested on the
+ * console: "41us to 5.2ms, the WDT will overflow before a single frame"). ql-core5 took Pck (50 MHz, 21 ms) and fed it
+ * from the vertical blank, every 16.7 ms: on the console (first-run9 rows 9 and 10) it reset about 5 ms after arming,
+ * and since the graphics chip is not reset with the CPU the TV kept the last picture: the "freeze" was that reset.
+ * So: fed from an interrupt every 1 ms (loader/client.c, the SH-4's timer unit 1), and the clock measured before
+ * arming (dcql_wdt_clock: interval mode, no reset possible). The SH-4 does not clear WTCNT and WTCSR on the
+ * watchdog's own reset (only the RESET pin does): WOVF stays set for the next program to read.
+ * Reset type: manual reset (RSTS 1), as KallistiOS's console-tested example (examples/dreamcast/basic/watchdog:
+ * "a manual reset ... This will cause your Dreamcast to reboot immediately"). A manual reset keeps the bus controller
+ * (main RAM's refresh, so the run's crumb survives) and the clock generator's settings; the power-on reset (ql-core5)
+ * resets them, and the console never came back from it (first-run9 rows 9 and 10, power-cycled). */
 #define DCQL_WTCNT 0xffc00008u
 #define DCQL_WTCSR 0xffc0000cu
 #define DCQL_WT_TME 0x80u
 #define DCQL_WT_WTIT 0x40u
+#define DCQL_WT_RSTS 0x20u
 #define DCQL_WT_WOVF 0x10u
+#define DCQL_WT_IOVF 0x08u
 #define DCQL_WT_CKS4096 7u
-#define DCQL_WDT_LIMIT_US 20971u
+#define DCQL_WDT_MODE (DCQL_WT_WTIT | DCQL_WT_RSTS | DCQL_WT_CKS4096)   /* 0x67; counting 0xe7 */
+#define DCQL_WDT_LIMIT_US 5243u   /* 256 * 4096 / 200 MHz; dcql_wdt_clock measures the console's own */
 static inline void dcql_wdt_feed(void) { DCQL_HW_R16(DCQL_WTCNT) = 0x5a00; }
-/* watchdog mode, power-on reset, Pck/4096; TME off while the clock is chosen (WOVF cleared), the counter at 0, TME */
-static inline void dcql_wdt_arm(void) {
-    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_WTIT | DCQL_WT_CKS4096);
-    DCQL_HW_R16(DCQL_WTCNT) = 0x5a00;
-    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_TME | DCQL_WT_WTIT | DCQL_WT_CKS4096);
-}
+/* the three arming writes, one by one (client.c shows a line between them with diag=1): the mode with TME off (WOVF
+   and IOVF cleared), the counter at 0, then TME. The feed must already be running before the third. */
+static inline void dcql_wdt_arm_mode(void) { DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WDT_MODE); }
+static inline void dcql_wdt_arm_count(void) { DCQL_HW_R16(DCQL_WTCNT) = 0x5a00; }
+static inline void dcql_wdt_arm_go(void) { DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_TME | DCQL_WDT_MODE); }
+static inline void dcql_wdt_arm(void) { dcql_wdt_arm_mode(); dcql_wdt_arm_count(); dcql_wdt_arm_go(); }
 /* stopped: TME and the mode bit cleared (no reset, no interrupt) */
 static inline void dcql_wdt_off(void) { DCQL_HW_R16(DCQL_WTCSR) = 0xa500; }
 static inline uint8_t dcql_wdt_csr(void) { return DCQL_HW_R8(DCQL_WTCSR); }
 static inline uint8_t dcql_wdt_cnt(void) { return DCQL_HW_R8(DCQL_WTCNT); }
+/* the watchdog's clock, measured without any risk: interval mode (WT/IT 0: an overflow only sets IOVF, and its
+   interrupt stays masked as KallistiOS leaves it), /4096, counted over `us` microseconds of the caller's clock, then
+   stopped. Returns the count (0: the watchdog does not count, an emulator; 0x100 | count: it overflowed, IOVF). */
+static inline unsigned dcql_wdt_clock(uint64_t (*now_us)(void), unsigned us) {
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_CKS4096);
+    DCQL_HW_R16(DCQL_WTCNT) = 0x5a00;
+    const uint64_t t0 = now_us();
+    DCQL_HW_R16(DCQL_WTCSR) = (uint16_t)(0xa500u | DCQL_WT_TME | DCQL_WT_CKS4096);
+    while (now_us() - t0 < us) {}
+    const unsigned c = DCQL_HW_R8(DCQL_WTCNT), csr = DCQL_HW_R8(DCQL_WTCSR);
+    DCQL_HW_R16(DCQL_WTCSR) = 0xa500;
+    DCQL_HW_R16(DCQL_WTCNT) = 0x5a00;
+    return (csr & DCQL_WT_IOVF) ? 0x100u | c : c;
+}
+/* the SH-4's timer unit 1 stopped, its interrupt off (the watchdog's feed, client.c): before a restart */
+static inline void dcql_tmu1_stop(void) {
+    DCQL_HW_R8(0xffd80004u) &= (uint8_t)~2u;   /* TSTR: STR1 */
+    DCQL_HW_R16(0xffd8001cu) = 0;              /* TCR1: UNIE and UNF cleared */
+}
 
 /* ---------------------------------------------------------------- the GD-ROM's ATA registers (G1 bus, P2) */
 #define DCQL_ATA_ALTSTATUS 0xa05f7018u

@@ -35,6 +35,7 @@
 #include "dcql_net.h"
 #include "dcql_live.h"
 #include "dcql_hw.h"
+#include "cl_still.h"
 #include <dc/video.h>
 #include <dc/biosfont.h>
 
@@ -86,21 +87,45 @@ void cl_report(const char *fmt, ...) {
     if (n > 0) cl_report_bytes(b, (size_t)n < sizeof(b) ? (size_t)n : sizeof(b) - 1);
 }
 
-/* ---------------------------------------------------------------- the SH-4 watchdog, fed from the vertical blank
+/* ---------------------------------------------------------------- the SH-4 watchdog, fed every 1 ms (ql-core6)
    (ql-core5) Registers in include/dcql_hw.h: until ql-core5 WTCSR was written at 0xffc00004 (STBCR), so the watchdog
    never counted and the console's `hangoff` row froze. Off by default now: "wdt=1" arms it (the console test arm) until
    a console run shows its reset brings the loader back and good programs never reach its 21 ms (the vertical blank's
    longest gap on the console was 19.35 ms, first-run7). g_wdt_csr0: WTCSR as this program found it (WOVF set = the
    last reset was the watchdog's, if the BIOS left it); g_wdt_csr1: read back right after arming (0xc7 = counting). */
-static volatile uint32_t g_wdt_feeds, g_wdt_gap_us;
+/* ql-core6: the watchdog's real overflow is 5.25 ms, not 21 ms (include/dcql_hw.h): the vertical blank (every 16.7 ms)
+   cannot feed it, and on the console it reset about 5 ms after arming (first-run9 rows 9 and 10). Now the SH-4's timer
+   unit 1 (unused by KallistiOS: TMU0 is its scheduler, TMU2 its clock) interrupts every 1 ms at priority 15 and feeds
+   it; only "wdt=1" takes TMU1. A program that keeps interrupts off for more than about 4 ms resets the console. The
+   vertical blank is still measured (the report's longest gap). Before arming, the watchdog's clock is measured in
+   interval mode (no reset possible) and the limit worked out from it; a watchdog that overflows sooner than 3 ms is
+   not armed. With diag=1 a line on the TV before and after each arming write. */
+#define WDT_FEED_HZ 1000u
+static volatile uint32_t g_wdt_feeds, g_wdt_gap_us;        /* the vertical blank: count and longest gap */
 static volatile uint64_t g_wdt_last_us;
-static volatile int g_wdt_armed;
+static volatile uint32_t g_tmu_feeds, g_tmu_gap_us;        /* the 1 ms feed: count and longest gap */
+static volatile uint32_t g_tmu_gap_at_ms;                  /* ... and when it ended (ms after cl_init) */
+static volatile uint32_t g_tmu_gap_kos;                    /* ... on KallistiOS's own clock (the control) */
+static volatile uint64_t g_tmu_last_kos;
+static uint64_t g_t0_ms;
+static volatile uint64_t g_tmu_last_us;
+static volatile int g_wdt_armed, g_tmu_on;
 static uint8_t g_wdt_csr0, g_wdt_csr1, g_wdt_cnt1;
+static unsigned g_wdt_clock = 0xffffu, g_wdt_limit_us;     /* counts in 2000 us (0xffff: not measured) */
 static int g_vbl_handle = -1;
+static void diag_step(uint16_t colour, const char *fmt, ...);
+/* microseconds that never jump (ql-core6). KallistiOS's clock takes a TMU2 tick as 80 ns, but TMU2 reloads after
+   12468720 ticks (Pck/4 at 49.87 MHz, one second): timer_us_gettime64 reads 997498 us at the end of each second and
+   then 1000000, a jump of 2.50 ms every second. Every "longest gap" measured with it was 2.5 ms long: the vertical
+   blank's 19.1 to 19.4 ms on the console (first-run7, first-run9) and ql-core5's "2.5 ms with interrupts off" were
+   that jump (Flycast: a 1 ms feed read 3501 us, at whole seconds). Here: whole ticks, one tick 1/12468720 s. */
+static uint64_t mono_us(void) {
+    const timer_val_t t = __dreamcast_get_ticks();
+    return ((uint64_t)t.secs * 12468720u + t.ticks) * 1000000u / 12468720u;
+}
 static void vbl_feed(uint32_t code, void *data) {
     (void)code; (void)data;
-    if (g_wdt_armed) dcql_wdt_feed();
-    const uint64_t now = timer_us_gettime64();
+    const uint64_t now = mono_us();
     if (g_wdt_last_us && g_wdt_feeds > 1) {
         const uint64_t gap = now - g_wdt_last_us;
         if (gap > g_wdt_gap_us) g_wdt_gap_us = (uint32_t)gap;
@@ -108,20 +133,59 @@ static void vbl_feed(uint32_t code, void *data) {
     g_wdt_last_us = now;
     ++g_wdt_feeds;
 }
+static void tmu_feed(irq_t src, irq_context_t *ctx, void *data) {
+    (void)src; (void)ctx; (void)data;
+    timer_clear(TMU1);
+    if (g_wdt_armed) dcql_wdt_feed();
+    const uint64_t now = mono_us();
+    if (g_tmu_last_us) {
+        const uint64_t gap = now - g_tmu_last_us;
+        if (gap > g_tmu_gap_us) { g_tmu_gap_us = (uint32_t)gap; g_tmu_gap_at_ms = (uint32_t)(timer_ms_gettime64() - g_t0_ms); }
+    }
+    g_tmu_last_us = now;
+    /* the control: the same gap on KallistiOS's clock reads 2.5 ms longer once a second */
+    const uint64_t kos = timer_us_gettime64();
+    if (g_tmu_last_kos && kos - g_tmu_last_kos > g_tmu_gap_kos) g_tmu_gap_kos = (uint32_t)(kos - g_tmu_last_kos);
+    g_tmu_last_kos = kos;
+    ++g_tmu_feeds;
+}
 static void wdt_start(int arm) {
     g_vbl_handle = vblank_handler_add(vbl_feed, NULL);
-    if (!arm || g_vbl_handle < 0) return;
-    dcql_wdt_arm();   /* watchdog mode, power-on reset, 256 counts of Pck/4096: about 21 ms at 50 MHz */
+    if (!arm) return;
+    diag_step(0xffff, "CL 1W WDT CLOCK TEST");
+    g_wdt_clock = dcql_wdt_clock(mono_us, 2000);   /* interval mode: no reset possible */
+    g_wdt_limit_us = (g_wdt_clock & 0xffu) ? 256u * 2000u / (g_wdt_clock & 0xffu) : 0;
+    diag_step(0xffff, "CL 1W WDT %u IN 2MS %s", g_wdt_clock & 0xffu, g_wdt_clock & 0x100u ? "OVF" : "");
+    if ((g_wdt_clock & 0x100u) || (g_wdt_limit_us && g_wdt_limit_us < 3000u)) {
+        diag_step(0xf800, "CL 1W WDT TOO FAST: OFF");
+        return;
+    }
+    /* the feed first: the watchdog never counts without it */
+    irq_set_handler(EXC_TMU1_TUNI1, tmu_feed, NULL);
+    timer_prime(TMU1, WDT_FEED_HZ, 1);
+    timer_clear(TMU1);
+    timer_start(TMU1);
+    g_tmu_on = 1;
+    diag_step(0xffff, "CL 1W FEED 1MS ON %u", (unsigned)g_tmu_feeds);
+    dcql_wdt_arm_mode();
+    diag_step(0xffff, "CL 1W MODE CSR %02X", dcql_wdt_csr());
+    dcql_wdt_arm_count();
+    diag_step(0xffff, "CL 1W COUNT 0 CNT %u", dcql_wdt_cnt());
+    g_wdt_armed = 1;   /* before TME: the next feed must already count */
+    dcql_wdt_arm_go();
     g_wdt_csr1 = dcql_wdt_csr();
     g_wdt_cnt1 = dcql_wdt_cnt();
-    g_wdt_armed = 1;
     H->h.flags |= CL_F_WDT_ARMED;
     cl_handoff_seal(H);
+    diag_step(0x07e0, "CL 1W ARMED CSR %02X CNT %u", g_wdt_csr1, g_wdt_cnt1);
+    diag_step(0x07e0, "CL 1W FED %u GAP %u US", (unsigned)g_tmu_feeds, (unsigned)g_tmu_gap_us);
 }
 static void wdt_stop(void) {
     if (g_wdt_armed) { dcql_wdt_off(); g_wdt_armed = 0; }
-    H->h.wdt_feeds = g_wdt_feeds;
-    H->h.wdt_gap_us = g_wdt_gap_us;
+    if (g_tmu_on) { timer_stop(TMU1); g_tmu_on = 0; }
+    /* the END's feed words: the 1 ms feed's when it ran, else the vertical blank's */
+    H->h.wdt_feeds = g_tmu_feeds ? g_tmu_feeds : g_wdt_feeds;
+    H->h.wdt_gap_us = g_tmu_feeds ? g_tmu_gap_us : g_wdt_gap_us;
 }
 
 /* ---------------------------------------------------------------- the in-game link (adapter) */
@@ -202,7 +266,6 @@ static int g_diag;                  /* args "diag=1": the link's first datagrams
    twice its size, 26 characters, 5 rows that wrap), held about a second so a TV or a photo can read it; and on the
    serial line ("cl-step"). Only on a 640-wide RGB565 screen; never from an exception handler. */
 static unsigned g_diag_row;
-static uint64_t g_t0_ms;
 static void diag_text_at(unsigned y0, uint16_t colour, const char *b) {
     if (!vid_mode || vid_mode->pm != PM_RGB565 || vid_mode->width != 640 || vid_mode->height < 480) return;
     uint16_t g[BFONT_HEIGHT * BFONT_THIN_WIDTH];
@@ -528,12 +591,26 @@ static vfs_handler_t g_pc_vfs = {
     .open = pc_open, .close = pc_close, .read = pc_read, .seek = pc_seek, .tell = pc_tell, .total = pc_total,
     .fstat = pc_fstat};
 
-/* the bytes [off, off + n) of the packed picture (rows of w * 2 bytes), read from the caller's rows in place */
-static void still_bytes(const uint8_t *pix, uint32_t row, uint32_t stride, uint32_t off, uint32_t n, uint8_t *out) {
-    while (n) {
-        const uint32_t y = off / row, x = off % row, k = row - x < n ? row - x : n;
-        memcpy(out, pix + y * stride + x, k);
-        out += k; off += k; n -= k;
+/* a still's rounds: loader/cl_still.h (ql-core6: the head in every round and before every repeated END; until then
+   one lost head lost the whole still, first-run9 row 4). The PC's answers arrive on the link thread (CL_STILLACK). */
+static cl_still_count_t g_still_n;
+static uint32_t g_still_failed;
+static void still_io_send(void *ctx, uint32_t a, uint16_t index, const void *p, uint16_t n) {
+    (void)ctx;
+    if (a == CL_STILL_END) {   /* a fresh answer for this END: the old one and stray wakes cleared */
+        g_still_acked = 0;
+        while (sem_trywait(&g_req_sem) == 0) {}
+    }
+    link_out_wait(CL_STILL, a, index, p, n);
+}
+static int still_io_wait(void *ctx, unsigned ms) {
+    (void)ctx;
+    const uint64_t t0 = timer_ms_gettime64();
+    for (;;) {
+        if (g_still_acked) { g_still_acked = 0; return (int)g_still_missing; }
+        const uint64_t el = timer_ms_gettime64() - t0;
+        if (el >= ms) return -1;
+        sem_wait_timed(&g_req_sem, (int)(ms - el));
     }
 }
 int cl_still(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigned picture) {
@@ -542,35 +619,20 @@ int cl_still(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigne
 static int still_send(const void *pix, unsigned w, unsigned hgt, unsigned stride, unsigned picture, uint32_t req) {
     if (!g_link_up || !pix || w > 640 || hgt > 480 || !w || !hgt) return -1;
     const uint8_t *src = (const uint8_t *)pix;
-    const uint32_t row = w * 2, bytes = row * hgt, blocks = (bytes + CL_CHUNK - 1) / CL_CHUNK;
+    const uint32_t row = w * 2, bytes = row * hgt;
     uint32_t crc = 0;
     for (unsigned y = 0; y < hgt; ++y) crc = cl_crc32(crc, src + y * stride, row);
     mutex_lock(&g_req_mx);
     const uint32_t index = ++g_still_index;
     cl_still_head_t hd = {index, picture, w, hgt, CL_PIX_RGB565, bytes, crc, req};
-    uint8_t blk[CL_CHUNK];
     uint8_t hb[sizeof(hd)];
     memcpy(hb, &hd, sizeof(hd));   /* both ends little-endian */
-    link_out_wait(CL_STILL, CL_STILL_HEAD, (uint16_t)index, hb, sizeof(hb));
-    memset(g_still_bits, 0, sizeof(g_still_bits));
-    int rc = -2;
-    for (int round = 0; round < 12; ++round) {
-        for (uint32_t k = 0; k < blocks; ++k)
-            if (!(g_still_bits[k >> 3] & (1u << (k & 7)))) {
-                const uint32_t off = k * CL_CHUNK, n = bytes - off < CL_CHUNK ? bytes - off : CL_CHUNK;
-                still_bytes(src, row, stride, off, n, blk);
-                link_out_wait(CL_STILL, off, (uint16_t)index, blk, (uint16_t)n);
-            }
-        g_still_acked = 0;
-        while (sem_trywait(&g_req_sem) == 0) {}
-        for (int t = 0; t < 10 && !g_still_acked; ++t) {
-            link_out_wait(CL_STILL, CL_STILL_END, (uint16_t)index, hb, sizeof(hb));
-            sem_wait_timed(&g_req_sem, 300);
-        }
-        if (g_still_acked && g_still_missing == 0) { rc = 0; break; }
-    }
+    const cl_still_io_t io = {NULL, still_io_send, still_io_wait};
+    const int rc = cl_still_rounds(&io, g_still_bits, sizeof(g_still_bits), src, row, stride, bytes, (uint16_t)index,
+                                   hb, sizeof(hb), &g_still_n);
     mutex_unlock(&g_req_mx);
     if (!rc) { ++g_st.stills; H->h.stills_sent = g_st.stills; }
+    else ++g_still_failed;
     return rc;
 }
 
@@ -594,7 +656,7 @@ static void *diag_thread(void *arg) {
         char w[40];
         const unsigned cnt = dcql_wdt_cnt(), csr = dcql_wdt_csr();
         snprintf(w, sizeof(w), "WDT %s CNT %3u CSR %02X", g_wdt_armed ? "ON " : "OFF", cnt, csr);
-        dbgio_printf("cl-wdt %d: %s gap %u us\n", i, w, (unsigned)g_wdt_gap_us);
+        dbgio_printf("cl-wdt %d: %s feeds %u gap %u us\n", i, w, (unsigned)g_tmu_feeds, (unsigned)g_tmu_gap_us);
         diag_text_at(198, g_wdt_armed ? 0x07e0 : 0x8410, w);
     }
     return NULL;
@@ -811,18 +873,31 @@ static void __attribute__((noreturn)) finish(uint32_t state, int code) {
 /* the closing lines (not from an exception handler: they format text) */
 static void summary(void) {
     if (g_leaving) return;
-    cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us (the watchdog resets after about %u us); WTCSR at "
-              "start %02x%s, after arming %02x count %u, now %02x count %u\n",
-              g_wdt_armed ? "armed" : "measured only", (unsigned)g_wdt_feeds, (unsigned)g_wdt_gap_us,
-              (unsigned)DCQL_WDT_LIMIT_US, g_wdt_csr0,
+    cl_report("cl-wdt: %s, vertical blanks %u, longest gap %u us; WTCSR at start %02x%s, after arming %02x count %u, "
+              "now %02x count %u\n", g_wdt_armed ? "armed (manual reset)" : "measured only", (unsigned)g_wdt_feeds,
+              (unsigned)g_wdt_gap_us, g_wdt_csr0,
               (g_wdt_csr0 & DCQL_WT_WOVF) ? " (WOVF: the last reset was the watchdog's)" : "", g_wdt_csr1, g_wdt_cnt1,
               dcql_wdt_csr(), dcql_wdt_cnt());
+    if (g_wdt_clock != 0xffffu)   /* ql-core6: the clock as measured, and the 1 ms feed */
+        cl_report("cl-wdt clock: %u counts in 2000 us%s, so it resets %u us after the last feed (%s); feed every %u us: "
+                  "%u feeds, longest gap %u us (ended %u ms after start; %u us on KallistiOS's clock, which jumps 2.5 ms "
+                  "each second)\n", g_wdt_clock & 0xffu, (g_wdt_clock & 0x100u) ? " (overflowed)" : "", g_wdt_limit_us,
+                  g_wdt_limit_us ? "measured" : "not counting here: no watchdog", 1000000u / WDT_FEED_HZ,
+                  (unsigned)g_tmu_feeds, (unsigned)g_tmu_gap_us, (unsigned)g_tmu_gap_at_ms, (unsigned)g_tmu_gap_kos);
     if (g_link_up) cl_report("cl-link: up %u ms after start (path to the PC: %s %d ms)\n", (unsigned)g_link_up_ms,
                              g_path_ms >= 0 ? "ARP answered after" : "no ARP answer in", g_path_ms >= 0 ? g_path_ms : 30000);
     if (g_link)
         cl_report("cl-link: %s, files opened %u refused %u, reads %u, %u bytes in %u ms, lines %u dropped %u, stills %u\n",
                   g_link_up ? "up" : "never up", g_st.files_opened, g_st.files_refused, g_st.reads, g_st.read_bytes,
                   g_st.read_ms, g_st.lines, g_st.lines_dropped, g_st.stills);
+    if (g_still_n.rounds) {   /* ql-core6: what the stills cost on the link, and the link layer's own send drops */
+        unsigned tx, rx, txd, rxd;
+        dcql_net_counters(&tx, &rx, &txd, &rxd);
+        cl_report("cl-still: held %u not held %u; rounds %u, heads %u, blocks %u, ends %u, answers %u; the link's "
+                  "send refusals %u (ring full, sent again; or a failed sendto)\n", g_st.stills, (unsigned)g_still_failed, (unsigned)g_still_n.rounds,
+                  (unsigned)g_still_n.heads, (unsigned)g_still_n.blocks, (unsigned)g_still_n.ends,
+                  (unsigned)g_still_n.acks, txd);
+    }
     if (g_link) {
         dcql_live_stats_t ls;
         dcql_live_stats(&ls);
@@ -939,9 +1014,9 @@ int cl_init(unsigned flags) {
     /* the watchdog (ql-core5): off by default, "wdt=1" arms it (the console test arm). ql-core4 armed it by default
        with the full restart, but its writes missed WTCSR, so the console never ran it; until a console run shows its
        reset comes back to the loader (the SH-4 keeps WTCSR across its own reset: the BIOS must stop it) and that good
-       programs stay inside its 21 ms (the vertical blank's longest gap on the console was 19.35 ms), it stays an arm.
-       WTCSR as found first: a set WOVF says the last reset was the watchdog's (cleared here so the next run reads its
-       own). On a 50 Hz picture (a vertical blank every 20 ms against 21 ms) "wdt=1" is the caller's risk. */
+       programs never keep interrupts off past its 5.25 ms (ql-core6: the real limit; fed every 1 ms by TMU1), it
+       stays an arm. WTCSR as found first: a set WOVF says the last reset was the watchdog's (cleared here so the next
+       run reads its own). */
     g_wdt_csr0 = dcql_wdt_csr();
     if (g_wdt_csr0 & (DCQL_WT_TME | DCQL_WT_WOVF)) dcql_wdt_off();
     if (g_wdt_csr0 & DCQL_WT_WOVF) dbgio_printf("cl: WTCSR %02x at start: the last reset was the watchdog's\n", g_wdt_csr0);
