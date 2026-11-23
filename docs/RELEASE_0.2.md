@@ -65,8 +65,11 @@ gate, it is never resolved there), then:
 2. runs every host test (`tests/test_*.py`, a new one too), the syntax of every Python file, and the controls (for
    example, the 0.2 work-in-progress PC tool must take its own echo). Since ql-fix-pc each of these is its own gate
    row: the full `test_loop` (with the modem-rate transfer, no `--quick`), `test_assets` with its four
-   broken-implementation controls, and `test_safety` (20 tests, 5 control rows: the PC's binding, file roots and
-   limits against the 1990fb9 code, which must fail);
+   broken-implementation controls, and the three safety suites, each a positive row and a historical control row
+   whose pinned rows must fail with their named discrepancy on the code the audit read:
+   `test_safety` (21 pinned rows, 16 controls against 1990fb9), `test_safety2` (34 pinned rows, 27 controls against
+   2ff9b9d and 1 against 24cd792) and `test_safety3` (24 pinned rows, 22 controls against ac45161: the round-3
+   blockers);
 3. measures the size rows below from the link map and checks what the head adds to the repository (no blob over
    300 KB, no build outputs, no game data, no dot-folders but `.github`);
 4. runs one Flycast suite (`tools/gate/flysuite.py`, `suite.json`): it first listens and refuses to start if a loader
