@@ -167,6 +167,10 @@ From the pre-tag audit (2026-11-23, "What a console run should still check"), wi
   shutdown; stop / reconfigure / start with traffic in flight; repeated grabs after an interrupted grab; stack
   high-water marks with DHCP.
 - The optional stub's results recorded apart.
+- Boot the loader, wait 30 s, then start the bridge and push (on Flycast this order fails: Flycast on Windows stops
+  receiving on a port that met an ICMP "port unreachable"; a console's KallistiOS ignores it).
+- Grabs of a moving game, a held game and a game with its menu open: each held whole (the CRC covers the bytes sent; a
+  moving picture may tear).
 
 ### Deferred: can follow the tag
 
