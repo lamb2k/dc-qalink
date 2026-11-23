@@ -1,6 +1,6 @@
 # Third-party software
 
-dc-qalink ships no third-party source. At build time it uses:
+dc-qalink ships one piece of third-party data, the in-game menu's font (below). At build time it uses:
 
 | Component | Where | Licence |
 |---|---|---|
@@ -19,4 +19,13 @@ dc-qalink's own (`loader/cl_util.c`).
 A program built with the link carries KOS and libppp under the KOS License: keep its copyright notice in your
 distribution's documentation, as KOS itself requires.
 
-The Python tools use the Python standard library only (PSF licence) and the system `ssh` / `scp` / `ssh-keygen`.
+The in-game menu (`lib/dcql_menu.c`) draws with **Spleen 8x16** 2.3.0 by Frederic Cambus
+(https://github.com/fcambus/spleen), BSD 2-Clause licence, full text in `lib/font/LICENSE-spleen.txt`. Only the printable
+ASCII glyphs (32..126) are kept, converted to one bit a pixel by `lib/font/mkfont.py` into `lib/font/spleen8x16.h`
+(receipt: `lib/font/RECEIPT.txt`). A program built with the menu carries these glyphs in binary form: keep Spleen's
+copyright notice and licence in your distribution's documentation, as its licence requires. The menu's QR encoder is
+dc-qalink's own.
+
+The Python tools use the Python standard library only (PSF licence) and the system `ssh` / `scp` / `ssh-keygen`; the menu example's picture
+tool (`example/menu/shots.py`, not needed to build) uses Pillow (HPND licence) and, for its QR checks, zxing-cpp
+(Apache 2.0) as an independent decoder.
