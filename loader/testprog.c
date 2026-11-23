@@ -19,7 +19,12 @@
                 (the exit-time bound; the report comes back from the copy kept in RAM; lane ql-fix-dc)
      cdfile:<p> the same from the loader's disc (/cd/<p>), for the load-time comparison
      still      one 640x480 test still (colour bars) to the PC; stills:<n> n of them
-     screen:<n> n grabs of the screen itself (the frame buffer, bars drawn on its lower part) to the PC
+     screen:<n> n grabs of the screen itself (the frame buffer, bars drawn on its lower part) to the PC; with
+                move  a thread keeps drawing new bars all through each grab (a moving game);
+                hold  a thread redraws the same picture each 1/60 s with a blinking HELD label (a held game that
+                      still renders);
+                menu  a thread draws a menu panel over the picture with its highlight moving each 1/60 s (a game
+                      with a menu open). The PC must hold each grab whole with its CRC right (lane ql-fix-dc round 3)
      crash      a misaligned write (then an illegal instruction, then abort, as Flycast raises none of the first):
                 CRASHED with the registers, back through the return stub
      heapwreck  overwrite the whole heap (and KOS's own records in it), then crash: the stub still brings the loader
@@ -56,6 +61,34 @@ static void say(int row, const char *s) {
 }
 
 static int has(const char *args, const char *w) { return strstr(args, w) != NULL; }
+
+/* screen:<n> move / hold / menu (round 3): the frame buffer keeps changing while the grab reads it */
+static volatile int g_draw_mode, g_draw_stop;
+static volatile unsigned g_draws;
+static void *draw_thread(void *arg) {
+    (void)arg;
+    static const uint16_t c[6] = {0xf800, 0x07e0, 0x001f, 0xffe0, 0x07ff, 0xf81f};
+    unsigned t = 0;
+    while (!g_draw_stop) {
+        ++t;
+        if (g_draw_mode == 1) {   /* move: new bars over the lower part, shifted each time */
+            for (int y = 200; y < 480; ++y)
+                for (int x = 0; x < 640; ++x) vram_s[y * 640 + x] = c[((x + t * 7) / 80 + y / 40) % 6];
+            thd_sleep(2);
+        } else if (g_draw_mode == 2) {   /* hold: the picture stays; a blinking label, as a paused game shows */
+            bfont_draw_str_ex(vram_s + 260 * 640 + 260, 640, (t & 8) ? 0xffff : 0xf800, 0, 16, true, "HELD");
+            thd_sleep(16);
+        } else {   /* menu: a panel with a highlight bar moving down its rows */
+            for (int r = 0; r < 8; ++r)
+                for (int y = 0; y < 20; ++y)
+                    for (int x = 160; x < 480; ++x)
+                        vram_s[(220 + r * 22 + y) * 640 + x] = r == (int)(t % 8) ? 0x07ff : 0x2104;
+            thd_sleep(16);
+        }
+        ++g_draws;
+    }
+    return NULL;
+}
 /* a whole word of the args ("ret" is not "return") */
 static int word(const char *a, const char *w) {
     const size_t n = strlen(w);
@@ -193,17 +226,24 @@ int main(int argc, char **argv) {
         static const uint16_t bars[8] = {0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x0000};
         const unsigned n = (unsigned)strtoul(sc + 7, NULL, 10);
         unsigned held = 0;
+        g_draw_mode = word(args, "move") ? 1 : word(args, "hold") ? 2 : word(args, "menu") ? 3 : 0;
+        kthread_t *drawer = NULL;
         for (unsigned k = 0; k < n; ++k) {
             for (int y = 200; y < 480; ++y)
                 for (int x = 0; x < 640; ++x) vram_s[y * 640 + x] = bars[((x / 80) + k) & 7];
             snprintf(line, sizeof(line), "SCREEN GRAB %u OF %u", k + 1, n);
             say(6, line);
+            if (g_draw_mode && !drawer) drawer = thd_create(false, draw_thread, NULL);
             const uint64_t t1 = timer_ms_gettime64();
             const int r = cl_still(vram_s, 640, 480, 1280, k + 1);
             held += r == 0;
             cl_report("screen %u: %s in %u ms\n", k + 1, r ? "NOT HELD" : "held by the PC",
                       (unsigned)(timer_ms_gettime64() - t1));
         }
+        if (drawer) { g_draw_stop = 1; thd_join(drawer, NULL); }
+        if (g_draw_mode)
+            cl_report("screen drawing (%s): %u redraws during the grabs\n",
+                      g_draw_mode == 1 ? "move" : g_draw_mode == 2 ? "hold" : "menu", (unsigned)g_draws);
         cl_report("screens %u of %u held\n", held, n);
     }
     if (has(args, "heapwreck")) {

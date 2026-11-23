@@ -653,17 +653,23 @@ static int still_send(const void *pix, unsigned w, unsigned hgt, unsigned stride
     if (!g_link_up || !pix || w > 640 || hgt > 480 || !w || !hgt) return -1;
     const uint8_t *src = (const uint8_t *)pix;
     const uint32_t row = w * 2, bytes = row * hgt;
+    /* round 3: the CRC of the bytes as sent (cl_still.h), from one word a block held on the heap for this still only
+       (at most 600 blocks: 2,400 B). Without that memory, the older way: the CRC before sending, right only for a
+       picture that does not change under the grab. */
+    uint32_t *const crcs = (uint32_t *)malloc(((bytes + CL_CHUNK - 1) / CL_CHUNK) * sizeof(uint32_t));
     uint32_t crc = 0;
-    for (unsigned y = 0; y < hgt; ++y) crc = cl_crc32(crc, src + y * stride, row);
+    if (!crcs)
+        for (unsigned y = 0; y < hgt; ++y) crc = cl_crc32(crc, src + y * stride, row);
     mutex_lock(&g_req_mx);
     const uint32_t index = ++g_still_index;
     cl_still_head_t hd = {index, picture, w, hgt, CL_PIX_RGB565, bytes, crc, req};
     uint8_t hb[sizeof(hd)];
     memcpy(hb, &hd, sizeof(hd));   /* both ends little-endian */
     const cl_still_io_t io = {NULL, still_io_send, still_io_wait};
-    const int rc = cl_still_rounds(&io, g_still_bits, sizeof(g_still_bits), src, row, stride, bytes, (uint16_t)index,
-                                   hb, sizeof(hb), &g_still_n);
+    const int rc = cl_still_rounds(&io, g_still_bits, sizeof(g_still_bits), crcs, src, row, stride, bytes,
+                                   (uint16_t)index, hb, sizeof(hb), &g_still_n);
     mutex_unlock(&g_req_mx);
+    free(crcs);
     if (!rc) { ++g_st.stills; H->h.stills_sent = g_st.stills; }
     else ++g_still_failed;
     return rc;

@@ -14,6 +14,12 @@ of that still and never answered; the client sent the whole picture 12 times: "N
 Cases: clean; the first head lost (must be held within 2 s, on both receivers); one block lost; the first END lost;
 the first head and the first repeat lost. Controls that must fail: every head lost (not held); the ql-core5 sender
 (the head once, the same rounds) with the first head lost (not held, about 42 s, the console's 43.5 s).
+
+Round 3 (lane ql-fix-dc, 2026-11-23): a picture that changes while it is sent (a moving game, a held game that still
+renders, the in-game menu over it: the frame buffer on screen is read in pieces while the program draws). The sender
+now takes the CRC of each block as sent and the END carries the picture's CRC (cl_still.h). Cases: moving, on both
+receivers; moving with one block lost (its copy sent again differs). Control that must fail: the same moving picture
+with the CRC taken before sending (crcs NULL: the code path of dccfe98, where client.c computed it first).
 """
 import argparse, ctypes, json, os, random, struct, subprocess, sys, tempfile, zlib
 
@@ -34,12 +40,13 @@ static send_fn g_s;
 static wait_fn g_w;
 static void s_(void *c, uint32_t a, uint16_t i, const void *p, uint16_t n) { (void)c; g_s(a, i, (const uint8_t *)p, n); }
 static int w_(void *c, unsigned ms) { (void)c; return g_w(ms); }
-int run_still(send_fn s, wait_fn w, uint8_t *bits, uint32_t bits_size, const uint8_t *src, uint32_t row,
-              uint32_t stride, uint32_t bytes, uint32_t index, const uint8_t *head, uint32_t head_len, uint32_t *n) {
+int run_still(send_fn s, wait_fn w, uint8_t *bits, uint32_t bits_size, uint32_t *crcs, const uint8_t *src,
+              uint32_t row, uint32_t stride, uint32_t bytes, uint32_t index, const uint8_t *head, uint32_t head_len,
+              uint32_t *n) {
     g_s = s; g_w = w;
     const cl_still_io_t io = {0, s_, w_};
     cl_still_count_t c = {0, 0, 0, 0, 0};
-    const int r = cl_still_rounds(&io, bits, bits_size, src, row, stride, bytes, (uint16_t)index, head,
+    const int r = cl_still_rounds(&io, bits, bits_size, crcs, src, row, stride, bytes, (uint16_t)index, head,
                                   (uint16_t)head_len, &c);
     n[0] = c.rounds; n[1] = c.heads; n[2] = c.blocks; n[3] = c.ends; n[4] = c.acks;
     return r;
@@ -95,12 +102,19 @@ class Link:
             self.sink.on_still(self, 0xabc, a, index, data, 'host', lambda j: self.held.append(j) if j['crc_ok'] else 0)
 
 
-def c_sender(lib, link, pix, index, head):
+def c_sender(lib, link, pix, index, head, sent_crc=True, moving=None):
+    """sent_crc: the CRC of the bytes as sent (round 3), else taken before sending (crcs NULL). moving: a random
+    generator that redraws part of the picture after every block sent (a program drawing during the grab)."""
     bits = (ctypes.c_uint8 * ((W * H * 2 // cl.CHUNK) // 8 + 16))()
     n = (ctypes.c_uint32 * 5)()
+    crcs = (ctypes.c_uint32 * ((len(pix) + cl.CHUNK - 1) // cl.CHUNK))() if sent_crc else None
+    buf = (ctypes.c_uint8 * len(pix)).from_buffer_copy(pix)
 
     def s(a, i, p, ln):
         link.datagram(a, i, ctypes.string_at(p, ln))
+        if moving is not None and a < len(pix):   # the program draws on: a few rows change under the sender
+            y = moving.randrange(H - 8)
+            ctypes.memset(ctypes.addressof(buf) + y * W * 2, moving.getrandbits(8), 8 * W * 2)
 
     def w(ms):
         if link.ack is None:
@@ -113,9 +127,8 @@ def c_sender(lib, link, pix, index, head):
         return missing
 
     sf, wf = SEND_FN(s), WAIT_FN(w)
-    buf = (ctypes.c_uint8 * len(pix)).from_buffer_copy(pix)
     hb = (ctypes.c_uint8 * len(head)).from_buffer_copy(head)
-    r = lib.run_still(sf, wf, bits, ctypes.sizeof(bits), buf, W * 2, W * 2, len(pix), index, hb, len(head), n)
+    r = lib.run_still(sf, wf, bits, ctypes.sizeof(bits), crcs, buf, W * 2, W * 2, len(pix), index, hb, len(head), n)
     return r, {'rounds': n[0], 'heads': n[1], 'blocks': n[2], 'ends': n[3], 'answers': n[4]}
 
 
@@ -179,6 +192,25 @@ def main():
                                 'seconds_sim': round(link.t, 2), 'lost': link.lost[:4], 'sent': n, 'pass': ok})
                 print('%-4s %-6s %-46s %-8s rc %2d  %6.2f s sim  %s' % ('PASS' if ok else 'FAIL', kind, name, got, r,
                                                                        link.t, n), flush=True)
+                index += 1
+        # round 3: a picture that changes while it is sent
+        mcases = [
+            ('moving picture (the CRC of the bytes as sent)', set(), True, 'held', 2.0),
+            ('moving picture, one block lost', {('block', 77)}, True, 'held', 3.0),
+            ('CONTROL: moving picture, CRC before sending (dccfe98)', set(), False, 'not held', None),
+        ]
+        for kind in ('loop', 'bridge'):
+            for name, lose, sent_crc, want, max_s in mcases:
+                head = struct.pack('<8I', index, 7, W, H, 1, len(pix), crc, 0)
+                link = Link(kind, tmp, lose)
+                r, n = c_sender(lib, link, pix, index, head, sent_crc=sent_crc, moving=random.Random(index))
+                got = 'held' if (r == 0 and len(link.held) == 1) else 'not held'
+                ok = got == want and (max_s is None or link.t <= max_s)
+                allok &= ok
+                results.append({'receiver': kind, 'case': name, 'want': want, 'got': got, 'rc': r,
+                                'seconds_sim': round(link.t, 2), 'lost': link.lost[:4], 'sent': n, 'pass': ok})
+                print('%-4s %-6s %-46s %-8s rc %2d  %6.2f s sim  %s' % ('PASS' if ok else 'FAIL', kind, name[:46], got,
+                                                                       r, link.t, n), flush=True)
                 index += 1
         # control: the ql-core5 sender, the console's loss
         head = struct.pack('<8I', index, 7, W, H, 1, len(pix), crc, 0)
