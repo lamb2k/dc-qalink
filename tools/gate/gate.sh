@@ -217,7 +217,12 @@ test_row() {   # name, expect (0 or fail), command...
 pyfiles=$(cd "$S" && git ls-files '*.py' | tr '\n' ' ')
 # shellcheck disable=SC2086
 test_row python-syntax 0 python3 -c 'import ast,sys; [ast.parse(open(f,encoding="utf-8").read(),f) for f in sys.argv[1:]]; print(len(sys.argv)-1,"files parse")' $pyfiles
-test_row test_loop 0 python3 tests/test_loop.py --quick --host "$W/hostb/cl_host" --out "$H/loop"
+# the tag gate runs test_loop whole (audit 2026-11-23, item 6): with --quick it left out the 60 KB modem-rate
+# transfer and its efficiency assertion. That row must be in the log, or this is a FAIL row of its own.
+test_row test_loop 0 python3 tests/test_loop.py --host "$W/hostb/cl_host" --out "$H/loop"
+grep -qE '^modem rate 1390 B/s: 60 KB raw image +PASS' "$H/test_loop.log" \
+  && row "control test_loop modem-rate row" PASS "the 60 KB modem-rate transfer ran and passed (no --quick)" \
+  || row "control test_loop modem-rate row" FAIL "the modem-rate row is missing or failed (host/test_loop.log)"
 test_row test_bridge 0 python3 tests/test_bridge.py --out "$H/bridge"
 test_row test_autoconnect 0 python3 tests/test_autoconnect.py --out "$H/autoconnect"
 test_row test_echo 0 python3 tests/test_echo.py
@@ -249,9 +254,36 @@ for p in "${PLANS[@]}"; do
 for h in json.load(open(sys.argv[1])).get("host", []):
     print("\t".join([h["name"], h["cmd"], str(h.get("expect", 0)), h.get("grep", "")]))' "$p")
 done
+# required controls (audit 2026-11-23, item 6): each its own row; a control the test no longer offers is a FAIL row,
+# never silently left out. test_assets --controls: its four broken pieces (twiddle, strips, mip layout, 565) must each
+# fail. test_safety: the PC boundaries (lane ql-fix-pc), and --controls on 1990fb9's pc/ (the tree the audit read):
+# every one of its five items must fail there.
+if grep -q -- "'--controls'" "$S/tests/test_assets.py" 2>/dev/null; then
+  test_row control-test_assets 0 python3 tests/test_assets.py --controls --out "$H/assets-controls"
+  grep -qE '^controls: 4 of 4 failed as they must' "$H/control-test_assets.log" \
+    && row "control test_assets four broken pieces" PASS "4 of 4 failed as they must" \
+    || row "control test_assets four broken pieces" FAIL "test_assets --controls did not show 4 of 4 failing"
+else
+  row "control test_assets four broken pieces" FAIL "tests/test_assets.py has no --controls (a required control)"
+fi
+if [ -f "$S/tests/test_safety.py" ]; then
+  test_row test_safety 0 python3 tests/test_safety.py --out "$H/safety"
+  if rm -rf "$W/old-1990fb9" && mkdir -p "$W/old-1990fb9" && git -C "$S" archive 1990fb9 pc tools | tar -x -C "$W/old-1990fb9"; then
+    test_row control-test_safety-1990fb9 0 python3 tests/test_safety.py --pc "$W/old-1990fb9/pc" --controls --out "$H/safety-old"
+    for it in A1 A2 A3 A4 A5; do
+      grep -qE "^control $it .*must fail\) PASS" "$H/control-test_safety-1990fb9.log" \
+        && row "control 1990fb9 fails $it" PASS "the audited PC code fails item $it as it must" \
+        || row "control 1990fb9 fails $it" FAIL "item $it did not fail on 1990fb9's pc/ (host/control-test_safety-1990fb9.log)"
+    done
+  else
+    row "control 1990fb9 fails A1-A5" FAIL "1990fb9's pc/ could not be taken from git"
+  fi
+else
+  row "test test_safety" FAIL "tests/test_safety.py missing (a required test)"
+fi
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done
