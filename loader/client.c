@@ -192,8 +192,13 @@ static void wdt_stop(void) {
 static int g_link;                  /* the link was started */
 static volatile int g_link_up, g_link_failed;
 static volatile uint32_t g_link_up_ms;   /* ms from cl_init to the link up (adapter, address) */
-/* rx: one file-service answer (CL_FREAD_MAX in 1 KiB datagrams) with room to spare; tx: lines and still blocks */
-static unsigned char g_rx_mem[24 * 1024], g_tx_mem[16 * 1024];
+/* rx: one file-service answer (CL_FREAD_MAX in 1 KiB datagrams, 8,368 B with the ring's length words) or the network
+   disc's 8 KiB in flight, with room to spare; tx: lines and still blocks (the senders wait for room: link_out_wait).
+   Lane ql-mem: 24 + 16 KiB before, sized to need (docs/SIZES.md) */
+#define CL_RX_RING (16u * 1024u)
+#define CL_TX_RING (8u * 1024u)
+_Static_assert(CL_RX_RING >= (CL_FREAD_MAX / CL_CHUNK) * (CL_HDR + CL_CHUNK + 4 + 2) + 4096, "rx ring: one answer + 4 KiB");
+static unsigned char g_rx_mem[CL_RX_RING] __attribute__((aligned(32))), g_tx_mem[CL_TX_RING] __attribute__((aligned(32)));
 static mutex_t g_req_mx = MUTEX_INITIALIZER;
 static semaphore_t g_req_sem = SEM_INITIALIZER(0), g_up_sem = SEM_INITIALIZER(0);
 static volatile uint32_t g_req_id, g_req_blocks, g_req_got, g_req_len;
@@ -403,7 +408,7 @@ static int path_wait(void) {
 }
 static void *link_thread(void *arg) {
     (void)arg;
-    static uint8_t d[CL_DGRAM_MAX + 8];
+    uint8_t d[CL_DGRAM_MAX + 8] __attribute__((aligned(4)));   /* on the link thread's 16 KiB stack (lane ql-mem) */
     g_link_thd = thd_get_current();
     while (dcql_net_state() != DCQL_LINK_UP) {
         if (dcql_net_state() == DCQL_LINK_FAILED) {
@@ -493,8 +498,10 @@ static int pc_request(int type, const void *pl, uint16_t n, uint8_t *buf, uint32
 typedef struct { int used; uint32_t handle, size, pos; } pcf_t;
 static pcf_t g_pcf[16];
 /* one read-ahead block: a C library's small buffered reads (1 KiB each through newlib's FILE) cost one round trip per
-   CL_FREAD_MAX, not per call */
-static uint8_t g_ra[CL_FREAD_MAX] __attribute__((aligned(32)));
+   CL_FREAD_MAX, not per call. Lane ql-mem: only a program that reads /pc files needs it, so it is allocated when the
+   first file opens and freed when the last one closes (no allocation: small reads go to the PC as asked, unbuffered) */
+static uint8_t *g_ra;
+static int g_pcf_open;
 static const pcf_t *g_ra_file;
 static uint32_t g_ra_handle, g_ra_off, g_ra_len;
 static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
@@ -513,6 +520,7 @@ static void *pc_open(vfs_handler_t *vfs, const char *fn, int mode) {
     for (int i = 0; i < 16; ++i)
         if (!g_pcf[i].used) {
             g_pcf[i] = (pcf_t){1, g_req_handle, g_req_size, 0};
+            if (!g_pcf_open++ && !g_ra) g_ra = (uint8_t *)memalign(32, CL_FREAD_MAX);
             ++g_st.files_opened;
             return (void *)(intptr_t)(i + 1);
         }
@@ -529,6 +537,11 @@ static int pc_close(void *h) {
     link_out(CL_FCLOSE, f->handle, 0, NULL, 0);
     if (g_ra_file == f) g_ra_file = NULL;
     f->used = 0;
+    if (g_pcf_open > 0 && !--g_pcf_open && g_ra) {
+        g_ra_file = NULL;
+        free(g_ra);
+        g_ra = NULL;
+    }
     return 0;
 }
 static ssize_t pc_read(void *h, void *buf, size_t cnt) {
@@ -538,7 +551,7 @@ static ssize_t pc_read(void *h, void *buf, size_t cnt) {
     if (cnt > f->size - f->pos) cnt = f->size - f->pos;
     const uint64_t t0 = timer_ms_gettime64();
     size_t done = 0;
-    if (cnt < CL_FREAD_MAX) {
+    if (cnt < CL_FREAD_MAX && g_ra) {
         if (!(g_ra_file == f && g_ra_handle == f->handle && f->pos >= g_ra_off && f->pos + cnt <= g_ra_off + g_ra_len)) {
             const uint32_t n = f->size - f->pos < CL_FREAD_MAX ? f->size - f->pos : CL_FREAD_MAX;
             uint8_t pl[12];
@@ -746,6 +759,9 @@ static void __attribute__((noreturn)) jump_preloaded(void) {
 }
 
 /* ---- the run's ending to the PC over the link, before the full restart (ql-core4) */
+/* the exception path's frame buffer (raw_out), also end_send_link's answer buffer */
+static uint8_t g_raw[14 + 20 + 8 + CL_DGRAM_MAX + 32] __attribute__((aligned(32)));
+_Static_assert(sizeof(g_raw) >= CL_DGRAM_MAX + 8, "g_raw holds one answer");
 #define END_TAIL_MAX (32u * 1024u)       /* report bytes an END carries from a thread (its tail) */
 #define END_TAIL_RAW (4u * 1024u)        /* ... and from an exception */
 static void end_head(cl_end_t *e, uint32_t tail_max, uint32_t path) {
@@ -770,7 +786,10 @@ static int end_send_link(void) {
     end_head(&e, END_TAIL_MAX, 1);
     uint8_t hb[CL_END_LEN];
     memcpy(hb, &e, sizeof(hb));   /* both ends little-endian */
-    static uint8_t d[CL_DGRAM_MAX + 8];
+    /* the answers' buffer is the exception path's frame buffer: the two ways of sending END never run together
+       (finish picks one; lane ql-mem) */
+    uint8_t *const d = g_raw;
+    const unsigned dmax = CL_DGRAM_MAX + 8;
     const int on_link = thd_get_current() == g_link_thd;
     g_endack = 0;
     for (int round = 0; round < 2; ++round) {
@@ -782,7 +801,7 @@ static int end_send_link(void) {
         const uint64_t t0 = timer_ms_gettime64();
         while (!g_endack && timer_ms_gettime64() - t0 < 1000) {
             if (!on_link) { thd_sleep(10); continue; }
-            const int n = dcql_net_recv_wait(d, sizeof(d), 10);   /* only ENDACK is taken now */
+            const int n = dcql_net_recv_wait(d, dmax, 10);   /* only ENDACK is taken now */
             if (n > (int)CL_HDR && cl_unframe(d, (size_t)n) >= 0 && d[3] == CL_ENDACK && cl_rd32(d + 8) == H->h.run_id) {
                 g_endack_missing = cl_rd16(d + 14);
                 g_endack = 1;
@@ -796,7 +815,6 @@ static int end_send_link(void) {
 /* from an exception (no threads, no sockets): UDP frames built here and handed to the adapter's driver, which sends by
    PIO from an interrupt (KallistiOS bba_rtx). Each frame twice: an answer cannot be read here. Best effort: a frame is
    dropped when the driver's transmit lock was held by the thread the exception stopped. */
-static uint8_t g_raw[14 + 20 + 8 + CL_DGRAM_MAX + 32] __attribute__((aligned(32)));
 static uint16_t g_raw_id;
 static void raw_out(netif_t *nif, uint8_t type, uint32_t a, uint16_t b, const void *p, uint16_t n) {
     uint8_t *f = g_raw;
@@ -890,6 +908,13 @@ static void summary(void) {
         cl_report("cl-link: %s, files opened %u refused %u, reads %u, %u bytes in %u ms, lines %u dropped %u, stills %u\n",
                   g_link_up ? "up" : "never up", g_st.files_opened, g_st.files_refused, g_st.reads, g_st.read_bytes,
                   g_st.read_ms, g_st.lines, g_st.lines_dropped, g_st.stills);
+    if (g_link) {   /* lane ql-mem: the link layer's static stacks, most used so far, and its drops */
+        unsigned du, ds, tu, ts, tx, rx, txd, rxd;
+        dcql_net_stack_use(&du, &ds, &tu, &ts);
+        dcql_net_counters(&tx, &rx, &txd, &rxd);
+        cl_report("cl-mem: stack dial+rx %u of %u, tx %u of %u; rings rx %u tx %u; drops rx %u tx %u\n", du, ds, tu, ts,
+                  CL_RX_RING, CL_TX_RING, rxd, txd);
+    }
     if (g_still_n.rounds) {   /* ql-core6: what the stills cost on the link, and the link layer's own send drops */
         unsigned tx, rx, txd, rxd;
         dcql_net_counters(&tx, &rx, &txd, &rxd);

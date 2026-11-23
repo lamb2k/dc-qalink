@@ -14,8 +14,9 @@
  *   reassembly: every datagram stays <= DCQL_NET_DGRAM both ways.
  * ADAPTER (DCQL_NET_HAVE_BBA): the broadband adapter (or the LAN adapter) through KOS's own driver and network stack:
  *   net_init() (DHCP, or a static address set on the device first), one UDP socket, a receive thread blocked in
- *   recvfrom (16 KiB static stack: it wakes only when a datagram arrives) and a send thread blocked on a semaphore the
- *   ring's producer signals (8 KiB). net_shutdown() before a jump stops the adapter (its DMA goes to the adapter's own
+ *   recvfrom (it wakes only when a datagram arrives; since lane ql-mem it is the dial thread itself, staying on with
+ *   the dial thread's 16 KiB static stack once the adapter is up) and a send thread blocked on a semaphore the ring's
+ *   producer signals (8 KiB). net_shutdown() before a jump stops the adapter (its DMA goes to the adapter's own
  *   memory on the G2 bus, never to main RAM).
  */
 #include "dcql_net.h"
@@ -35,6 +36,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -89,10 +91,18 @@ static bool thread_busy(tid_t id) {
     return busy;
 }
 
-/* ---- single-producer single-consumer rings of datagrams: [u16 length][bytes] */
+/* ---- single-producer single-consumer rings of datagrams: [u16 length][bytes]
+   The program's own ring memory (dcql_net_config), or the built-in 4 KiB rings, allocated once by the first
+   dcql_net_start() only when the program supplied none (lane ql-mem: a program with its own rings no longer carries
+   8 KiB of unused built-in rings in its fixed memory); never freed, so there is no heap use after the link's start. */
 typedef struct { unsigned char *buf; unsigned size; volatile unsigned head, tail; } ring_t;
-static unsigned char g_rx_def[4096], g_tx_def[4096];
-static ring_t g_rx = {g_rx_def, sizeof(g_rx_def), 0, 0}, g_tx = {g_tx_def, sizeof(g_tx_def), 0, 0};
+#define DEF_RING 4096u
+static ring_t g_rx = {NULL, DEF_RING, 0, 0}, g_tx = {NULL, DEF_RING, 0, 0};
+static int rings_ready(void) {
+    if (!g_rx.buf) { g_rx.buf = memalign(32, DEF_RING); g_rx.size = DEF_RING; g_rx.head = g_rx.tail = 0; }
+    if (!g_tx.buf) { g_tx.buf = memalign(32, DEF_RING); g_tx.size = DEF_RING; g_tx.head = g_tx.tail = 0; }
+    return g_rx.buf && g_tx.buf;
+}
 static unsigned ring_used(const ring_t *r) { return r->head - r->tail; }
 static bool ring_put(ring_t *r, const void *p, unsigned n) {
     if (!p || !n || n > DCQL_NET_DGRAM || ring_used(r) + n + 2 > r->size) return false;
@@ -440,41 +450,45 @@ static void register_adapters(void) {
     bba_init();
     la_init();
 }
-static unsigned char g_brx_stack[16384] __attribute__((aligned(32))), g_btx_stack[8192] __attribute__((aligned(32)));
-static unsigned char g_bpkt_rx[DCQL_NET_DGRAM + 208], g_bpkt_tx[DCQL_NET_DGRAM + 8];
+/* lane ql-mem: the receive loop runs on the dial thread itself once the adapter is up (the dial thread's 16 KiB stack,
+   which also carried net_init and DHCP), so the adapter no longer keeps a second 16 KiB stack for it */
+static unsigned char g_btx_stack[8192] __attribute__((aligned(32)));
 static semaphore_t g_tx_sem = SEM_INITIALIZER(0), g_rx_sem = SEM_INITIALIZER(0);
 static volatile int g_bthreads, g_bdown;
 
-static void *dcql_bba_rx_thd(void *arg) {
-    (void)arg;
+/* the datagram buffers live on their threads' static stacks (lane ql-mem: 2,616 B less fixed memory; the stacks'
+   high-water marks are reported by dcql_net_stack_use()) */
+static void bba_rx_loop(void) {
+    unsigned char pkt_rx[DCQL_NET_DGRAM + 208] __attribute__((aligned(4)));
     while (!g_bdown) {
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         const int s = g_sock;
         if (s < 0) break;
-        const int n = recvfrom(s, g_bpkt_rx, sizeof(g_bpkt_rx) - 1, 0, (struct sockaddr *)&from, &fl);
+        const int n = recvfrom(s, pkt_rx, sizeof(pkt_rx) - 1, 0, (struct sockaddr *)&from, &fl);
         if (g_bdown) break;
         if (n <= 0) { if (n < 0) thd_sleep(10); continue; }
         g_rx_bytes += n;
         if (!accept_from(&from, fl, n) || g_state != DCQL_LINK_UP) { ++g_rx_drops; continue; }
-        if (!ring_put(&g_rx, g_bpkt_rx, (unsigned)n)) ++g_rx_drops;
+        if (!ring_put(&g_rx, pkt_rx, (unsigned)n)) ++g_rx_drops;
         else sem_signal(&g_rx_sem);
     }
-    return NULL;
 }
 static void *dcql_bba_tx_thd(void *arg) {
     (void)arg;
+    unsigned char pkt_tx[DCQL_NET_DGRAM + 8] __attribute__((aligned(4)));
     while (!g_bdown) {
         sem_wait(&g_tx_sem);
         int n;
-        while (!g_bdown && g_sock >= 0 && (n = ring_get(&g_tx, g_bpkt_tx, sizeof(g_bpkt_tx))) >= 0)
-            if (n > 0) send_to_peer(g_bpkt_tx, n);
+        while (!g_bdown && g_sock >= 0 && (n = ring_get(&g_tx, pkt_tx, sizeof(pkt_tx))) >= 0)
+            if (n > 0) send_to_peer(pkt_tx, n);
     }
     return NULL;
 }
 static void set4(unsigned char *d, unsigned v) { memcpy(d, &v, 4); }
 
-static void bba_main(void) {
+/* returns 1 when this (dial) thread is to stay on as the receive thread */
+static int bba_main(void) {
     register_adapters();
     g_state = DCQL_LINK_DIAL;
     g_attempt = 1;
@@ -484,7 +498,7 @@ static void bba_main(void) {
         /* DHCP asked for the known address (a quick REQUEST where a server answers), then the static address: in
            Flycast's adapter emulation a console that skips DHCP sends but receives nothing (lane ql-core, 2026-11-22) */
         const int r = net_init(g_dhcp_first == 2 ? 0 : ntohl(g_cfg_ip));   /* 2: any address the server gives */
-        if (!net_default_dev) { g_err = -41; g_state = DCQL_LINK_FAILED; logf_("dcql: no adapter (%d)", r); return; }
+        if (!net_default_dev) { g_err = -41; g_state = DCQL_LINK_FAILED; logf_("dcql: no adapter (%d)", r); return 0; }
         g_net_ready = true;
         if (!net_default_dev->netmask[0] || !net_default_dev->ip_addr[0]) {   /* no DHCP answer (KOS set at most the address) */
             const unsigned m = g_cfg_mask ? g_cfg_mask : htonl(0xffffff00u);
@@ -498,7 +512,7 @@ static void bba_main(void) {
     if (!g_net_ready) {
         g_static_used = g_cfg_ip != 0;
         if (g_cfg_ip) {   /* a static address: on the device before net_init, so it asks no DHCP server */
-            if (net_dev_init() < 0 || !net_default_dev) { g_err = -40; g_state = DCQL_LINK_FAILED; return; }
+            if (net_dev_init() < 0 || !net_default_dev) { g_err = -40; g_state = DCQL_LINK_FAILED; return 0; }
             set4(net_default_dev->ip_addr, g_cfg_ip);
             set4(net_default_dev->netmask, g_cfg_mask ? g_cfg_mask : htonl(0xffffff00u));
             set4(net_default_dev->gateway, g_cfg_gw);
@@ -506,42 +520,61 @@ static void bba_main(void) {
             set4(net_default_dev->broadcast, (g_cfg_ip & m) | ~m);
         }
         const int r = net_init(0);
-        if (!net_default_dev) { g_err = -41; g_state = DCQL_LINK_FAILED; logf_("dcql: no adapter (%d)", r); return; }
+        if (!net_default_dev) { g_err = -41; g_state = DCQL_LINK_FAILED; logf_("dcql: no adapter (%d)", r); return 0; }
         g_net_ready = true;
     }
     if (!net_default_dev->ip_addr[0] && net_dhcp_request(0) < 0) {}   /* a retry after a DHCP that failed */
-    if (!net_default_dev->ip_addr[0]) { g_err = -42; g_state = DCQL_LINK_FAILED; logf_("dcql: no address (DHCP)"); return; }
+    if (!net_default_dev->ip_addr[0]) { g_err = -42; g_state = DCQL_LINK_FAILED; logf_("dcql: no address (DHCP)"); return 0; }
     memcpy(g_ip, net_default_dev->ip_addr, 4);
     memcpy(g_mask, net_default_dev->netmask, 4);
     memcpy(g_gw, net_default_dev->gateway, 4);
     if (g_sock < 0) {
         const int s = socket(AF_INET, SOCK_DGRAM, 0);
-        if (s < 0) { g_err = -11; g_state = DCQL_LINK_FAILED; return; }
+        if (s < 0) { g_err = -11; g_state = DCQL_LINK_FAILED; return 0; }
         struct sockaddr_in me;
         memset(&me, 0, sizeof(me));
         me.sin_family = AF_INET;
         me.sin_port = htons(g_lport);
         me.sin_addr.s_addr = INADDR_ANY;
-        if (bind(s, (struct sockaddr *)&me, sizeof(me)) < 0) { close(s); g_err = -12; g_state = DCQL_LINK_FAILED; return; }
+        if (bind(s, (struct sockaddr *)&me, sizeof(me)) < 0) { close(s); g_err = -12; g_state = DCQL_LINK_FAILED; return 0; }
         g_sock = s;
     }
     ring_clear(&g_rx);
     ring_clear(&g_tx);
+    int stay = 0;
     if (!g_bthreads) {
         kthread_attr_t a;
         memset(&a, 0, sizeof(a));
         a.create_detached = true;
         a.prio = PRIO_DEFAULT;
         a.disable_tls = true;
-        a.stack_size = sizeof(g_brx_stack); a.stack_ptr = g_brx_stack; a.label = "dcql-bba-rx";
-        if (!thd_create_ex(&a, dcql_bba_rx_thd, NULL)) { g_err = -43; g_state = DCQL_LINK_FAILED; return; }
         a.stack_size = sizeof(g_btx_stack); a.stack_ptr = g_btx_stack; a.label = "dcql-bba-tx";
-        if (!thd_create_ex(&a, dcql_bba_tx_thd, NULL)) { g_err = -43; g_state = DCQL_LINK_FAILED; return; }
+        memset(g_btx_stack, 0x5a, sizeof(g_btx_stack));   /* STACK_FILL: high-water mark */
+        if (!thd_create_ex(&a, dcql_bba_tx_thd, NULL)) { g_err = -43; g_state = DCQL_LINK_FAILED; return 0; }
         g_bthreads = 1;
+        stay = 1;   /* this thread receives from now on (dial_main) */
     }
     g_state = g_stop ? DCQL_LINK_OFF : DCQL_LINK_UP;
     logf_("dcql: up ip=%u.%u.%u.%u (adapter, %s)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
           g_static_used ? "static" : g_cfg_ip ? "DHCP, the address asked for" : "DHCP");
+    return stay;
+}
+/* a later dcql_net_start() on a running adapter link (after dcql_net_stop()): what bba_main does when the address,
+   the socket and both threads are already there, done at once on the caller's thread (no dial thread: the dial
+   thread's stack is the receive thread's) */
+static int bba_restart(void) {
+    if (!(g_kind == DCQL_NET_BBA && g_bthreads && g_net_ready && g_sock >= 0 && !g_bdown && net_default_dev &&
+          net_default_dev->ip_addr[0]))
+        return 0;
+    g_stop = 0; g_err = 0;
+    g_attempt = 1;
+    g_host = g_configured_host;
+    memcpy(g_peer, &g_host, 4);
+    ring_clear(&g_rx);
+    ring_clear(&g_tx);
+    g_state = DCQL_LINK_UP;
+    logf_("dcql: up ip=%u.%u.%u.%u (adapter, again)", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
+    return 1;
 }
 #endif /* DCQL_NET_HAVE_BBA */
 
@@ -561,7 +594,13 @@ static void *dial_main(void *arg) {
 #endif
     g_dial_tid = thd_get_id(thd_get_current());
 #if DCQL_NET_HAVE_BBA
-    if (g_kind == DCQL_NET_BBA) bba_main();
+    if (g_kind == DCQL_NET_BBA && bba_main()) {
+        /* the dial thread stays on as the adapter's receive thread, at the priority the receive thread had */
+        thd_set_prio(thd_get_current(), PRIO_DEFAULT);
+        g_dial_running = 0;
+        bba_rx_loop();   /* until dcql_net_shutdown() */
+        return NULL;
+    }
 #endif
 #if DCQL_NET_HAVE_MODEM
     if (g_kind == DCQL_NET_MODEM) modem_main((intptr_t)arg);
@@ -571,6 +610,11 @@ static void *dial_main(void *arg) {
     g_dial_running = 0;
     return NULL;
 }
+
+/* stack high-water marks (lane ql-mem): each static stack is filled with a pattern before its thread starts; the
+   bytes no longer holding it, counted from the low end, are the most the thread has used */
+#define STACK_FILL 0x5au
+static void stack_fill(unsigned char *s, unsigned n) { memset(s, STACK_FILL, n); }
 
 static int spawn_dial(int mode) {
     if (thread_busy(g_dial_tid) || g_dial_running) return 0;
@@ -582,9 +626,24 @@ static int spawn_dial(int mode) {
     a.prio = thd_get_prio(thd_get_current());
     a.label = "dcql-dial";
     a.disable_tls = true;
+    stack_fill(g_dial_stack, sizeof(g_dial_stack));
     g_dial_running = 1;
     if (!thd_create_ex(&a, dial_main, (void *)(intptr_t)mode)) { g_dial_running = 0; return 0; }
     return 1;
+}
+
+static unsigned stack_used(const unsigned char *s, unsigned n) {
+    unsigned i = 0;
+    while (i < n && s[i] == STACK_FILL) ++i;
+    return n - i;
+}
+void dcql_net_stack_use(unsigned *dial, unsigned *dial_size, unsigned *tx, unsigned *tx_size) {
+    *dial = stack_used(g_dial_stack, sizeof(g_dial_stack)); *dial_size = sizeof(g_dial_stack);
+#if DCQL_NET_HAVE_BBA
+    *tx = g_bthreads ? stack_used(g_btx_stack, sizeof(g_btx_stack)) : 0; *tx_size = sizeof(g_btx_stack);
+#else
+    *tx = 0; *tx_size = 0;
+#endif
 }
 
 static void copy_str(char *d, size_t n, const char *s) {
@@ -612,7 +671,12 @@ void dcql_net_config(const dcql_net_config_t *c) {
 }
 
 int dcql_net_start(void) {
-    if (thread_busy(g_dial_tid) || g_dial_running || g_state == DCQL_LINK_UP) return 0;
+    if (g_state == DCQL_LINK_UP) return 0;
+    if (!rings_ready()) { g_state = DCQL_LINK_FAILED; g_err = -44; return -1; }   /* no memory for the built-in rings */
+#if DCQL_NET_HAVE_BBA
+    if (bba_restart()) return 0;
+#endif
+    if (thread_busy(g_dial_tid) || g_dial_running) return 0;
     if (!g_kind) {
 #if DCQL_NET_HAVE_BBA && DCQL_NET_HAVE_MODEM
         g_kind = g_cfg_net == DCQL_NET_MODEM ? DCQL_NET_MODEM
