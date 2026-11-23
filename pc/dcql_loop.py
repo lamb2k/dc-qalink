@@ -356,6 +356,12 @@ class UdpTransport:
                 self.peer = a
                 print('%s console at %s:%d (the loader says its address is %s)' % (time.strftime('%H:%M:%S'), a[0], a[1],
                                                                                  h['console_ip']), flush=True)
+            elif (m is not None and m[0] == HELLO and len(m[4]) >= 96 and a[0] == (self.peer or self.remote)[0] and
+                  a[1] != (self.peer or self.remote)[1] and parse_hello(m[4])['role'] != 2):
+                # round 3: a loader that heard no PC moves its own port (Flycast on Windows stops receiving on a port
+                # that once sent to a closed PC port); the answers follow the port its beacons now come from
+                self.peer = a
+                print('%s console now speaks from port %d' % (time.strftime('%H:%M:%S'), a[1]), flush=True)
             return d
         except (socket.timeout, BlockingIOError):
             return None

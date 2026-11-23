@@ -535,8 +535,10 @@ int main(int argc, char **argv) {
     uint32_t rate_have = 0, rate = 0;
     unsigned frame = 0;
     int was_up = 0, a_was = 0;
-    uint64_t heard_ms = 0, up_ms = 0;
+    uint64_t heard_ms = 0, up_ms = 0, moved_ms = 0;
     uint32_t rx_seen = 0;
+    unsigned moves = 0, port_moves = 0;
+    const unsigned port_seed = (unsigned)((timer_us_gettime64() * 2654435761u) % 16384u);
     static uint8_t buf[1408];
     for (;;) {
         const uint64_t now = timer_ms_gettime64();
@@ -568,6 +570,21 @@ int main(int argc, char **argv) {
             if (now - quiet_since >= 10000 && !dcql_net_learning()) {   /* autoconnect: any PC that answers */
                 loader_log(g_ever_heard ? "PC lost 10 s: looking for any PC" : "no PC in 10 s: looking for any PC");
                 dcql_net_relearn();
+            }
+            /* round 3: while no PC answers, a new own port every 5 s (every 20 s after 2 minutes). Flycast on Windows
+               stops receiving on a port whose beacon met a PC port nobody listened on, so a PC tool started after the
+               loader heard its beacons but its LOAD never arrived (dcql_net_move_lport). The PC answers the port the
+               beacons come from; on a console, where nothing is lost this way, it costs one socket swap. Ports from
+               49152 (the dynamic range), a new one each move in this boot. */
+            if (heard_ms > moved_ms) moves = 0;
+            if (now - quiet_since >= 10000 && now - moved_ms >= (moves < 24 ? 5000u : 20000u)) {
+                moved_ms = now;
+                const unsigned p = 49152u + (port_seed + port_moves++) % 16384u;
+                if (dcql_net_move_lport(p)) {
+                    ++moves;
+                    g_core.p.link_lport = dcql_net_lport();
+                    loader_log("no PC for %u s: own port now %u", (unsigned)((now - quiet_since) / 1000), p);
+                }
             }
         } else {
             if (st == DCQL_LINK_FAILED) guard_stop("link failed: the loader waits");

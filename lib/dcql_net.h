@@ -64,6 +64,10 @@ unsigned dcql_net_tx_queued(void);
    for a while. */
 void dcql_net_relearn(void);
 int dcql_net_learning(void);
+/* the adapter link's own UDP port moved (round 3): the loader calls it while no PC answers, because Flycast on Windows
+   stops receiving on a port that once sent to a PC port nobody listened on. 1 when moved; 0 on the modem, a link not
+   up, or a port that cannot be bound. The PC answers the port the console speaks from. */
+int dcql_net_move_lport(unsigned port);
 int dcql_net_mac(unsigned char out[6]);            /* the adapter's MAC address; -1 (all zero) on the modem */
 void dcql_net_text(char *out, unsigned n);          /* "UP 192.0.2.5 TO 192.0.2.10 ADAPTER", "DIALLING 1/3" */
 void dcql_net_counters(unsigned *tx, unsigned *rx, unsigned *txd, unsigned *rxd);
