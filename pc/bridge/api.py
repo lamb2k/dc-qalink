@@ -1,11 +1,12 @@
 """http.py: contract 1 (docs/BRIDGE_API.md) over HTTP/1.1 on 127.0.0.1, standard library only (ThreadingHTTPServer;
 the live stream is Server-Sent Events)."""
-import base64, hashlib, io, json, os, queue, re, threading, time, zipfile
+import base64, hashlib, io, json, os, queue, re, shutil, threading, time, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .core import CONTRACT, BRIDGE_VERSION
 from . import assets
+import qlsafe   # noqa: E402  (the shared boundaries; core put pc/ on the path)
 
 LEVELS = {'read': 0, 'control': 1, 'run': 2}
 CORS = {'Access-Control-Allow-Origin': '*',
@@ -13,6 +14,8 @@ CORS = {'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Expose-Headers': 'Content-Disposition, X-Report-CRC-OK'}
 MAX_BODY = 16 << 20
+PLUGIN_MAX = 4 << 20            # one decoder plugin (an ES module)
+LOADER_DISC_MAX = 64 << 20      # the loader disc folder served as a ZIP (a loader's disc is a few MiB)
 
 
 def multipart(body, ctype):
@@ -218,10 +221,14 @@ def make_handler(bridge, level='run'):
                 m = re.match(r'^/v0/plugins/([\w.-]+\.m?js)$', p)
                 if m:
                     d = bridge.asset_plugins
-                    path = os.path.join(d, m[1]) if d else None
-                    if not path or not os.path.isfile(path):
+                    try:   # opened, then checked on the opened object: a plugin linked out of its folder is refused
+                        with qlsafe.open_confined(d, m[1]) as fh:
+                            js = fh.read(PLUGIN_MAX + 1)
+                    except qlsafe.Refused:
                         return self.err(404, 'no plugin %s' % m[1])
-                    return self.reply(200, open(path, 'rb').read(), 'text/javascript; charset=utf-8')
+                    if len(js) > PLUGIN_MAX:
+                        return self.err(413, 'plugin %s is over %d bytes' % (m[1], PLUGIN_MAX))
+                    return self.reply(200, js, 'text/javascript; charset=utf-8')
                 if p == '/v0/disc/reads':
                     if bridge.disc is None:
                         return self.reply(200, {'reads': []})
@@ -266,7 +273,10 @@ def make_handler(bridge, level='run'):
                 if p == '/v0/runs':
                     if not self.allowed('run'):
                         return
-                    r = self.push(who)
+                    try:
+                        r = self.push(who)
+                    except qlsafe.Refused as e:   # the run queue is full (count or bytes): try again later
+                        return self.err(429, str(e))
                     if r is None:
                         return
                     bridge.audit_call(who, 'run', 'POST /v0/runs %s' % r.name, r.id)
@@ -362,6 +372,10 @@ def make_handler(bridge, level='run'):
             if files and ('/' in files or '\\' in files or '..' in files):
                 self.err(400, 'files names a served folder the bridge knows, never a path')
                 return None
+            if files and (not bridge.files_root or qlsafe.confine(bridge.files_root, files, want='dir') is None):
+                # audit round 2: a run asking for a subfolder gets it or is refused, never the whole /pc root
+                self.err(400, 'files: %r is not a folder below the served /pc root' % files)
+                return None
             if commit and not re.match(r'^[0-9a-fA-F]{7,40}$', commit):
                 self.err(400, 'commit: a git commit id (7 to 40 hex digits)')
                 return None
@@ -395,11 +409,19 @@ def make_handler(bridge, level='run'):
             if not src or not os.path.isdir(src):
                 return self.err(501, 'no loader disc set up (start the bridge with --loader-disc <folder with disc.gdi>)')
             buf = io.BytesIO()
+            total = 0
             with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(os.listdir(src)):
-                    full = os.path.join(src, fn)
-                    if os.path.isfile(full):
-                        z.write(full, fn)
+                    try:   # each file opened, then checked on the opened object (links out of the folder refused)
+                        fh = qlsafe.open_confined(src, fn)
+                    except qlsafe.Refused:
+                        continue
+                    with fh:
+                        total += os.fstat(fh.fileno()).st_size
+                        if total > LOADER_DISC_MAX:
+                            return self.err(413, 'the loader disc folder is over %d bytes' % LOADER_DISC_MAX)
+                        with z.open(fn, 'w') as out:
+                            shutil.copyfileobj(fh, out, 1 << 20)
             return self.reply(200, buf.getvalue(), 'application/zip',
                               {'Content-Disposition': 'attachment; filename="dc-qalink-loader-disc.zip"'})
 

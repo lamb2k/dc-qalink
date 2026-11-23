@@ -10,24 +10,78 @@ Content-Length, MCP base64), A4 the bridge keeps a run whose END came before a f
 and the END assembler's cover, A5 the one HELLO decoder (way-back words, CRC and version checked) and first_console.
 
 --pc DIR runs the rows against another pc/ tree. --controls is the control: with --pc naming 1990fb9's pc/ (the code
-the audit read) every item must FAIL; it exits 0 only then and prints one "control A<n>" row per item."""
+the audit read) every pinned row with an expected discrepancy must FAIL with exactly it (tests/ctlrows.py, round 2 of
+the audit): an exception (a missing helper, an import or setup error) is a control FAIL, and so is a missing row. A
+positive run needs every pinned row present and passing."""
 import argparse, json, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, urllib.error, \
     urllib.request, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = []
+sys.path.insert(0, HERE)
+import ctlrows   # noqa: E402
+
+# row name -> (pinned id, the discrepancy 1990fb9 must show and the test of the row's details that says it was seen;
+# None: a new-tree-only row, its helper is not in 1990fb9)
+PINNED_ROWS = {
+    'default bridge: the UDP socket is bound to 127.0.0.1 (kernel table)':
+        ('A1.bind_default', 'bound 0.0.0.0', lambda k: k.get('bound') == '0.0.0.0'),
+    'a --console of this PC (Flycast): bound on that address, still not every one':
+        ('A1.bind_flycast', 'bound 0.0.0.0', lambda k: k.get('bound') == '0.0.0.0'),
+    'positive: --allow-lan (a person\'s choice) binds every address': ('A1.allow_lan', None, None),
+    'only-local: a LAN sender\'s HELLO is dropped before parsing (not decoded, not listed)':
+        ('A1.lan_unparsed', 'decoded and listed', lambda k: k.get('decoded', 0) > 0 and k.get('listed', 0) > 0),
+    'positive: a loader on this PC (Flycast) is still heard and linked': ('A1.local_linked', None, None),
+    '/pc: a link (file or folder) out of the root is refused; a plain file is served':
+        ('A2.pc_links', 'served outside', lambda k: bool(k.get('served_outside'))),
+    'folder disc / overlay: a linked file out of the root is not indexed or opened':
+        ('A2.folder_disc', 'indexed link', lambda k: 'link.txt' in (k.get('indexed') or [])),
+    'GDI: a track named out of the descriptor\'s folder is refused (one beside it reads)':
+        ('A2.gdi_names', 'not refused', lambda k: k.get('refused') is False),
+    'model dependencies: names out of the root (links, .., absolute) read as absent':
+        ('A2.model_deps', 'leaked', lambda k: bool(k.get('leaked'))),
+    'asset import: a path out of the asset root (or a link out) is refused before reading':
+        ('A2.asset_path', 'took outside paths', lambda k: len(k.get('took') or []) > 1),
+    'MCP push_build: a file out of its root is refused before reading (one inside is sent)':
+        ('A2.mcp_path', 'sent outside files', lambda k: (k.get('codes') or [0])[0] == 202),
+    'stills (CLI): inconsistent heads allocate nothing; pending stills capped (count, bytes)':
+        ('A3.stills_cli', 'unchecked heads', lambda k: bool(k.get('raised')) or k.get('inconsistent_held', 0) > 0
+         or k.get('pending', 0) > 4),
+    'stills (bridge): an inconsistent head allocates nothing; pending stills capped':
+        ('A3.stills_bridge', 'unchecked heads', lambda k: k.get('inconsistent_held', 0) > 0 or k.get('pending', 0) > 4),
+    '/pc: open files a program holds are capped (100 distinct opens)':
+        ('A3.open_files', 'uncapped', lambda k: k.get('held', 0) > 32),
+    'HTTP: Content-Length negative, signed or over the limit is refused (413) before reading':
+        ('A3.http_length', 'negative length served', lambda k: (k.get('codes') or [0])[0] == 200),
+    'MCP push_build: base64 over the limit (or not base64) refused before decoding':
+        ('A3.mcp_base64', 'decoded before admission', lambda k: bool(k.get('raised')) or k.get('sent', 0) > 0),
+    'bridge: a valid END, then a loader back with an empty report = the run\'s result, not lost':
+        ('A4.bridge_end', 'lost', lambda k: k.get('state') == 'lost'),
+    'END assembler: whole tail ENDACK 0; overlap and hole not complete; other run, oversize refused':
+        ('A4.assembler', None, None),
+    'HELLO parser: the 164-byte way-back words are read (where, run, sense, aux)':
+        ('A5.parse_way_back', 'way-back words not read', lambda k: k.get('way_back') is None),
+    'one HELLO decoder: 164-byte way-back words read; bad CRC, version, short, truncated refused':
+        ('A5.decoder', None, None),
+    'first_console uses it: a good beacon decodes; a bad CRC or a program\'s HELLO does not':
+        ('A5.first_console', None, None),
+}
+R = None   # ctlrows.Rows, made in main
 
 
 def record(item, name, ok, **kw):
-    RESULTS.append({'item': item, 'name': name, 'ok': bool(ok), **kw})
-    print('%-3s %-74s %s %s' % (item, name, 'PASS' if ok else 'FAIL', json.dumps(kw, default=str)[:200]), flush=True)
+    rid, want, seen = PINNED_ROWS[name]
+    found = 'ok' if ok else (want if want and seen(kw) else 'other')
+    R.row(rid, name, lambda: (ok, found, kw))
 
 
 def guarded(item, name, f):
+    rid = PINNED_ROWS[name][0]
+    if R.controls and PINNED_ROWS[name][1] is None:
+        return   # a new-tree-only row: not run on the old tree
     try:
         f()
-    except Exception as e:   # old code without a helper fails its row; it never stops the rest
-        record(item, name, False, error='%s: %s' % (type(e).__name__, e))
+    except Exception as e:   # recorded as an error: on the old tree that is a control FAIL, never the expected one
+        R.row(rid, name, lambda: (_ for _ in ()).throw(e))
 
 
 def free_port(kind=socket.SOCK_STREAM):
@@ -259,16 +313,21 @@ def a3(cl, root):
     def stills():
         sk = cl.StillSink(None, 1, lambda s: None)
         lp = FakeLoop()
-        sk.on_still(lp, cl.STILL_HEAD, 1, struct.pack('<8I', 1, 1, 1, 1, 1, 64 << 20, 0, 0))   # 1 x 1 claiming 64 MiB
-        sk.on_still(lp, cl.STILL_HEAD, 2, struct.pack('<8I', 2, 1, 640, 480, 7, 640 * 480 * 2, 0, 0))   # format 7
-        sk.on_still(lp, cl.STILL_HEAD, 3, b'\x01' * 20)   # short head
+        raised = []
+        for i, h in ((1, struct.pack('<8I', 1, 1, 1, 1, 1, 64 << 20, 0, 0)),          # 1 x 1 claiming 64 MiB
+                     (2, struct.pack('<8I', 2, 1, 640, 480, 7, 640 * 480 * 2, 0, 0)),  # format 7
+                     (3, b'\x01' * 20)):                                               # short head
+            try:   # the old receiver raised on a short head: that is the discrepancy, seen here, not an error
+                sk.on_still(lp, cl.STILL_HEAD, i, h)
+            except struct.error as e:
+                raised.append(str(e)[:60])
         bad = len(sk.cur)
         for i in range(10, 20):   # ten valid 640 x 480 heads: only the pending budget's worth are taken
             sk.on_still(lp, cl.STILL_HEAD, i, struct.pack('<8I', i, 1, 640, 480, 1, 640 * 480 * 2, 0, 0))
         held = sum(len(s['data']) for s in sk.cur.values() if s.get('data') is not None)
         record('A3', 'stills (CLI): inconsistent heads allocate nothing; pending stills capped (count, bytes)',
-               bad == 0 and len(sk.cur) <= 4 and held <= (4 << 20), inconsistent_held=bad, pending=len(sk.cur),
-               bytes=held)
+               bad == 0 and not raised and len(sk.cur) <= 4 and held <= (4 << 20), inconsistent_held=bad,
+               pending=len(sk.cur), bytes=held, raised=raised)
     guarded('A3', 'stills (CLI): inconsistent heads allocate nothing; pending stills capped (count, bytes)', stills)
 
     def stills_bridge():
@@ -327,10 +386,16 @@ def a3(cl, root):
         bc = mcp_server.BridgeClient('http://127.0.0.1:1', 'test')
         calls = []
         bc.call = lambda *x, **k: calls.append(x) or (202, {'id': '1'})
-        c, _ = bc.push({'base64': 'A' * (24 << 20)})
-        c2, _ = bc.push({'base64': '!!notbase64!!'})
+        raised = []
+        codes = []
+        for b64 in ('A' * (24 << 20), '!!notbase64!!'):
+            try:   # the old client decoded first and raised on bad base64: the discrepancy, seen here
+                codes.append(bc.push({'base64': b64})[0])
+            except ValueError as e:
+                raised.append(str(e)[:60])
+                codes.append(None)
         record('A3', 'MCP push_build: base64 over the limit (or not base64) refused before decoding',
-               c == 413 and c2 == 413 and not calls, codes=[c, c2], sent=len(calls))
+               codes == [413, 413] and not calls and not raised, codes=codes, sent=len(calls), raised=raised)
     guarded('A3', 'MCP push_build: base64 over the limit (or not base64) refused before decoding', mcp_b64)
 
 
@@ -392,6 +457,15 @@ def a4(cl, root):
 
 # ------------------------------------------------------------------------------------------------ A5
 def a5(cl, pcdir):
+    def parse_way_back():
+        m = cl.unframe(hello_dgram())
+        h = cl.parse_hello(m[4])
+        wb = h.get('way_back')
+        record('A5', 'HELLO parser: the 164-byte way-back words are read (where, run, sense, aux)',
+               wb is not None and wb['where'] == 0x13 and wb['run'] == 0xabcd1234 and wb['sense'] == 0x2a05,
+               way_back=wb)
+    guarded('A5', 'HELLO parser: the 164-byte way-back words are read (where, run, sense, aux)', parse_way_back)
+
     def decoder():
         d = hello_dgram()
         h, run = cl.decode_hello(d)
@@ -430,6 +504,8 @@ def main():
     import dcql_loop as cl
     import dcql_disc
     from bridge.core import Bridge
+    global R
+    R = ctlrows.Rows({v[0]: v[1] for v in PINNED_ROWS.values()}, a.controls)
     root = tempfile.mkdtemp(prefix='ql-safety-')
     t0 = time.time()
     try:
@@ -440,21 +516,7 @@ def main():
         a5(cl, pcdir)
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    items = sorted({r['item'] for r in RESULTS})
-    failed_items = sorted({r['item'] for r in RESULTS if not r['ok']})
-    if a.out:
-        os.makedirs(a.out, exist_ok=True)
-        json.dump({'pc': pcdir, 'controls': a.controls, 'results': RESULTS},
-                  open(os.path.join(a.out, 'safety-results.json'), 'w'), indent=1)
-    if a.controls:
-        for it in items:
-            print('control %s (on %s: must fail) %s' % (it, pcdir, 'PASS' if it in failed_items else 'FAIL'))
-        print('controls: %d of %d items failed as they must' % (len(failed_items), len(items)))
-        return 0 if failed_items == items and len(items) == 5 else 1
-    bad = [r['name'] for r in RESULTS if not r['ok']]
-    print('%d of %d passed in %.1f s%s' % (len(RESULTS) - len(bad), len(RESULTS), time.time() - t0,
-                                          '' if not bad else '; FAILED: ' + '; '.join(bad)))
-    return 1 if bad else 0
+    return R.verdict(pcdir if a.controls else 'this tree', a.out)
 
 
 if __name__ == '__main__':

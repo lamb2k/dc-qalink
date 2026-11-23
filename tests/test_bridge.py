@@ -231,8 +231,11 @@ def main():
     t0 = time.time()
     code, rs = R.post('/v0/command', {'cmd': 'reset', 'level': 'return'})
     r = R.wait_run(run['id'])
+    # ql-fix-pc round 2: the rung is what was tried (RESET); the way back is named from the loader's own record (the
+    # simulated loader reports the stub's jump after a RESET), never from the rung
     record('reset (the ladder\'s first rung) brings a running program back', r['state'] == 'reset' and
-           rs.get('rung') == 'stub', state=r['state'], rung=rs.get('rung'), seconds=round(time.time() - t0, 2))
+           rs.get('rung') == 'reset' and r.get('way_back') == 'stub' and rs.get('way_back') == 'stub',
+           state=r['state'], rung=rs.get('rung'), way_back=r.get('way_back'), seconds=round(time.time() - t0, 2))
     code, run = R.push(args='secs=1 crash')
     r = R.wait_run(run['id'])
     record('crash: state crashed, the crash parsed from the report', r['state'] == 'crashed' and

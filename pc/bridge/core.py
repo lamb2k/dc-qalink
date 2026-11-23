@@ -31,6 +31,23 @@ def local_addresses():
     return out
 
 
+def bind_refused(host, console, only_local):
+    """Why the loader's UDP port may not be bound on `host`, or None (audit round 2, item 1). Without --allow-lan
+    (only_local) the port is bound on loopback only, with one documented exception: local Flycast. Its emulated
+    adapter speaks from this PC's own LAN address, so `--console <this PC's own address>` binds that one address
+    (never every address) and the receive filter still drops every datagram from off this PC before parsing. A
+    wildcard, any other interface, or a typed --udp-host that is not loopback needs --allow-lan."""
+    if not only_local:
+        return None
+    if host in ('localhost',) or host.startswith('127.'):
+        return None
+    ch = (console or '').partition(':')[0]
+    if console and console != 'auto' and host == ch and ch in local_addresses():
+        return None
+    return ('binding the loader\'s port on %s reaches beyond this PC: that needs --allow-lan (a person\'s choice); '
+            'without it the bridge binds 127.0.0.1, or this PC\'s own address named by --console (Flycast)' % host)
+
+
 # ------------------------------------------------------------------------------------------------ transport
 class BridgeUdp:
     """The loader's UDP port, bound for as long as the bridge runs (a Windows socket that once took an ICMP
@@ -243,25 +260,37 @@ class Stills:
         self.meta = {}           # id -> json
         self.waiters = {}        # grab request id -> list of still ids (filled when held)
         self.refused = 0         # heads refused: malformed, or over the pending budget
+        self.expired = 0         # unfinished stills abandoned (idle over cl.STILL_STALE_S): their slots freed
+        self.receipts = cl.StillReceipts()   # completed stills (bounded): a repeated head / END is answered, not reopened
+        self.META_KEEP = 4096
 
     def on_still(self, loop, run, a, b, payload, tier, emit):
         key = (run, b)
+        now = time.time()
         st = self.cur.get(key)
         if a == cl.STILL_HEAD:
             hd = cl.still_head(payload)   # checked before anything is allocated (audit 2026-11-23, item 3)
             if hd is None:
                 self.refused += 1
                 return
+            if st is None and self.receipts.get(key) == hd['bytes']:
+                return   # the ACK of a completed still was lost: the program sends its head again; never reopened
             if st is None or st['bytes'] != hd['bytes'] or st['done']:
+                self.expired += cl.still_expire(self.cur, now)
                 if not cl.still_room(self.cur, hd['bytes'], key):
                     self.refused += 1
                     return
-                self.cur[key] = {'picture': hd['picture'], 'w': hd['w'], 'h': hd['h'], 'bytes': hd['bytes'],
-                                 'crc': hd['crc'], 'req': hd['req'], 'data': bytearray(hd['bytes']), 'have': set(),
-                                 't0': time.time(), 'done': False}
+                self.cur[key] = st = {'picture': hd['picture'], 'w': hd['w'], 'h': hd['h'], 'bytes': hd['bytes'],
+                                      'crc': hd['crc'], 'req': hd['req'], 'data': bytearray(hd['bytes']),
+                                      'have': set(), 't0': now, 't_last': now, 'done': False}
+            st['t_last'] = now
             return
         if st is None:
+            nb = self.receipts.get(key)
+            if a == cl.STILL_END and nb is not None:   # answered from the receipt: complete
+                loop.send(cl.STILLACK, run, b, 0, cl.still_full_ack(nb))
             return
+        st['t_last'] = now
         if a == cl.STILL_END:
             nblocks = (st['bytes'] + cl.CHUNK - 1) // cl.CHUNK
             bits = bytearray((nblocks + 7) // 8)
@@ -285,6 +314,12 @@ class Stills:
                      'seconds': round(time.time() - st['t0'], 3), 'request': st['req'] or None, 'tier': tier,
                      'at': now_iso(), 'png': path if ok else None}
                 self.meta[sid] = j
+                while len(self.meta) > self.META_KEEP:   # the still's record stays on disk with its run; memory bounded
+                    old = next(iter(self.meta))
+                    self.meta.pop(old)
+                    for w in [w for w, ids in self.waiters.items() if old in ids]:
+                        self.waiters.pop(w, None)
+                self.receipts.add(key, st['bytes'])
                 self.log('still %s (picture %d) %s in %.2f s' % (sid, st['picture'], 'held' if ok else 'CRC MISMATCH',
                                                                j['seconds']))
                 if st['req']:
@@ -293,10 +328,9 @@ class Stills:
                 self.cur.pop(key, None)
             loop.send(cl.STILLACK, run, b, min(missing, 0xFFFF), bytes(bits[:cl.DGRAM_MAX - cl.HDR - 4]))
             return
-        k = a // cl.CHUNK
-        if a % cl.CHUNK == 0 and a + len(payload) <= st['bytes']:
+        if not st['done'] and cl.still_block_ok(st, a, payload):   # present only at its exact place and length
             st['data'][a:a + len(payload)] = payload
-            st['have'].add(k)
+            st['have'].add(a // cl.CHUNK)
 
 
 # ------------------------------------------------------------------------------------------------ runs
@@ -309,7 +343,10 @@ class Run:
         self.build = None        # the build record's id (Bridge.make_build)
         self.id = '%08x' % self.sid
         self.name, self.raw, self.args = name, raw, args
+        self.nbytes = len(raw)   # kept when the payload is dropped at the run's end (Bridge._worker)
         self.sha256 = hashlib.sha256(raw).hexdigest()
+        self.evidence = None     # audit round 2: what arrived, separately: the END and the loader's saved report
+        self.reset_rung = None   # the ladder rung tried (a request, not how the console came back: that is way_back)
         self.deadline_s, self.files, self.reset_after_s, self.by = deadline_s, files, reset_after_s, by
         self.state = 'queued'
         self.queued_at, self.ended_at = now_iso(), None
@@ -331,7 +368,7 @@ class Run:
         self.done = threading.Event()
 
     def json(self, tier, device_name):
-        j = {'id': self.id, 'program': {'name': self.name, 'sha256': self.sha256, 'bytes': len(self.raw)},
+        j = {'id': self.id, 'program': {'name': self.name, 'sha256': self.sha256, 'bytes': self.nbytes},
              'args': self.args, 'state': self.state, 'times': self.times, 'way_back': self.way_back, 'by': self.by,
              'queued_at': self.queued_at, 'ended_at': self.ended_at, 'device': device_name, 'tier': tier,
              'deadline_s': self.deadline_s, 'files': self.files_stats, 'stills': self.stills,
@@ -342,6 +379,10 @@ class Run:
             j['transfer'] = self.transfer
         if self.ending:
             j['ending'] = self.ending
+        if self.evidence:
+            j['evidence'] = self.evidence
+        if self.reset_rung:
+            j['reset_rung'] = self.reset_rung
         return j
 
 
@@ -417,6 +458,10 @@ class Bridge:
         os.makedirs(self.sessions_dir, exist_ok=True)
         self.logf = open(os.path.join(self.data_dir, 'bridge.log'), 'a', encoding='utf-8')
         self._ext_log = log
+        why = bind_refused(bind[0], console, only_local)
+        if why:
+            self.logf.close()
+            raise PermissionError(why)
         self.t = BridgeUdp(bind[0], bind[1], console, autoconnect, os.path.join(self.data_dir, 'consoles.json'),
                            only_local)
         if self.t.fixed and only_local and not self.t.is_local(self.t.fixed[0]):
@@ -436,6 +481,7 @@ class Bridge:
         self.runs = {}
         self.run_order = []
         self.queue = queue.Queue()
+        self.submit_lock = threading.Lock()
         self.active = None
         self.sessions = {}
         self.current = None          # the session of the linked program (or the last one)
@@ -535,7 +581,7 @@ class Bridge:
                 'session': cur.id if cur else None, 'rate_bps': round(rate, 1),
                 'mode': 'summary' if (self.loop.hello or {}).get('net') == 'modem' else 'full', 'paused': self.paused,
                 'n': cur.max_n if cur else 0, 'level': self.level, 'tier': self.tier(),
-                'queue': [r.id for r in list(self.queue.queue)], 'active_run': a.id if a is not None else None,
+                'queue': [r.id for r in list(self.queue.queue) if r is not None], 'active_run': a.id if a is not None else None,
                 'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
                 'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build_id,
                 'udp_bind': '%s:%d' % self.t.bound[:2],
@@ -632,7 +678,7 @@ class Bridge:
             return self.current
         r = self.runs.get('%08x' % run_sid)
         return self.new_session(run_sid, {'name': r.name if r else 'program (started on the console)',
-                                          'bytes': len(r.raw) if r else None, 'hash': r.sha256 if r else None})
+                                          'bytes': r.nbytes if r else None, 'hash': r.sha256 if r else None})
 
     # ------------------------------------------------------------------ the tap
     def tap(self, m):
@@ -764,17 +810,41 @@ class Bridge:
         self.record({'t': 'link', 'state': 'lost', 'role': 'program', 'run': '%08x' % run, 'why': why})
         if self.current is not None:
             self.current.flush()
+        a = self.active
+        if a is None or a.sid != run:   # a program the bridge did not push: its link is gone, so is its state
+            self.retire_run_state(run)
+
+    FILES_MAX = 4   # live file services (one per run); the oldest is retired past this, so descriptors stay bounded
+                    # at FILES_MAX x FileService.OPEN_MAX for the bridge's lifetime
 
     def file_service(self, run):
         fs = self.files.get(run)
         if fs is None:
             r = self.runs.get('%08x' % run)
             root = self.files_root
-            if r is not None and r.files and self.files_root:
-                cand = qlsafe.confine(self.files_root, r.files, want='dir')
-                root = cand or self.files_root
+            if r is not None and r.files:
+                # a run that asked for a subfolder gets that subfolder or nothing (audit round 2: fail closed, never
+                # widened to the whole /pc root)
+                root = qlsafe.confine(self.files_root, r.files, want='dir') if self.files_root else None
+                if root is None:
+                    self.log('run %s: /pc subfolder %r is not a folder below the served root: /pc refused for this run'
+                             % (r.id, r.files))
+            while len(self.files) >= self.FILES_MAX:
+                self.retire_run_state(next(iter(self.files)))
             fs = self.files[run] = cl.FileService(root, self.log)
         return fs
+
+    def retire_run_state(self, run):
+        """A run's live state retired (run end, the program's link lost, the bridge stopping): its file service's
+        descriptors closed and its disc handles dropped. Returns the file service's totals (or None)."""
+        fs = self.files.pop(run, None)
+        if fs is not None:
+            fs.close()
+        if self.disc is not None and hasattr(self.disc, 'retire'):
+            self.disc.retire(run)
+        if self.active is None or self.active.sid != run:
+            self.endings.pop(run, None)
+        return fs.summary() if fs is not None else None
 
     def subscribe(self, channels=wire.CH_REC | wire.CH_TRACE | wire.CH_LOG, every=1):
         if self.client_run is not None:
@@ -831,17 +901,31 @@ class Bridge:
                 self.log('run %s: %s' % (run.id, run.error))
             finally:
                 run.ended_at = now_iso()
-                run.raw_keep = None
+                run.raw = None            # a finished run keeps its numbers, not its program bytes (audit round 2)
                 self.active = None
+                self.retire_run_state(run.sid)
                 run.done.set()
                 self.record({'t': 'back' if run.state not in ('refused',) else 'verdict', 'run': run.id,
                              'state': run.state, 'way_back': run.way_back, 'seconds': run.times.get('run_s'),
                              'error': run.error})
 
     # ------------------------------------------------------------------ runs
+    QUEUE_MAX = 8                 # runs waiting at once
+    QUEUE_BYTES = 64 << 20        # and their program bytes together
+    RUNS_KEEP = 512               # finished runs kept in memory (their files stay in the data folder)
+
     def submit(self, name, raw, args='', deadline_s=0, files=None, reset_after_s=None, by='api', commit=None):
         if cl.LOAD_ADDR + len(raw) + 4 > cl.IMAGE_END:
             raise ValueError('program too large: %d bytes' % len(raw))
+        with self.submit_lock:   # admission: the queue is capped in count and bytes before anything is kept
+            waiting = [q for q in list(self.queue.queue) if q is not None]
+            if len(waiting) >= self.QUEUE_MAX or sum(q.nbytes for q in waiting) + len(raw) > self.QUEUE_BYTES:
+                raise qlsafe.Refused('the run queue is full (%d runs, %d bytes waiting; at most %d runs, %d bytes)' % (
+                    len(waiting), sum(q.nbytes for q in waiting), self.QUEUE_MAX, self.QUEUE_BYTES))
+            done = [i for i in self.run_order if self.runs[i].done.is_set()]
+            for i in done[:max(0, len(self.run_order) - self.RUNS_KEEP)]:
+                self.runs.pop(i, None)
+                self.run_order.remove(i)
         r = Run(name, raw, args, int(deadline_s or 0), files, reset_after_s, by, commit)
         b = self.make_build(name, r.sha256, len(raw), args, commit, by)
         r.build = b['id']
@@ -906,28 +990,34 @@ class Bridge:
                 return None
             wait_s = (run.deadline_s + 60) if run.deadline_s else 900
             reset_at = t_exec + run.reset_after_s if run.reset_after_s else None
+            lost_why = None
             while hb is None and time.time() - t_exec < wait_s:
                 if run.reset_flag.is_set() or (reset_at and time.time() >= reset_at):
                     rung, secs, hb, ack = cl.ladder(loop, run.sid, 20.0, self.log, b0)
-                    run.way_back = {'reset': 'stub', 'watchdog or reboot': 'watchdog', None: 'power'}.get(rung, rung)
-                    self.record({'t': 'reset', 'run': run.id, 'rung': run.way_back, 'seconds': secs}, session)
+                    # the rung is what was tried; how the console came back is read from the loader's HELLO below
+                    run.reset_rung = {'reset': 'reset', 'watchdog or reboot': 'watchdog wait', None: 'power'}.get(
+                        rung, rung)
+                    self.record({'t': 'reset', 'run': run.id, 'rung': run.reset_rung, 'acknowledged': ack is not None,
+                                 'seconds': secs}, session)
                     if hb is None:
-                        run.state, run.error = 'lost', 'power cycle needed'
-                        return
+                        lost_why = 'power cycle needed'   # the END (if any) still decides the result below
                     break
                 hb = loop.wait(back, 1.0)
             self.client_left('program ended')
             run.times['run_s'] = round(time.time() - t_exec, 3)
-            run.files_stats = self.file_service(run.sid).summary()
+            fs = self.files.get(run.sid)
+            run.files_stats = fs.summary() if fs is not None else cl.FileService(None, None).summary()
             if self.disc is not None:
                 run.files_stats = dict(run.files_stats, disc=self.disc.summary())
             asm = self.endings.get(run.sid)
             er = cl.end_report(asm, run.sid, None) if asm is not None else None
+            run.way_back = cl.way_back_of(hb)
+            run.evidence = {'end': cl.ending_state(er), 'loader_back': hb is not None, 'loader_report': 'none'}
             if hb is None:
+                why = lost_why or 'the loader did not come back within %d s' % wait_s
                 if er is not None:   # the END is in hand: the run's result, though the loader is not back
-                    return self._end_result(run, er, session, t_start, 'the loader did not come back within %d s' %
-                                            wait_s)
-                run.state, run.error = 'lost', 'the loader did not come back within %d s' % wait_s
+                    return self._end_result(run, er, session, t_start, why)
+                run.state, run.error = 'lost', why
                 return
             if hb['report_run'] != run.sid or hb['report_state'] in (0, 1) or (er is not None and not hb['report_len']):
                 if er is not None:
@@ -937,13 +1027,26 @@ class Bridge:
                 run.state = 'lost'
                 run.error = 'loader back without this run (power cycle?)'
                 return
-            rep = loop.fetch_report(hb, os.path.join(self.data_dir, 'reports'))
+            try:
+                rep = loop.fetch_report(hb, os.path.join(self.data_dir, 'reports'))
+            except (RuntimeError, OSError) as e:
+                rep = None
+                run.evidence['loader_report'] = 'failed: %s' % e
+            else:
+                run.evidence['loader_report'] = 'crc ok' if rep['crc_ok'] else 'bad crc'
+            if (rep is None or not rep['crc_ok']) and cl.end_rank(er) > 0:
+                # audit round 2: the loader's saved report failed (unreadable or bad CRC); the run's END, verified,
+                # is the best report: the result is the END's, the loader's failure stays in `evidence`
+                return self._end_result(run, er, session, t_start, 'the loader\'s report: %s' %
+                                        run.evidence['loader_report'])
+            if rep is None:
+                run.state, run.error = 'lost', 'the loader\'s report: %s (no END for this run)' % \
+                    run.evidence['loader_report']
+                return
             run.times['report_s'] = rep['seconds']
             run.report = open(rep['path'], 'rb').read()
             run.report_crc_ok = rep['crc_ok']
             run.state = RUN_STATE_OF.get(rep['state'], 'lost')
-            hdr_way = 'stub' if run.way_back is None else run.way_back
-            run.way_back = hdr_way
             text = run.report.decode('latin-1')
             run.summary = parse_summary(text, run.state, rep['exit'], run.times['run_s'], self.tier(), session)
             if 'crash' in run.summary:
@@ -962,7 +1065,6 @@ class Bridge:
         run.report = tail
         run.report_crc_ok = er['crc_ok']
         run.state = RUN_STATE_OF.get(er['state'], 'lost')
-        run.way_back = run.way_back or 'full restart'
         run.ending = {k: er[k] for k in ('bytes', 'tail_bytes', 'complete', 'whole', 'crc_ok', 'by')}
         if not er['complete']:
             run.error = "the END's tail is incomplete (%d of %d bytes held)" % (er['tail_bytes'],
@@ -1044,8 +1146,8 @@ class Bridge:
         if run is not None:   # the worker owns the link while a run is on: it climbs the ladder once the program runs
             run.reset_flag.set()
             run.done.wait(40.0)
-            return 200, {'ok': run.way_back in ('stub', 'watchdog'), 'id': 'reset', 'rung': run.way_back or 'none',
-                         'run': run.id}
+            return 200, {'ok': run.way_back is not None, 'id': 'reset', 'rung': run.reset_rung or 'none',
+                         'way_back': run.way_back, 'run': run.id}
         h = self.loop.hello or {}
         if self.client is None and h and time.time() - h.get('at', 0) < 3.0 and h.get('state') in (0, 2, 3):
             # nothing running and the loader beaconing: already back at the loader (Flycast run f2 waited 30 s here)
@@ -1054,8 +1156,9 @@ class Bridge:
             b0 = (self.loop.hello or {}).get('boot_count')
             rung, secs, hb, ack = cl.ladder(self.loop, 0, 20.0, self.log, b0)
         self.client_left('reset')
-        return 200, {'ok': hb is not None, 'id': 'reset', 'rung': {'reset': 'stub', 'watchdog or reboot': 'watchdog'}.get(
-            rung, 'none'), 'seconds': secs}
+        return 200, {'ok': hb is not None, 'id': 'reset', 'rung': {'reset': 'reset', 'watchdog or reboot':
+                                                                     'watchdog wait'}.get(rung, 'none'),
+                     'way_back': cl.way_back_of(hb), 'seconds': secs}
 
     def power(self):
         msgs = []
@@ -1109,10 +1212,13 @@ class Bridge:
         self.queue.put(None)
         if self.current is not None:
             self.current.close('bridge stopped')
+        for run in list(self.files):
+            self.retire_run_state(run)
         self.t.close()
 
 
 def program_image(data):
+    """The flat image of a pushed program: an ELF's load span is validated before it is allocated (cl.elf_image)."""
     if data[:4] == b'\x7fELF':
         lo, img = cl.elf_image(data)
         if lo != cl.LOAD_ADDR:

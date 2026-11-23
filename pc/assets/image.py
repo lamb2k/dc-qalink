@@ -9,6 +9,9 @@ try:
 except ImportError:            # Pillow is optional
     _PIL = None
 
+PIXELS_MAX = 4096 * 4096       # a picture's pixels, checked from its header before anything is inflated or allocated
+                               # (audit round 2): 64 MiB as RGBA; Dreamcast textures are at most 1024 x 1024
+
 
 def _png_rows(raw, w, h, bpp, stride):
     out = np.zeros((h, stride), np.uint8)
@@ -63,8 +66,18 @@ def read_png(data):
             break
     if depth != 8 or inter:
         raise ValueError('PNG: only 8-bit, non-interlaced without Pillow (depth %s, interlace %s)' % (depth, inter))
+    if ctype not in (0, 2, 3, 4, 6):
+        raise ValueError('PNG: colour type %s' % ctype)
+    if not w or not h or w * h > PIXELS_MAX:
+        raise ValueError('PNG: %s x %s pixels refused (at most %d pixels)' % (w, h, PIXELS_MAX))
     ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
-    px = _png_rows(zlib.decompress(b''.join(idat)), w, h, ch, w * ch).reshape(h, w, ch)
+    need = h * (1 + w * ch)          # the filtered rows' exact size: the inflate stops there
+    z = zlib.decompressobj()
+    raw = z.decompress(b''.join(idat), need + 1)
+    if len(raw) != need:
+        raise ValueError('PNG: image data inflates to %s%d bytes, the header says %d' % (
+            'over ' if len(raw) > need else '', len(raw), need))
+    px = _png_rows(raw, w, h, ch, w * ch).reshape(h, w, ch)
     out = np.full((h, w, 4), 255, np.uint8)
     if ctype == 3:
         out[..., :3] = plte[px[..., 0]]
@@ -85,6 +98,8 @@ def read_image(data):
     """RGBA (h, w, 4) from PNG or JPEG bytes (JPEG and other formats need Pillow)."""
     if _PIL is not None:
         im = _PIL.open(io.BytesIO(data))
+        if im.width * im.height > PIXELS_MAX or not im.width or not im.height:   # the header, before decoding
+            raise ValueError('picture %d x %d refused (at most %d pixels)' % (im.width, im.height, PIXELS_MAX))
         return np.array(im.convert('RGBA'), np.uint8)
     if data[:8] == b'\x89PNG\r\n\x1a\n':
         return read_png(data)

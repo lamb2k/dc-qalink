@@ -15,9 +15,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def udp_host(a):
-    """The UDP bind (audit 2026-11-23, item 1): loopback unless a person opted in. --udp-host typed is used as typed;
-    --allow-lan binds every address; a --console that is this PC's own address (Flycast beacons from it) binds that
-    address; else 127.0.0.1. Without --allow-lan the bridge reads only its own PC's senders whatever is bound."""
+    """The UDP bind (audit 2026-11-23 item 1, round 2): loopback unless a person opted in. --allow-lan binds every
+    address; a --console that is this PC's own address (Flycast beacons from it) binds that one address, the single
+    documented exception; else 127.0.0.1. A typed --udp-host is checked by the bridge (core.bind_refused): anything
+    but loopback needs --allow-lan, so the bridge refuses to start instead of binding it."""
     if a.udp_host:
         return a.udp_host
     if a.allow_lan:
@@ -37,8 +38,8 @@ def main(argv=None):
                     help='sessions, stills, reports, bridge.log, calls.log')
     ap.add_argument('--udp-host', default=None,
                     help='the address the loader\'s UDP port is bound on. Default: 127.0.0.1, or the address --console '
-                         'names when it is this PC\'s own (Flycast), or every address with --allow-lan. Whatever is '
-                         'bound, without --allow-lan only datagrams from this PC\'s own addresses are read')
+                         'names when it is this PC\'s own (Flycast), or every address with --allow-lan. Anything but '
+                         'loopback needs --allow-lan (the bridge refuses to start otherwise)')
     ap.add_argument('--udp-port', type=int, default=52060, help='the loader\'s port, bound while the bridge runs')
     ap.add_argument('--console', default='auto', help='auto (the first loader heard) or the console\'s address')
     ap.add_argument('--device', choices=('flycast', 'console', 'mock'), help='the tier of numbers (default: guessed)')
@@ -75,9 +76,13 @@ def main(argv=None):
     from bridge.core import Bridge
     from bridge.api import serve
     log = None if a.quiet else (lambda s: print(s, flush=True))
-    b = Bridge(a.data, (udp_host(a), a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level, log,
-               autoconnect=not a.no_autoconnect, only_local=not a.allow_lan, disc=a.disc, overlay=a.overlay,
-               whole=a.whole)
+    try:
+        b = Bridge(a.data, (udp_host(a), a.udp_port), a.console, a.device, a.files, a.selftest, a.loader_disc, a.level,
+                   log, autoconnect=not a.no_autoconnect, only_local=not a.allow_lan, disc=a.disc, overlay=a.overlay,
+                   whole=a.whole)
+    except PermissionError as e:
+        print('qalink_bridge: %s' % e, file=sys.stderr, flush=True)
+        return 2
     b.asset_plugins = a.asset_plugins
     b.asset_root = a.asset_root
     b.viewer_elf = a.viewer

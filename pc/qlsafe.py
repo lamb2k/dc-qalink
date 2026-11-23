@@ -11,9 +11,13 @@ datagram as the console's:
   EndAssembler            the run's ending (END head + tail pieces), bounded and run-specific, that says whether the
                           declared tail is held whole with no overlap (the CLI and the bridge both use it)
 
-A file is opened by the real path these return, so a link swapped in between the check and the open is the only gap,
-and that needs a person already writing inside the root."""
-import base64, binascii, os, struct, zlib
+  open_inside(root, path) a file opened first and then checked on the opened object (round 2 of the audit): the real
+  open_confined(root,rel) path of the open descriptor (/proc/self/fd, else the real path whose device and inode must
+                          be the descriptor's) must be a regular file below the root, or the file is closed and refused
+
+Serving code opens with open_inside / open_confined, so a link swapped in after a check cannot change what is read:
+what is checked is what was opened. confine() and inside() remain for indexing and listing."""
+import base64, binascii, os, stat, struct, zlib
 
 
 class Refused(ValueError):
@@ -56,6 +60,60 @@ def confine(root, rel, want='file'):
     if not rel or any(x in ('', '.', '..') for x in parts) or ':' in parts[0]:
         return None
     return inside(root, os.path.join(root, *parts), want)
+
+
+def _fd_path(fd):
+    """The real path of an open descriptor where the system says it (Linux /proc), else None."""
+    try:
+        p = os.readlink('/proc/self/fd/%d' % fd)
+    except OSError:
+        return None
+    return p if p.startswith('/') and not p.endswith(' (deleted)') else None
+
+
+def open_inside(root, path):
+    """`path` opened for reading, then checked on the opened object: a regular file whose real path (of the open
+    descriptor) is below `root`. The open file, or Refused (the file is closed first)."""
+    if not root or path is None:
+        raise Refused('no root')
+    try:
+        f = open(path, 'rb')
+    except OSError as e:
+        raise Refused('%s: %s' % (os.path.basename(str(path)), e.strerror or e))
+    try:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused('%s is not a regular file' % os.path.basename(path))
+        real = _fd_path(f.fileno())
+        if real is None:   # no /proc (Windows): the real path now must name this very object
+            real = os.path.realpath(path)
+            s2 = os.stat(real)
+            if (s2.st_dev, s2.st_ino) != (st.st_dev, st.st_ino):
+                raise Refused('%s changed while it was opened' % os.path.basename(path))
+        r = _real(root)
+        try:
+            if os.path.commonpath([r, os.path.normcase(real)]) != r:
+                raise Refused('%s is not below its root' % os.path.basename(path))
+        except ValueError:
+            raise Refused('%s is not below its root' % os.path.basename(path))
+        return f
+    except BaseException:
+        f.close()
+        raise
+
+
+def open_confined(root, rel):
+    """A peer's name below `root` (the rules of confine) opened and checked on the opened object; Refused otherwise."""
+    if not root or rel is None:
+        raise Refused('no root')
+    rel = rel.replace('\\', '/')
+    if '\0' in rel:
+        raise Refused('a NUL in the name')
+    rel = rel.lstrip('/')
+    parts = rel.split('/')
+    if not rel or any(x in ('', '.', '..') for x in parts) or ':' in parts[0]:
+        raise Refused('%r is not a plain name below the root' % rel[:80])
+    return open_inside(root, os.path.join(root, *parts))
 
 
 def read_capped(path, limit):
