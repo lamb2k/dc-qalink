@@ -30,7 +30,11 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
   before every way back so a return lands on the loader and not on openMenu. Its screen shows three large lines you
   can read off a TV: the console's address, the PC it looks for, beacons sent and answers heard. Its HELLO carries the
   adapter's MAC (a PC keeps one console by it across address changes), the GDEMU slot and version, and the stub's
-  record of the last way back.
+  record of the last way back. **On Flycast, start the bridge (or the app) before Flycast:** Flycast on Windows stops
+  receiving on a console port whose beacon met a PC port nobody listened on (an ICMP "port unreachable"), so a bridge
+  started after the loader links but its push gets "no answer to LOAD". A real console's KallistiOS ignores that
+  ICMP (Flycast found it; a console run of "boot the loader, wait 30 s, then start the bridge" is on the release's
+  console checklist).
 - **The first run on a console:** `python tools/first_console.py --program build/testprog.elf` waits for the beacon,
   pushes the test program, reads its report, grabs the console's screen 3 times, sends RESET and prints a pass/fail
   table. The PC tool learns the console's address from its beacon (`--udp auto`).

@@ -687,7 +687,10 @@ class StillSink:
                 bits[k >> 3] |= 1 << (k & 7)
             missing = nblocks - len(st['have'])
             if not missing and not st['done']:
-                ok = (zlib.crc32(bytes(st['data'])) & 0xFFFFFFFF) == st['crc']
+                crc = st['crc']
+                if crc == 0 and len(payload) >= 32:   # round 3: a CRC of the bytes as sent comes with the END
+                    crc = struct.unpack_from('<I', payload, 24)[0]
+                ok = (zlib.crc32(bytes(st['data'])) & 0xFFFFFFFF) == crc
                 name = 'still-%08x-%03d-p%05d.png' % (self.run, idx, st['picture'])
                 if not ok:
                     # round 3, blocker 5: a CRC mismatch is never a completion: no receipt, no full ACK; every block
