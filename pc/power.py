@@ -3,7 +3,7 @@
 
 Until a smart plug is named this prints "power cycle needed" and returns False: the person at the console switches it
 off and on. One adapter class per plug model, chosen by DCQL_PLUG (model name) with its settings in DCQL_PLUG_ARGS
-(JSON), for example DCQL_PLUG=example DCQL_PLUG_ARGS='{"host": "192.168.1.40"}'. A new model is one class with
+(JSON), for example DCQL_PLUG=example DCQL_PLUG_ARGS='{"host": "192.0.2.40"}'. A new model is one class with
 off() and on(); nothing else in the loop changes.
 
 On a console with a GDEMU, a power cycle starts openMenu, not the loader: the loop closes only if the card boots the

@@ -6,9 +6,9 @@ UDP 52060. This tool pushes a program to it, runs it, serves the program's files
 report back, and brings the console back to the loader without a hand on it. Protocol: include/dcql_loop.h (version 2;
 a loader of another version is refused, and it refuses this tool's datagrams the same way).
 
-  dcql_loop.py --udp 192.168.1.50 status                  the loader's beacon: state, transport, pending report
-  dcql_loop.py --udp 192.168.1.50 push prog.elf           send and verify only
-  dcql_loop.py --udp 192.168.1.50 run prog.elf --args "x" --deadline 300 --files packs/ --out results/
+  dcql_loop.py --udp 192.0.2.50 status                  the loader's beacon: state, transport, pending report
+  dcql_loop.py --udp 192.0.2.50 push prog.elf           send and verify only
+  dcql_loop.py --udp 192.0.2.50 run prog.elf --args "x" --deadline 300 --files packs/ --out results/
                  (serves /pc/... from packs/, writes serial-<run>.txt, still-<run>-NNN.png and report-<run>.txt)
   dcql_loop.py --udp ... run prog.elf --reset-after 20    RESET the program after 20 s (then the restart ladder)
   dcql_loop.py --udp ... reset                            RESET whatever runs now

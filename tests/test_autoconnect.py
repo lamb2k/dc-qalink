@@ -91,7 +91,7 @@ def main():
         d1 = os.path.join(root, 'one')
         b = new_bridge(d1)
         port = b.t.port
-        s1 = Beacon('127.0.0.2', port, '192.168.1.235', A)
+        s1 = Beacon('127.0.0.2', port, '192.0.2.235', A)
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.2' and b.link_state == 'up', 3)
         record('1 first loader: linked by itself, no /v0/link', ok and time.time() - s1.first < 2.5,
                seconds=round(time.time() - s1.first, 2), link=b.link_state, chosen=b.t.chosen_ip)
@@ -101,7 +101,7 @@ def main():
         s1.stop()
         lost = wait_for(lambda: b.link_state == 'lost', 12)
         record('2 the loader goes silent: link lost', lost, link=b.link_state)
-        s2 = Beacon('127.0.0.3', port, '192.168.1.240', A, boot=2)
+        s2 = Beacon('127.0.0.3', port, '192.0.2.240', A, boot=2)
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.3' and b.link_state == 'up', 3)
         record('2 back on a new address: relinked within 2 s, no call', ok and time.time() - s2.first < 2.5,
                seconds=round(time.time() - s2.first, 2), chosen=b.t.chosen_ip, console_ip=(b.loop.hello or {}).get('console_ip'))
@@ -109,9 +109,9 @@ def main():
         b.close()
 
         b = new_bridge(d1)
-        other = Beacon('127.0.0.5', b.t.port, '192.168.1.50', B)
+        other = Beacon('127.0.0.5', b.t.port, '192.0.2.50', B)
         time.sleep(0.3)
-        known = Beacon('127.0.0.4', b.t.port, '192.168.1.241', A, boot=3)
+        known = Beacon('127.0.0.4', b.t.port, '192.0.2.241', A, boot=3)
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.4', 3)
         time.sleep(1.0)
         record('3 two loaders, one remembered: the remembered one is linked', ok and b.t.chosen_ip == '127.0.0.4',
@@ -119,7 +119,7 @@ def main():
         other.stop(); known.stop(); b.close()
 
         b = new_bridge(os.path.join(root, 'off'), auto=False)
-        s = Beacon('127.0.0.6', b.t.port, '192.168.1.60', A)
+        s = Beacon('127.0.0.6', b.t.port, '192.0.2.60', A)
         time.sleep(3.0)
         record('control: autoconnect off: heard, not linked', b.t.chosen_ip is None and len(b.t.discovery()) == 1,
                chosen=b.t.chosen_ip)
@@ -129,8 +129,8 @@ def main():
         s.stop(); b.close()
 
         b = new_bridge(os.path.join(root, 'two'))
-        x1 = Beacon('127.0.0.7', b.t.port, '192.168.1.70', A)
-        x2 = Beacon('127.0.0.8', b.t.port, '192.168.1.80', B)
+        x1 = Beacon('127.0.0.7', b.t.port, '192.0.2.70', A)
+        x2 = Beacon('127.0.0.8', b.t.port, '192.0.2.80', B)
         time.sleep(0.2)
         first = b.t.chosen_ip
         time.sleep(2.5)
@@ -148,19 +148,19 @@ def main():
         M, M2, C = '00:d0:f1:02:a3:b4', '00:d0:f1:99:88:77', '33' * 8
         dm = os.path.join(root, 'mac')
         b = new_bridge(dm)
-        s = Beacon('127.0.0.10', b.t.port, '192.168.1.235', A, mac=M, slot=158)
+        s = Beacon('127.0.0.10', b.t.port, '192.0.2.235', A, mac=M, slot=158)
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.10', 3)
         rem = json.load(open(os.path.join(dm, 'consoles.json')))
         record('4 a loader with a MAC: linked and remembered by its MAC', ok and list(rem) == ['mac:' + M]
                and rem['mac:' + M]['gdemu_slot'] == 158, remembered=rem)
         s.stop(); b.close()
         b = new_bridge(dm)
-        s = Beacon('127.0.0.11', b.t.port, '192.168.1.236', C, boot=2, mac=M, slot=158)
+        s = Beacon('127.0.0.11', b.t.port, '192.0.2.236', C, boot=2, mac=M, slot=158)
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.11', 3)
         record('4 same MAC, a new loader build and a new address: linked by itself', ok, chosen=b.t.chosen_ip)
         s.stop(); b.close()
         b = new_bridge(dm)
-        s = Beacon('127.0.0.12', b.t.port, '192.168.1.237', A, mac=M2, slot=158)
+        s = Beacon('127.0.0.12', b.t.port, '192.0.2.237', A, mac=M2, slot=158)
         time.sleep(2.5)
         record('control: another console with the remembered loader build but another MAC: not linked (waits)',
                b.t.chosen_ip is None and len(b.t.discovery()) == 1, chosen=b.t.chosen_ip)
@@ -169,10 +169,10 @@ def main():
         # a console remembered by its loader before the loader sent the MAC: found by the loader key, then kept by MAC
         dmig = os.path.join(root, 'migrate')
         os.makedirs(dmig)
-        json.dump({'loader:%s:sim loader (autoconnect test)' % A: {'last_ip': '192.168.1.235'}},
+        json.dump({'loader:%s:sim loader (autoconnect test)' % A: {'last_ip': '192.0.2.235'}},
                   open(os.path.join(dmig, 'consoles.json'), 'w'))
         b = new_bridge(dmig)
-        s = Beacon('127.0.0.13', b.t.port, '192.168.1.235', A, mac=M, slot=158,
+        s = Beacon('127.0.0.13', b.t.port, '192.0.2.235', A, mac=M, slot=158,
                    stub=(6, 0x48000, 0x104, 1), gdemu_ver=(5 << 16) | (14 << 8))
         ok = wait_for(lambda: b.t.chosen_ip == '127.0.0.13' and b.loop.hello is not None, 3)
         rem = json.load(open(os.path.join(dmig, 'consoles.json')))
@@ -188,7 +188,7 @@ def main():
                and 'mac %s slot 158 gdemu 5.14.0' % M in text and 'stub step 6 jump (white)' in text,
                device={k: dev[k] for k in ('mac', 'gdemu_slot', 'gdemu_version', 'stub_text')}, describe=text[-120:])
         s.stop(); b.close()
-        h128 = cl.parse_hello(cl.unframe(hello('192.168.1.2', A), any_version=True)[4])
+        h128 = cl.parse_hello(cl.unframe(hello('192.0.2.2', A), any_version=True)[4])
         record('control: a 128-byte HELLO (loader before 456ac57): no MAC, keyed by its loader',
                h128['mac'] is None and h128['stub'] is None and h128['gdemu_slot'] is None
                and BridgeUdp.ident(h128).startswith('loader:'),
@@ -200,7 +200,7 @@ def main():
             b = Bridge(os.path.join(root, 'lan-%s' % only_local), ('127.0.0.1', 0), 'auto', 'flycast',
                        only_local=only_local)
             b.t.is_local = lambda ip: ip != '127.0.0.9'
-            lan = Beacon('127.0.0.9', b.t.port, '192.168.1.235', A)
+            lan = Beacon('127.0.0.9', b.t.port, '192.0.2.235', A)
             time.sleep(2.0)
             if only_local:
                 try:

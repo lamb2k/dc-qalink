@@ -496,9 +496,11 @@ class Bridge:
              'ident': self.t.ident(h) if h else None, **self.t.card(h or {}),
              'program': {'run': '%08x' % self.client_run, 'linked': self.client is not None,
                          'hello_run': '%08x' % self.client_hello_run} if self.client_run else None}
-        if self.active:
-            d['state'] = 'running' if self.active.state == 'running' else self.active.state
-            d['last_run'] = {'id': self.active.id, 'state': self.active.state}
+        a = self.active        # read once: the runner thread sets it to None when the run ends
+        if a is not None:
+            st = a.state
+            d['state'] = 'running' if st == 'running' else st
+            d['last_run'] = {'id': a.id, 'state': st}
         elif self.run_order:
             r = self.runs[self.run_order[-1]]
             d['last_run'] = {'id': r.id, 'state': r.state, 'report_bytes': len(r.report or b'')}
@@ -507,11 +509,12 @@ class Bridge:
     def status(self):
         now = time.time()
         rate = sum(b for t, b in self.rx_hist if now - t < 2.0) / 2.0
+        a, cur = self.active, self.current      # read once each: other threads clear them (run end, link loss)
         return {'contract': CONTRACT, 'bridge': BRIDGE_VERSION, 'link': self.link_state, 'device': self.device(),
-                'session': self.current.id if self.current else None, 'rate_bps': round(rate, 1),
+                'session': cur.id if cur else None, 'rate_bps': round(rate, 1),
                 'mode': 'summary' if (self.loop.hello or {}).get('net') == 'modem' else 'full', 'paused': self.paused,
-                'n': self.current.max_n if self.current else 0, 'level': self.level, 'tier': self.tier(),
-                'queue': [r.id for r in list(self.queue.queue)], 'active_run': self.active.id if self.active else None,
+                'n': cur.max_n if cur else 0, 'level': self.level, 'tier': self.tier(),
+                'queue': [r.id for r in list(self.queue.queue)], 'active_run': a.id if a is not None else None,
                 'autoconnect': self.t.autoconnect, 'remembered': len(self.t.remembered),
                 'only_local': self.t.only_local, 'remote_refused': self.t.remote_refused, 'build': self.build_id,
                 'disc': self.disc.manifest()['mode'] if self.disc else None}

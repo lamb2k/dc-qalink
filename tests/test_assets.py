@@ -234,6 +234,38 @@ def t_bridge(out):
         b.close()
 
 
+def t_status_race(out):
+    """status() and device() while the run ends: the runner sets `active` to None between the reads (ql-int's MCP
+    host log at shutdown: 'NoneType' object has no attribute 'id'). The trap clears `active` on its first read."""
+    from bridge.core import Bridge
+    d = tempfile.mkdtemp(prefix='ql-assets-st-', dir=out)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    b = Bridge(d, ('127.0.0.1', port), console='127.0.0.1:%d' % (port + 1), device_kind='mock', log=None)
+
+    class Ending:
+        id = 'r1'
+
+        @property
+        def state(self):
+            b.active = None                  # the run finishes on another thread right here
+            return 'running'
+    errs = []
+    try:
+        for f in (b.status, b.device):
+            b.active = Ending()
+            try:
+                f()
+            except Exception as e:           # noqa: BLE001 - the check is that nothing escapes
+                errs.append('%s: %r' % (f.__name__, e))
+    finally:
+        b.close()
+    return check('bridge: status and device while the active run ends (no read of a cleared run)', not errs,
+                 '; '.join(errs) or 'both answered')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.path.join(tempfile.gettempdir(), 'dcql-test-assets'))
@@ -264,7 +296,7 @@ def main():
         return 0 if len(failed) == 4 else 1
     for f in (t_twiddle, t_mip_layout, t_formats, t_resize_lost, t_budget, t_strips, t_diff):
         f()
-    for f in (t_dqa, t_models, t_render_flat, t_render_cull, t_render_model, t_bridge):
+    for f in (t_dqa, t_models, t_render_flat, t_render_cull, t_render_model, t_bridge, t_status_race):
         f(a.out)
     bad = [n for n, ok, _ in RESULTS if not ok]
     print('%d/%d passed in %.1f s%s' % (len(RESULTS) - len(bad), len(RESULTS), time.time() - t0,
