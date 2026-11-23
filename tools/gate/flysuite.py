@@ -371,9 +371,15 @@ def check_loop(r, rd, res):
         elif k == 'report_by':
             out.append(('result came by %s' % want, want in str(rep.get('by', '')), rep.get('by')))
         elif k == 'crash_registers':
-            e = rep.get('end') or end or {}
-            out.append(('crash registers in the END', bool(e.get('crash_pc')) and bool(e.get('crash_evt')),
-                        'evt %s pc %s' % (e.get('crash_evt'), e.get('crash_pc'))))
+            # the END's registers sit in the report's "end" (a run with nothing kept) or in the run's end.end, with the
+            # PC tool's decoded end.crash beside them (a run whose record was kept: ql-core6's gate, row c6-03)
+            cands = [rep.get('end'), end.get('end') if isinstance(end, dict) else None, end]
+            e = next((c for c in cands if isinstance(c, dict) and c.get('crash_pc')), {})
+            cr = end.get('crash') if isinstance(end, dict) else None
+            cr = cr if isinstance(cr, dict) else {}
+            ok = (bool(e.get('crash_pc')) and bool(e.get('crash_evt'))) or (bool(cr.get('pc')) and bool(cr.get('event')))
+            out.append(('crash registers in the END', ok, 'evt %s pc %s' % (e.get('crash_evt') or cr.get('event'),
+                                                                            e.get('crash_pc') or cr.get('pc'))))
         elif k == 'report_min_bytes':
             out.append(('report at least %d bytes' % want, (rep.get('bytes') or 0) >= want, rep.get('bytes')))
         elif k == 'transfer_refused':
@@ -438,9 +444,9 @@ def main_run(a):
         time.sleep(a.boot_wait)
         rowres = {}
 
-        def loop_rows(phase):
+        def loop_rows(phase, only=None):
             for r in rows:
-                if r.get('phase', 'loop') != phase:
+                if r.get('phase', 'loop') != phase or (only and r['name'] != only):
                     continue
                 if relay.tripped:
                     break
@@ -629,20 +635,23 @@ def main_run(a):
                     bridge.kill()
                 bridge = None
                 time.sleep(1.0)
-            # a fresh boot for the tail (the first ql-core4 gates: after the bridge phase the loader beaconed but did
-            # not answer LOAD): each tail row starts on a loader that only this relay has spoken to
-            stop_flycast(fly)
-            fly = None
-            relay = Relay(a.port, a.ctl, loc, say)
-            relay.start()
-            fly = launch_flycast(a.flycast, a.config, a.disc, out, 'dcql-gate-tail-%d' % os.getpid())
-            say('tail: flycast restarted, pid %d' % fly[3].pid)
-            time.sleep(a.boot_wait)
-            loop_rows('tail')
-            relay.stop()
-            if relay.tripped:
-                result['guard']['tripped'] = relay.tripped
-                return 9
+            # a fresh boot for each tail row (the first ql-core4 gates: after the bridge phase the loader beaconed but
+            # did not answer LOAD; ql-core6's first gate: a tail row's hang leaves Flycast, which has no watchdog,
+            # hung for the next): each starts on a loader that only its own relay has spoken to
+            for tr in [r['name'] for r in rows if r.get('phase') == 'tail']:
+                if fly:
+                    stop_flycast(fly)
+                fly = None
+                relay = Relay(a.port, a.ctl, loc, say)
+                relay.start()
+                fly = launch_flycast(a.flycast, a.config, a.disc, out, 'dcql-gate-tail-%d' % os.getpid())
+                say('tail: flycast restarted for %s, pid %d' % (tr, fly[3].pid))
+                time.sleep(a.boot_wait)
+                loop_rows('tail', tr)
+                relay.stop()
+                if relay.tripped:
+                    result['guard']['tripped'] = relay.tripped
+                    return 9
         # phase "disc": a lane's own disc (its program alone, no loader), booted on a fresh Flycast; its serial line
         # is the evidence. Nothing is sent to it and no relay runs: the guard is heard again first.
         drows = [r for r in rows if r.get('phase') == 'disc']
