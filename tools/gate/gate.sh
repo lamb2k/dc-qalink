@@ -184,14 +184,23 @@ for f in testprog.elf liveprog.elf loader.elf LOADER.BIN stub.bin liveprog.map; 
 
 # ------------------------------------------------------------------------------------------------- 3. host tests
 H=$W/host
+# Each host test runs in a network namespace of its own when it can (root: unshare -n, loopback up), so fixed test
+# ports (test_loop's 53100 and up) never meet another lane's tests on the same machine. GATE_NETNS=0 turns it off.
+NETNS=()
+if [ "${GATE_NETNS:-1}" != 0 ] && unshare -n sh -c 'ip link set lo up' 2> /dev/null; then
+  NETNS=(unshare -n sh -c 'ip link set lo up && exec "$@"' netns)
+  row "host test isolation" PASS "each host test in its own network namespace (no port shared with other lanes)"
+else
+  row "host test isolation" PASS "shared network (no unshare): a port clash runs the test once more"
+fi
 test_row() {   # name, expect (0 or fail), command...
   local name=$1 expect=$2 log=$H/$1.log rc; shift 2
-  (cd "$S" && timeout 900 "$@") > "$log" 2>&1; rc=$?
+  (cd "$S" && timeout 900 "${NETNS[@]}" "$@") > "$log" 2>&1; rc=$?
   local again=""
   if [ $rc -ne 0 ] && grep -q 'Address already in use' "$log"; then   # a port another program held: once more
     mv "$log" "$log.clash"
-    (cd "$S" && timeout 900 "$@") > "$log" 2>&1; rc=$?
-    again=" (run again after a port clash: $1.log.clash)"
+    (cd "$S" && timeout 900 "${NETNS[@]}" "$@") > "$log" 2>&1; rc=$?
+    again=" (run again after a port clash: $name.log.clash)"
   fi
   local tail; tail=$(grep -E '[0-9]+ of [0-9]+|passed|^OK|^FAILED|Ran [0-9]+|PASS|FAIL' "$log" | tail -2 | tr '\n' ' ' | cut -c1-200)
   if { [ "$expect" = 0 ] && [ $rc -eq 0 ]; } || { [ "$expect" = fail ] && [ $rc -ne 0 ] && [ $rc -ne 124 ]; }; then
