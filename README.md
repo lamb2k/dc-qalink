@@ -19,8 +19,9 @@ broadband adapter.
 
 [DC QA Link Cloud](https://github.com/lamb2k/dc-qalink-cloud) is the desktop app for dc-qalink: live timings against
 your budget, screen grabs, push and run, commands and a virtual pad, recorded sessions, and an MCP server so agents
-(Claude Code, Codex) can drive the console. Its 0.2 build on this release follows; until then the
-[0.1.0 preview](https://github.com/lamb2k/dc-qalink-cloud/releases/tag/v0.1.0-preview) (Windows x64) is the download.
+(Claude Code, Codex) can drive the console. Download: the
+[0.2.1 preview](https://github.com/lamb2k/dc-qalink-cloud/releases/tag/v0.2.1-preview) (Windows x64), built on
+this release; its first-run setup asks how your Dreamcast connects and where you keep your builds.
 
 ## New in 0.2.0: the control loop and the broadband adapter
 
