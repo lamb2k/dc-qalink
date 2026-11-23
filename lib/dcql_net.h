@@ -34,13 +34,17 @@ typedef struct {
     int dhcp_first;             /* adapter with ip set: 1 ask DHCP for that address first (as KOS's net_init(ip) does
                                    for dcload-ip), 2 ask DHCP for any address first; the static address only if no DHCP
                                    server answers. 0: the static address alone */
-    unsigned char *rx_mem, *tx_mem;   /* ring memory (static); NULL = the built-in 4 KiB rings */
+    unsigned char *rx_mem, *tx_mem;   /* ring memory (static); NULL = the built-in 4 KiB rings, allocated once by the
+                                         first dcql_net_start() (never freed; start fails with err -44 without memory) */
     unsigned rx_size, tx_size;
     unsigned ppp_wait_ms;       /* modem: bound on PPP negotiation (0 = unbounded, as dc-qalink 0.1) */
     void (*log)(const char *line);
 } dcql_net_config_t;
 
 void dcql_net_config(const dcql_net_config_t *c);   /* before dcql_net_start(); copies the strings */
+/* the most bytes the dial thread (on the adapter: also the receive thread) and the adapter's send thread have used of
+   their static stacks so far (a pattern check), with the stacks' sizes; tx 0 before the adapter's threads start */
+void dcql_net_stack_use(unsigned *dial, unsigned *dial_size, unsigned *tx, unsigned *tx_size);
 int dcql_net_bba_present(void);                     /* an adapter answers its detect (no side effects) */
 int dcql_net_start(void);         /* bring the link up in the background (or hang up + redial); 0 = started/already */
 void dcql_net_stop(void);         /* modem: hang up in the background. adapter: close the socket */
