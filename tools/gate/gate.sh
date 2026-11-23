@@ -127,9 +127,12 @@ else
     finish FAIL
   fi
   row merge PASS "$(git diff --cached --shortstat | sed 's/^ //')"
-  own=$(git diff --name-only "$BASESHA"..."$HEADSHA" | grep -E '^(tools/gate/|docs/RELEASE_0\.2\.md$)' | tr '\n' ' ')
-  [ -z "$own" ] && row "gate files untouched" PASS "tools/gate/ and docs/RELEASE_0.2.md not changed by the head" \
-                || row "gate files untouched" FAIL "the head changes the gate's own files: $own"
+  # the gate's own files (gate.sh, the suite, sizes, flysuite: tools/gate/) must come out of the merge as the base has
+  # them. A gate change a lane was ruled to make lands on the integration branch first (by ql-int), so the merge then
+  # changes nothing there. docs/RELEASE_0.2.md is a release document, not a gate file (ruling 2026-11-23).
+  own=$(git diff --cached --name-only "$BASESHA" -- tools/gate/ | tr '\n' ' ')
+  [ -z "$own" ] && row "gate files untouched" PASS "the merge leaves tools/gate/ as $BASE has it" \
+                || row "gate files untouched" FAIL "the merge changes the gate's own files: $own"
 fi
 # the owner's direction (2026-11-22, "we can get rid of dialo"): no mascot in the tree, by text or by path
 hits=$( { git grep -n -i -w -I -E 'mascots?|dialo' -- . ':(exclude)tools/gate/*'
@@ -217,7 +220,12 @@ test_row() {   # name, expect (0 or fail), command...
 pyfiles=$(cd "$S" && git ls-files '*.py' | tr '\n' ' ')
 # shellcheck disable=SC2086
 test_row python-syntax 0 python3 -c 'import ast,sys; [ast.parse(open(f,encoding="utf-8").read(),f) for f in sys.argv[1:]]; print(len(sys.argv)-1,"files parse")' $pyfiles
-test_row test_loop 0 python3 tests/test_loop.py --quick --host "$W/hostb/cl_host" --out "$H/loop"
+# the tag gate runs test_loop whole (audit 2026-11-23, item 6): with --quick it left out the 60 KB modem-rate
+# transfer and its efficiency assertion. That row must be in the log, or this is a FAIL row of its own.
+test_row test_loop 0 python3 tests/test_loop.py --host "$W/hostb/cl_host" --out "$H/loop"
+grep -qE '^modem rate 1390 B/s: 60 KB raw image +PASS' "$H/test_loop.log" \
+  && row "control test_loop modem-rate row" PASS "the 60 KB modem-rate transfer ran and passed (no --quick)" \
+  || row "control test_loop modem-rate row" FAIL "the modem-rate row is missing or failed (host/test_loop.log)"
 test_row test_bridge 0 python3 tests/test_bridge.py --out "$H/bridge"
 test_row test_autoconnect 0 python3 tests/test_autoconnect.py --out "$H/autoconnect"
 test_row test_echo 0 python3 tests/test_echo.py
@@ -231,6 +239,18 @@ else
   row "test control-test_echo-old" FAIL "be1edc1e4's pc/dcql_loop.py not found"
 fi
 test_row test_link 0 sh -c 'cd tests && python3 -m unittest -v test_link'
+# host_lib (ruling 2026-11-23, a standing row): the console library's host checks (gcc, ASan+UBSan+leaks), whose
+# control (copies of the 1990fb9 code) must fail inside them. Required once the base has it; before that, not in the tree.
+if [ -f "$S/lib/test/run.sh" ]; then
+  test_row host_lib 0 sh lib/test/run.sh "$H/host_lib"
+  grep -qE 'host_lib: PASS \(head passes, control fails as it must\)' "$H/host_lib.log" \
+    && row "control host_lib" PASS "the head passes and its 1990fb9 control fails as it must" \
+    || row "control host_lib" FAIL "host/host_lib.log lacks the head-passes, control-fails line"
+elif git -C "$S" cat-file -e "$BASESHA:lib/test/run.sh" 2>/dev/null; then
+  row "test host_lib" FAIL "lib/test/run.sh is in $BASE but not in the merge (a required test)"
+else
+  row "test host_lib" N/A "lib/test/run.sh not in this tree yet (it lands with ql-fix-dc)"
+fi
 mkdir -p "$G/host-mcp"
 log=$G/host-mcp/test_mcp-host.log
 (cd "$G/tree" && timeout 600 "$GATE_WINPY" -u tests/test_mcp.py --out "$(winp "$G/host-mcp")") > "$log" 2>&1; rc=$?
@@ -249,9 +269,36 @@ for p in "${PLANS[@]}"; do
 for h in json.load(open(sys.argv[1])).get("host", []):
     print("\t".join([h["name"], h["cmd"], str(h.get("expect", 0)), h.get("grep", "")]))' "$p")
 done
+# required controls (audit 2026-11-23, item 6): each its own row; a control the test no longer offers is a FAIL row,
+# never silently left out. test_assets --controls: its four broken pieces (twiddle, strips, mip layout, 565) must each
+# fail. test_safety: the PC boundaries (lane ql-fix-pc), and --controls on 1990fb9's pc/ (the tree the audit read):
+# every one of its five items must fail there.
+if grep -q -- "'--controls'" "$S/tests/test_assets.py" 2>/dev/null; then
+  test_row control-test_assets 0 python3 tests/test_assets.py --controls --out "$H/assets-controls"
+  grep -qE '^controls: 4 of 4 failed as they must' "$H/control-test_assets.log" \
+    && row "control test_assets four broken pieces" PASS "4 of 4 failed as they must" \
+    || row "control test_assets four broken pieces" FAIL "test_assets --controls did not show 4 of 4 failing"
+else
+  row "control test_assets four broken pieces" FAIL "tests/test_assets.py has no --controls (a required control)"
+fi
+if [ -f "$S/tests/test_safety.py" ]; then
+  test_row test_safety 0 python3 tests/test_safety.py --out "$H/safety"
+  if rm -rf "$W/old-1990fb9" && mkdir -p "$W/old-1990fb9" && git -C "$S" archive 1990fb9 pc tools | tar -x -C "$W/old-1990fb9"; then
+    test_row control-test_safety-1990fb9 0 python3 tests/test_safety.py --pc "$W/old-1990fb9/pc" --controls --out "$H/safety-old"
+    for it in A1 A2 A3 A4 A5; do
+      grep -qE "^control $it .*must fail\) PASS" "$H/control-test_safety-1990fb9.log" \
+        && row "control 1990fb9 fails $it" PASS "the audited PC code fails item $it as it must" \
+        || row "control 1990fb9 fails $it" FAIL "item $it did not fail on 1990fb9's pc/ (host/control-test_safety-1990fb9.log)"
+    done
+  else
+    row "control 1990fb9 fails A1-A5" FAIL "1990fb9's pc/ could not be taken from git"
+  fi
+else
+  row "test test_safety" FAIL "tests/test_safety.py missing (a required test)"
+fi
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done
