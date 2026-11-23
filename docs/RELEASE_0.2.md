@@ -48,11 +48,17 @@ gate, it is never resolved there), then:
    300 KB, no build outputs, no game data, no dot-folders but `.github`);
 4. runs one Flycast suite (`tools/gate/flysuite.py`, `suite.json`): it first listens and refuses to start if a loader
    at any other address is heard, then status, push and run, a long report, three screen grabs, a crash, RESET, the
-   restart way back, two controls (a corrupted image refused, a reboot with no hand-in), the bridge linking Flycast,
+   restart way back, two controls (a corrupted image refused, a reboot with no ending), the bridge linking Flycast,
    live data on with a planted 2 ms delay that must read as 2 ms, and MCP 9 of 9; plus the lane's own controls and two
    numbers its hand-back cites, re-measured;
 5. on PASS commits the merge and pushes `v0.2`; on FAIL names the step and the file.
 Machine settings (paths, addresses, ports) come from a file outside the repository (`GATE_ENV`).
+
+Rulings on the gate's rows:
+- **2026-11-22, the plain-reboot control.** Since the full restart became the standard way back, a program that
+  reboots with no ending comes back with its run named **LOST** (the loader's start-of-run record survives the
+  restart), and the PC tool exits 5. The row expects exactly that: exit 5, state LOST. Its earlier form (exit 4,
+  "back without this run") stays as the `ret nosave` row: no link, nothing kept, exit 4.
 
 ## Limits (plan section 3), measured by the gate
 
