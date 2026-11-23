@@ -474,15 +474,19 @@ class FileService:
     """/pc/<path> for the running program: read-only, below one root folder, no '..'. Answers FOPEN with FINFO and
     FREAD with FDATA blocks (the client re-asks for what it lost)."""
 
-    def __init__(self, root, log):
-        self.root = os.path.abspath(root) if root else None
+    def __init__(self, root, log, anchor=None):
+        self.root = os.path.abspath(root) if root else (anchor.root if anchor is not None else None)
         self.log = log
         # round 3: the folder is anchored once for the service's lifetime (its identity, and a directory descriptor
-        # where the system has one); every open is checked against that anchor on the opened descriptor
-        try:
-            self.anchor = qlsafe.Anchor(self.root) if self.root else None
-        except (OSError, qlsafe.Refused):
-            self.anchor = None
+        # where the system has one); every open is checked against that anchor on the opened descriptor. Round 4: the
+        # bridge hands a run's subfolder anchored from the root's descriptor (`anchor`)
+        if anchor is not None:
+            self.anchor = anchor
+        else:
+            try:
+                self.anchor = qlsafe.Anchor(self.root) if self.root else None
+            except (OSError, qlsafe.Refused):
+                self.anchor = None
         self.handles = {}
         self.next = 1
         self.closed = False
@@ -969,6 +973,8 @@ class Loop:
                         break
                 elif last and time.time() - last > 2.5:
                     break
+                elif m and m[0] != REPORT and self.on_other:   # round 4: e.g. a run's END arriving during the fetch
+                    self.on_other(m)
                 if m and m[0] == ERR and m[1] == run:
                     raise RuntimeError('console: %s' % ERRORS.get(m[2], m[2]))
             need = [o for o in need if o not in blocks]
@@ -1272,7 +1278,10 @@ def session_main(a, loop, stamp):
         stamp('run: %s' % r)
         result['run'] = r
         if r in ('exec', 'no answer') and not a.no_collect:
-            rc = collect(a, loop, stamp, session, result, h, ending)
+            try:
+                rc = collect(a, loop, stamp, session, result, h, ending)
+            finally:
+                loop.on_other = None
         elif r not in ('exec', 'no answer'):
             rc = 3
     result['link'] = loop.stats
@@ -1326,6 +1335,8 @@ def ending_state(er):
         return 'none'
     if er['crc_ok']:
         return 'whole crc ok'
+    if er['whole']:   # round 4: the whole report arrived and its CRC is known to be wrong
+        return 'whole crc bad'
     if er['complete']:
         return 'complete'
     return 'tail incomplete' if er['end']['sent_len'] else 'head only'
@@ -1333,7 +1344,8 @@ def ending_state(er):
 
 def end_rank(er):
     """The END as evidence: 2 a whole report whose CRC agrees, 1 a complete declared tail, 0 less."""
-    return 0 if not er else 2 if er['crc_ok'] else 1 if er['complete'] else 0
+    # round 4: a whole report whose CRC is known to fail is never evidence; a truncated tail held whole is (rank 1)
+    return 0 if not er else 2 if er['crc_ok'] else 0 if er['whole'] else 1 if er['complete'] else 0
 
 
 def collect(a, loop, stamp, session, result, h, ending=None):
@@ -1405,7 +1417,8 @@ def collect(a, loop, stamp, session, result, h, ending=None):
     if hb is None and rung is None and a.reset_after is None:
         hb = loop.wait(back, a.wait, every=None)
     result['way_back'] = way_back_of(hb)   # from the loader's own record, never from the rung that was tried
-    loop.on_other = None
+    # round 4: from here only the run's END is taken (through the loader fetch too); the program's other traffic is over
+    loop.on_other = lambda m: end_datagram(m[2], m[4]) if m[0] == END and m[1] == session else None
     if serial:
         serial.close()
     result['program_side'] = {'files': files.summary(), 'lines': {k: v for k, v in lines.items() if k != 'next'},
@@ -1434,7 +1447,8 @@ def collect(a, loop, stamp, session, result, h, ending=None):
             if er.get('crash'):
                 stamp('crash: event %(event)s pc %(pc)s pr %(pr)s sp %(sp)s' % er['crash'])
             result['report'] = er
-            return 0 if er['state'] in ('DONE', 'RESET') else 5
+            loop.on_other = None
+            return 0 if er['state'] in ('DONE', 'RESET') and end_rank(er) > 0 else 5
         stamp('loader back after %.1f s without this run (power cycle?): %s' % (time.time() - t0, describe(hb)))
         result['report'] = None
         result['lost'] = RUN_STATES.get(hb['report_state'], hb['report_state']) if hb['report_run'] == session else None
@@ -1444,16 +1458,22 @@ def collect(a, loop, stamp, session, result, h, ending=None):
         rep = loop.fetch_report(hb, a.out)
     except RuntimeError as e:
         rep = {'error': str(e), 'crc_ok': False}
+    finally:
+        loop.on_other = None
+    er = end_result()   # round 4: ranked after the fetch, on everything that arrived (an END during it included)
+    if er:
+        result['end'] = er
     result['evidence'] = {'end': ending_state(er), 'loader_report': 'crc ok' if rep.get('crc_ok') else
                           rep.get('error') and 'failed: %s' % rep['error'] or 'bad crc'}
-    if not rep.get('crc_ok') and er and er['complete']:
+    if not rep.get('crc_ok') and end_rank(er) > 0:
         # audit round 2: the loader's saved report failed (unreadable or bad CRC); the run's END is the best evidence
         stamp('the loader\'s report %s; the run\'s result from its END (%s exit %d)' % (
             result['evidence']['loader_report'], er['state'], er['exit']))
         result['report'] = er
         # round 3, blocker 4: a complete declared tail is a valid result even with no whole-report CRC; the evidence
         # says which it is ('whole crc ok' or 'complete')
-        return 0 if er['state'] in ('DONE', 'RESET') and er['complete'] else 5
+        return 0 if er['state'] in ('DONE', 'RESET') else 5   # (end_rank > 0: whole crc ok, or a truncated tail
+                                                                   # held whole; never a whole report that failed)
     if 'error' in rep:
         stamp('report: %s' % rep['error'])
         result['report'] = None
