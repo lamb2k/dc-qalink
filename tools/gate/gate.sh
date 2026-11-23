@@ -335,9 +335,14 @@ safety_rows test_safety3 ac45161 \
    C4.cli_end_before_exec C4.bridge_late_end C4.late_report_attached C5.bridge_crc C5.cli_crc C6.runs_bound
    C6.resetack C6.way_back_inferred C6.docs" \
   "C1.no_fd_path C7.harness"
+# the round-4 confirmation audit's items (ql-fix-pc round 4): controls on df476a2, the head that audit read
+safety_rows test_safety4 df476a2 \
+  "D1.grab_exhausted D1.failed_bounded D2.cached_owner D2.link_change D2.hello_during_run D2.session_listing
+   D3.mcp_field_memory D3.session_stream D4.cli_end_during_fetch D4.whole_bad_crc D5.serial_window D5.docs" \
+  "D6.harness"
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3|test_safety4) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done
