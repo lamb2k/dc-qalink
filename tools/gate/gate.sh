@@ -137,6 +137,8 @@ hits=$( { git grep -n -i -w -I -E 'mascots?|dialo' -- . ':(exclude)tools/gate/*'
 git log -1 --format='%H %s' "$HEADSHA" > "$G/head.txt"
 mkdir -p "$G/tree"
 for d in pc tests tools relay; do [ -d "$S/$d" ] && cp -r "$S/$d" "$G/tree/"; done
+# the examples' Python tools too (a lane's disc rows run them on Windows, e.g. example/menu/shots.py)
+(cd "$S" && find example -name '*.py' -type f -exec cp --parents {} "$G/tree/" \; 2>/dev/null)
 find "$G/tree" -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null
 
 # ----------------------------------------------------------------------------------------------------- 2. builds
