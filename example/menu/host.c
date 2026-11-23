@@ -52,11 +52,20 @@ int main(int argc, char **argv) {
             if (DEMO_SHOTS[i].at == k && dcql_menu_is_open()) {
                 dcql_menu_draw(&t);
                 save(out, DEMO_SHOTS[i].name);
-                if (!strcmp(DEMO_SHOTS[i].name, "example")) {   /* the 480i option's still, for the owner's look check */
-                    dcql_menu_interlace(1);
-                    dcql_menu_draw(&t);
+                if (!strcmp(DEMO_SHOTS[i].name, "example")) {   /* 480i: AUTO follows the video mode; 0 / 1 force */
+                    static uint16_t off[640 * 480], on[640 * 480];
+                    memcpy(off, fb, sizeof fb);              /* default (AUTO) on a progressive mode */
+                    dcql_menu_interlace(1); dcql_menu_draw(&t); memcpy(on, fb, sizeof fb);
                     save(out, "example-480i");
-                    dcql_menu_interlace(0);
+                    check(memcmp(on, off, sizeof fb) != 0, "480i: forced on draws differently from progressive AUTO");
+                    dcql_menu_interlace(DCQL_MENU_AUTO);
+                    dcql_menu_host_interlaced = 1; dcql_menu_draw(&t);
+                    check(memcmp(fb, on, sizeof fb) == 0, "480i: AUTO on an interlaced mode = forced on");
+                    dcql_menu_host_interlaced = 0; dcql_menu_draw(&t);
+                    check(memcmp(fb, off, sizeof fb) == 0, "480i: AUTO on a progressive mode = off (the approved look)");
+                    dcql_menu_interlace(0); dcql_menu_host_interlaced = 1; dcql_menu_draw(&t);
+                    check(memcmp(fb, off, sizeof fb) == 0, "480i: forced off on an interlaced mode = off");
+                    dcql_menu_interlace(DCQL_MENU_AUTO); dcql_menu_host_interlaced = 0;
                 }
                 printf("shot %s snapshot \"%s\"\n", DEMO_SHOTS[i].name, dcql_menu_snapshot_text());
             }

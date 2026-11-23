@@ -37,7 +37,8 @@ void dcql_bios_reboot(void) __attribute__((noreturn));
 
 const uint32_t dcql_menu_colours[5] = {0x000000, 0x1848a8, 0xf0f0f0, 0x7890a8, 0xf0f0f0};
 enum { BODY_Y = 80, BODY_END = 416, SEL_X = 32, SEL_W = 576, VAL_X = 592, QR_MAX = 37, SNAP_MAX = 10 };
-enum { P_LINK = 0, P_LOG = 1, P_SNAP = 2 };   /* page kinds; game pages are 3 + their index */
+enum { P_LINK = 0, P_LOG = 1, P_SNAP = 2 };
+static int video_interlaced(void);   /* AUTO's video mode (below) */   /* page kinds; game pages are 3 + their index */
 
 typedef struct { const char *title; const dcql_menu_row_t *rows; int n; } page_t;
 
@@ -52,7 +53,7 @@ static struct {
     page_t pages[3 + DCQL_MENU_PAGES_MAX];
     int order[3 + DCQL_MENU_PAGES_MAX];   /* page kinds in the order L / R walks them */
     dcql_menu_row_t link[16];
-    int nlink, transport, interlace;
+    int nlink, transport, interlace, il_now;
     char connect_label[12];
     /* the Log page's ring */
     char log[DCQL_MENU_LOG_LINES][DCQL_MENU_LOG_COLS + 1];
@@ -75,7 +76,7 @@ static void text(const dcql_menu_target_t *t, int x, int y, const char *s, int c
         if (ch == ' ') continue;
         if (ch < DCQL_FONT_FIRST || ch > DCQL_FONT_LAST) ch = '?';
         const uint8_t *rows = dcql_font[ch - DCQL_FONT_FIRST];
-        if (g.interlace) {
+        if (g.il_now) {
             uint8_t two[16];
             two[0] = rows[0];
             for (int r = 1; r < 16; r++) two[r] = (uint8_t)(rows[r] | rows[r - 1]);
@@ -383,6 +384,7 @@ void dcql_menu_init(const dcql_menu_config_t *c) {
     if (c) g.cfg = *c;
     g.combo = g.cfg.combo ? g.cfg.combo : (DCQL_MENU_LT | DCQL_MENU_RT | DCQL_MENU_START);
     g.gate = g.combo;
+    g.interlace = DCQL_MENU_AUTO;
     g.title = g.cfg.title ? g.cfg.title : "QA LINK";
     strcpy(g.connect_label, "Connect");
     build_link_page();
@@ -580,6 +582,7 @@ static void draw_snapshot(const dcql_menu_target_t *t) {
 }
 void dcql_menu_draw(const dcql_menu_target_t *t) {
     if (!g.open) return;
+    g.il_now = g.interlace < 0 ? video_interlaced() : g.interlace;
     const int k = g.order[g.page];
     const page_t *p = &g.pages[k];
     const char *st = state_word();
@@ -609,7 +612,13 @@ void dcql_menu_draw(const dcql_menu_target_t *t) {
                                  : "(A) select   (B) back   (L)(R) page   (START) close", DCQL_MENU_TEXT, 70, 0);
 }
 const char *dcql_menu_snapshot_text(void) { return g.snap_text; }
-void dcql_menu_interlace(int on) { g.interlace = on; g.changes++; }
+void dcql_menu_interlace(int mode) { g.interlace = mode; g.changes++; }
+#ifdef _arch_dreamcast
+static int video_interlaced(void) { return (int)((*(volatile uint32_t *)0xa05f80d0 >> 4) & 1); }   /* SPG_CONTROL interlace */
+#else
+int dcql_menu_host_interlaced;
+static int video_interlaced(void) { return dcql_menu_host_interlaced; }
+#endif
 
 /* ---------------------------------------------------------------------------------------------- way (b) */
 static void fb_box(int x, int y, int w, int h, uint32_t rgb, void *u) {

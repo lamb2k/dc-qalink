@@ -131,8 +131,13 @@ int dcql_menu_stopped(uint32_t (*read_pad)(void *user), void *user);
 int dcql_menu_qr(const char *text, uint8_t *modules, int max_size);
 const char *dcql_menu_snapshot_text(void);           /* what the last Snapshot page's code holds */
 /* 480i: each glyph row is also drawn one line lower, so a one-line horizontal stroke shows in both fields of an
-   interlaced picture (less flicker on a CRT, a bolder look). Off by default: the approved design B look. */
-void dcql_menu_interlace(int on);
+   interlaced picture (no stroke lost in a field; a bolder look). DCQL_MENU_AUTO (the default) follows the video mode
+   at each draw: on for interlaced output (480i, 576i), off for VGA and progressive. 0 / 1 force it off / on. */
+#define DCQL_MENU_AUTO (-1)
+void dcql_menu_interlace(int mode);
+#ifndef _arch_dreamcast
+extern int dcql_menu_host_interlaced;   /* host builds (tests): what AUTO reads as the video mode */
+#endif
 
 #ifdef __cplusplus
 }

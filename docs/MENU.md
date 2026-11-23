@@ -77,8 +77,8 @@ speed claim), **estimate**.
 
 | Limit (plan) | Measured | Tier |
 |---|---|---|
-| Code and constant data, link + live + menu: at most 48 KB | menu alone 9,966 B (9.7 KB: code 7,964, constants 2,002 of which the font is 1,520); with the client library's link and live data 27,303 B (26.7 KB): within | map |
-| Fixed memory: at most 72 KB | menu alone 3,984 B (state, log ring 1.2 KB, QR modules 1.4 KB; the font is constant data); with link + live 128,816 B (125.8 KB): over, because the link and live data alone take 124,832 B | map |
+| Code and constant data, link + live + menu: at most 48 KB | menu alone 10,018 B (9.8 KB: code 8,016, constants 2,002 of which the font is 1,520); with the client library's link and live data 27,355 B (26.7 KB): within | map |
+| Fixed memory: at most 72 KB | menu alone 3,988 B (state, log ring 1.2 KB, QR modules 1.4 KB; the font is constant data); with link + live 128,820 B (125.8 KB): over, because the link and live data alone take 124,832 B | map |
 | Heap use after start: none | 0 B change over 100 opens, draws and closes (control: a planted 64-byte allocation in the same loop reads +7,208 B); the menu's object refers to no allocator | Flycast; object |
 | Cost each picture, menu closed: one test, under 0.01 ms | 200.9 ns a call (0.0002 ms; the empty loop 5.0 ns), one compare and branch | Flycast |
 | Cost each picture, menu open | way (a), the example's PVR sprites: 1.29 to 2.01 ms of CPU a picture (worst 2.01 ms), 748 to 1,167 sprites, 48 to 75 KB of vertex data; way (b), into the displayed frame buffer: 8.3 to 8.9 ms a full redraw (worst 11.2 ms), done only when something changes | Flycast |
@@ -92,15 +92,18 @@ about a thousand sprites) are for the console run.
 
 ## 480i
 
-Spleen draws most horizontal strokes one line thick, so at 480i each such stroke shows in only one of the two fields
-(it flickers at 30 Hz on a CRT, and one field alone reads badly). `dcql_menu_interlace(1)` draws each glyph row
-twice (one line lower too): both fields then carry every stroke, at the price of a bolder look. It is off by default
-(the approved look) until the owner chooses from the still pair.
+Spleen draws most horizontal strokes one line thick, so at 480i each such stroke would show in only one of the two
+fields (it flickers at 30 Hz on a CRT, and one field alone reads badly). So the menu follows the video mode by default
+(`DCQL_MENU_AUTO`, read from the video registers at each draw): on interlaced output (480i, 576i) it draws each glyph
+row twice (one line lower too), so both fields carry every stroke; on VGA and progressive output it draws the font as
+approved. A game can force either: `dcql_menu_interlace(0)` or `dcql_menu_interlace(1)` (owner, 2026-11-22: design B
+approved as drawn, with this default).
 
 ## Checks
 
 - `make OUT=<dir> host` in `example/menu`, then `<dir>/menu-host <out>`: the combo (part of it does not open, a held
-  one does not reopen), the example's pad script (its warp and options land), the QR sizes by length and the refusal
+  one does not reopen), 480i in both video modes (AUTO equals forced on when interlaced and the approved drawing when
+  progressive; forced off stays off; forced on differs, the control), the example's pad script (its warp and options land), the QR sizes by length and the refusal
   over 106 bytes. Then `shots.py host <out>`: every QR size decodes with an independent decoder (zxing-cpp) to its
   text, and a damaged copy (the control) does not.
 - `limits.py <menu.map> <menu-cl.map> <dcql_menu.o>`: the table above and the symbol check (no heap, disc, network or
