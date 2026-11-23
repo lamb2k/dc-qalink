@@ -315,7 +315,18 @@ safety_rows test_safety2 2ff9b9d \
    B3.queue_capped B3.raw_dropped B3.mcp_upload B4.ladder_exhausted B4.bad_crc_report B4.failed_report
    B4.label_full_restart B5.bridge_receipt B5.cli_receipts_bounded B5.bridge_expire B5.cli_expire B5.bridge_exact_len
    B5.cli_exact_len" \
-  "B1.allow_lan B1.flycast_exception B2.subfolder_api B4.label_stub B6.harness"
+  "B1.allow_lan B1.flycast_exception B2.subfolder_api B4.label_stub B6.harness B7.disc_back_to_back B7.disc_whole_big"
+# B7.disc_back_to_back's control is the head the gate refused (24cd792: back-to-back network-disc runs refused)
+if [ -f "$S/tests/test_safety2.py" ] && rm -rf "$W/old-24cd792" && mkdir -p "$W/old-24cd792" \
+   && git -C "$S" archive 24cd792 pc tools | tar -x -C "$W/old-24cd792"; then
+  test_row control-test_safety2-24cd792 0 python3 tests/test_safety2.py --pc "$W/old-24cd792/pc" --controls \
+    --control-rev 24cd792 --out "$H/test_safety2-old24"
+  grep -qE '^control B7\.disc_back_to_back \(.*\) PASS$' "$H/control-test_safety2-24cd792.log" \
+    && row "control 24cd792 B7.disc_back_to_back" PASS "fails on 24cd792 with its expected discrepancy" \
+    || row "control 24cd792 B7.disc_back_to_back" FAIL "did not fail as expected on 24cd792 (host/control-test_safety2-24cd792.log)"
+else
+  row "control 24cd792 B7.disc_back_to_back" FAIL "24cd792's pc/ or tests/test_safety2.py not available"
+fi
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
   case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2) continue ;; esac
