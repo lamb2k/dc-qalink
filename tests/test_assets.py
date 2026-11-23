@@ -185,6 +185,7 @@ def t_bridge(out):
     port = s.getsockname()[1]
     s.close()
     b = Bridge(d, ('127.0.0.1', port), console='127.0.0.1:%d' % (port + 1), device_kind='mock', log=None)
+    b.asset_root = out   # path imports read below the asset root only (audit 2026-11-23, item 2)
     srv = serve(b, '127.0.0.1', 0, 'run')
     url = 'http://127.0.0.1:%d' % srv.server_address[1]
 

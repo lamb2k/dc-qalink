@@ -31,6 +31,8 @@ import argparse, glob, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOP = os.path.normpath(os.path.join(HERE, '..', 'pc', 'dcql_loop.py'))
+sys.path.insert(0, os.path.dirname(LOOP))
+import dcql_loop as cl   # noqa: E402  (the one HELLO decoder: frame length, CRC and version checked)
 
 RUNG_STAGE = {1: 'drive not ready', 2: 'no way back recorded', 3: 'read failed', 4: 'SHA-256 mismatch'}
 STEP_NAME = {1: 'entered', 2: 'quiet', 3: 'GD init', 4: 'read', 5: 'checked', 6: 'jump', 7: 'reboot', 8: 'GDEMU select',
@@ -40,7 +42,7 @@ STEP_NAME = {1: 'entered', 2: 'quiet', 3: 'GD init', 4: 'read', 5: 'checked', 6:
 def way_back(console, port, wait_s):
     """Listen (send nothing) for the loader's HELLO from `console` and decode the last way back's record it carries
     (include/dcql_loop.h CL_HELLO_STUB and CL_HELLO_WB). None when no such beacon came in wait_s."""
-    import socket, struct
+    import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -55,43 +57,50 @@ def way_back(console, port, wait_s):
                 d, src = s.recvfrom(2048)
             except socket.timeout:
                 continue
-            if src[0] != console or len(d) < 16 + 164 + 4 or d[:2] != b'CL' or d[3] != 0x01:
+            if src[0] != console:
                 continue
-            pl = d[16:16 + 164]
-            if struct.unpack_from('<I', pl, 100)[0] != 1:   # role LOADER only
-                continue
-            # 136 step, 137 entries, 138 GDEMU result, 140 error word, 144 GDEMU version (ql-data); 148 where, 152 the
-            # BIOS's answer, 156 run, 160 the drive's sense (ql-core3)
-            stp, _entries, _gd, err, _ver, where, aux, run, sense = struct.unpack_from('<BBHIIIIII', pl, 136)
-            kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM'),
-                                   (16, 'hand-off put back from main RAM copy'),
-                                   (32, 'hand-off put back from sound RAM copy'),
-                                   (64, 'hand-off put back from the adapter\'s memory')) if where & b]
-            if stp in (16, 17):   # ql-core4: the full restart's crumb (no stub)
-                text = ('run %08x: %s; kept by %s%s%s' % (
-                    run, 'the full restart taken' if stp == 17 else 'NO ENDING (watchdog, reset or power)',
-                    ', '.join(kept) or 'nothing', '; the loader started on the saved address' if where & 256 else '',
-                    '' if where & 0x70 else ' (no saved copy survived: the crumb only)'))
-                return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
-            rungs = []
-            for i, name in enumerate(('BIOS', 'drive', 'after select')):
-                b = (err >> (8 * i)) & 255
-                if b:
-                    rungs.append('%s: %s code %d' % (name, RUNG_STAGE.get(b >> 4, 'stage %d' % (b >> 4)), b & 15))
-            sel = err >> 24
-            text = ('run %08x step %d (%s), %s; select %s; BIOS answer err1 %d err2 %d after %d CMD_INIT tries; kept by %s'
-                    % (run, stp, STEP_NAME.get(stp, '?'), '; '.join(rungs) or 'no rung failed',
-                       'not tried' if not sel else 'taken' if sel == 0x10 else 'refused code %d' % (sel & 15),
-                       aux & 255, (aux >> 8) & 255, aux >> 24, ', '.join(kept) or 'nothing (no record survived)'))
-            text += '; drive sense key %d ASC %02x' % (sense & 15, (sense >> 8) & 255)
-            if not where & 0x7f:
-                text = 'no record: the loader found none in any place (a cold boot, or nothing survived)'
-            if where & 256:
-                text += '; the loader started on the saved address'
-            return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
+            wb = way_back_record(d)
+            if wb is not None:
+                return wb
     finally:
         s.close()
     return None
+
+
+def way_back_record(d):
+    """The way-back record of one datagram: a loader's HELLO through dcql_loop.decode_hello (the frame's length, CRC
+    and protocol version checked, then the shared parser), with the 164-byte HELLO's way-back words; else None."""
+    got = cl.decode_hello(d, want_role=1)
+    if got is None or got[0].get('way_back') is None:
+        return None
+    w = got[0]['way_back']
+    stp, err, where, aux, run, sense = w['step'], w['err'], w['where'], w['aux'], w['run'], w['sense']
+    kept = [n for b, n in ((1, 'hand-off'), (2, 'RAM 8M'), (4, 'sound RAM'), (8, 'video RAM'),
+                           (16, 'hand-off put back from main RAM copy'),
+                           (32, 'hand-off put back from sound RAM copy'),
+                           (64, 'hand-off put back from the adapter\'s memory')) if where & b]
+    if stp in (16, 17):   # ql-core4: the full restart's crumb (no stub)
+        text = ('run %08x: %s; kept by %s%s%s' % (
+            run, 'the full restart taken' if stp == 17 else 'NO ENDING (watchdog, reset or power)',
+            ', '.join(kept) or 'nothing', '; the loader started on the saved address' if where & 256 else '',
+            '' if where & 0x70 else ' (no saved copy survived: the crumb only)'))
+        return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
+    rungs = []
+    for i, name in enumerate(('BIOS', 'drive', 'after select')):
+        b = (err >> (8 * i)) & 255
+        if b:
+            rungs.append('%s: %s code %d' % (name, RUNG_STAGE.get(b >> 4, 'stage %d' % (b >> 4)), b & 15))
+    sel = err >> 24
+    text = ('run %08x step %d (%s), %s; select %s; BIOS answer err1 %d err2 %d after %d CMD_INIT tries; kept by %s'
+            % (run, stp, STEP_NAME.get(stp, '?'), '; '.join(rungs) or 'no rung failed',
+               'not tried' if not sel else 'taken' if sel == 0x10 else 'refused code %d' % (sel & 15),
+               aux & 255, (aux >> 8) & 255, aux >> 24, ', '.join(kept) or 'nothing (no record survived)'))
+    text += '; drive sense key %d ASC %02x' % (sense & 15, (sense >> 8) & 255)
+    if not where & 0x7f:
+        text = 'no record: the loader found none in any place (a cold boot, or nothing survived)'
+    if where & 256:
+        text += '; the loader started on the saved address'
+    return {'where': where, 'step': stp, 'err': err, 'aux': aux, 'run': run, 'text': text}
 
 
 def main():

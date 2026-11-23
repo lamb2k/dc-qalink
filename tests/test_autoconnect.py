@@ -145,7 +145,8 @@ def main():
 
         # keyed by the adapter MAC from HELLO (loaders from 456ac57 on; ql-core2): one console across a loader update
         # and a new address. M is the console's MAC; C a new loader build (self-update) on the same console.
-        M, M2, C = '00:d0:f1:02:a3:b4', '00:d0:f1:99:88:77', '33' * 8
+        # synthetic locally administered MACs (02:...), no real adapter's (audit 2026-11-23, item 5)
+        M, M2, C = '02:00:00:00:00:01', '02:00:00:00:00:02', '33' * 8
         dm = os.path.join(root, 'mac')
         b = new_bridge(dm)
         s = Beacon('127.0.0.10', b.t.port, '192.0.2.235', A, mac=M, slot=158)
@@ -208,9 +209,10 @@ def main():
                     refused = False
                 except PermissionError:
                     refused = True
-                record('only-local (the default): a LAN console is listed, never linked; /v0/link refused',
-                       b.t.chosen_ip is None and refused and len(b.t.discovery()) == 1 and b.t.remote_refused > 0,
-                       chosen=b.t.chosen_ip, remote_refused=b.t.remote_refused)
+                # audit 2026-11-23 item 1: its datagrams are dropped before any parsing, so it is not even listed
+                record('only-local (the default): a LAN console is dropped unparsed, never linked; /v0/link refused',
+                       b.t.chosen_ip is None and refused and len(b.t.discovery()) == 0 and b.t.remote_refused > 0,
+                       chosen=b.t.chosen_ip, remote_refused=b.t.remote_refused, listed=len(b.t.discovery()))
             else:
                 record('control: --allow-lan (a person\'s choice): the same console is linked', b.t.chosen_ip == '127.0.0.9',
                        chosen=b.t.chosen_ip)

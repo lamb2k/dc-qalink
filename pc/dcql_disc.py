@@ -11,7 +11,10 @@ DCLOSE, DLOG). Standard library only.
 Modes: overlay (default): the console reads every file from its own disc except the overlay's files that differ from
 the base (or every overlay file when no base is given); whole: every file from the PC (base, with the overlay on top).
 """
-import hashlib, json, os, struct, threading, time
+import hashlib, json, os, struct, sys, threading, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qlsafe   # noqa: E402  (the shared boundaries)
 
 DOPEN, DREAD, DCLOSE, DINFO, DDATA, DLOG = 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C   # (0x21 is END, ql-core4)
 DISC_TYPES_FROM_CONSOLE = frozenset((DOPEN, DREAD, DCLOSE, DLOG))
@@ -66,13 +69,18 @@ class FolderSource:
         self.root = os.path.abspath(root)
         if not os.path.isdir(self.root):
             raise FileNotFoundError('no folder %s' % root)
-        self.files = {}   # KEY -> (name as stored, size, path)
+        self.files = {}   # KEY -> (name as stored, size, real path)
+        self.skipped = 0  # entries whose target (links followed) is not a file below the root: never indexed
         for d, dirs, names in os.walk(self.root):
             dirs.sort()
             for n in sorted(names):
                 p = os.path.join(d, n)
+                real = qlsafe.inside(self.root, p)
+                if real is None:
+                    self.skipped += 1
+                    continue
                 rel = norm(os.path.relpath(p, self.root))
-                self.files[key(rel)] = (rel, os.path.getsize(p), p)
+                self.files[key(rel)] = (rel, os.path.getsize(real), real)
 
     def describe(self):
         return {'kind': 'folder', 'path': self.root, 'files': len(self.files)}
@@ -81,7 +89,10 @@ class FolderSource:
         return self.files[k][1]
 
     def read(self, k, off, n):
-        with open(self.files[k][2], 'rb') as f:
+        real = qlsafe.inside(self.root, self.files[k][2])   # again at the open: a link swapped in since the index
+        if real is None:
+            raise PermissionError('%s is no longer a file below %s' % (self.files[k][0], self.root))
+        with open(real, 'rb') as f:
             f.seek(off)
             return f.read(n)
 
@@ -104,7 +115,13 @@ class ImageSource:
                 lba, typ, ss = int(t[1]), int(t[2]), int(t[3])
                 name = ' '.join(t[4:-1]).strip('"')
                 if typ == 4:
-                    self.tracks.append((lba, ss, 16 if ss == 2352 else 0, os.path.join(base, name)))
+                    # a track is a file beside the .gdi (links followed): a name that leaves its folder is refused;
+                    # a track that is simply absent is left out (only the tracks the file system needs are read)
+                    tp = qlsafe.confine(base, name, want=None)
+                    if tp is None:
+                        raise ValueError('%s: track %s is not beside the descriptor' % (path, name))
+                    if os.path.isfile(tp):
+                        self.tracks.append((lba, ss, 16 if ss == 2352 else 0, tp))
             hd = [t for t in self.tracks if t[0] >= 45000]
             self.fs_lba = (hd or self.tracks)[0][0]
         elif low.endswith('.iso') or low.endswith('.bin'):

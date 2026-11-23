@@ -337,6 +337,23 @@ class Program:
         else:
             state, code = 2, 0
         self.report.append(b'cl-link: up, lines %d\n' % self.line_seq)
+        if 'endonly' in self.args:
+            # ql-fix-pc: the run's END over the link (tail in two pieces, then the head), then a full restart whose
+            # BIOS reboot cleared the saved report: the loader comes back with no report (include/dcql_loop.h CL_END)
+            rep = b''.join(self.report)
+            half = len(rep) // 2
+            head = struct.pack('<IiIIIIIIIIIIIIII', state, code, 0, 0, 0, 0, len(rep), zlib.crc32(rep) & 0xFFFFFFFF,
+                               0, len(rep), 0, int((time.time() - t0) * 1000), 0, 0, 200, 1)
+            for _ in range(2):
+                self.send(cl.END, 0, half, rep[:half])
+                self.send(cl.END, half, len(rep) - half, rep[half:])
+                self.send(cl.END, 0xFFFFFFFF, len(rep), head)
+                time.sleep(0.2)
+            time.sleep(0.3)
+            with self.con.lock:
+                self.con.back(0, 0, b'')
+                self.con.send(cl.HELLO, 0, payload=self.con.hello_payload(1))
+            return
         time.sleep(0.3)
         with self.con.lock:
             self.con.back(state, code, b''.join(self.report))
