@@ -294,7 +294,8 @@ safety_rows() {   # test, old revision, "control ids", "positive-only ids"
       && row "pinned $t $id" PASS "present and passing" \
       || row "pinned $t $id" FAIL "missing or not passing (host/$t.log)"
   done
-  if rm -rf "$W/old-$rev" && mkdir -p "$W/old-$rev" && git -C "$S" archive "$rev" pc tools | tar -x -C "$W/old-$rev"; then
+  # (docs too: test_safety3's C6.docs row reads the old tree's published contract)
+  if rm -rf "$W/old-$rev" && mkdir -p "$W/old-$rev" && git -C "$S" archive "$rev" pc tools docs | tar -x -C "$W/old-$rev"; then
     test_row "control-$t-$rev" 0 python3 "tests/$t.py" --pc "$W/old-$rev/pc" --controls --out "$H/$t-old"
     for id in $ctl; do
       grep -qE "^control ${id//./\\.} \(.*\) PASS$" "$H/control-$t-$rev.log" \
@@ -327,9 +328,16 @@ if [ -f "$S/tests/test_safety2.py" ] && rm -rf "$W/old-24cd792" && mkdir -p "$W/
 else
   row "control 24cd792 B7.disc_back_to_back" FAIL "24cd792's pc/ or tests/test_safety2.py not available"
 fi
+# the round-3 audit's six blockers (ql-fix-pc round 3): controls on ac45161, the head that audit read
+safety_rows test_safety3 ac45161 \
+  "C1.unknown_run C1.root_swap C1.dep_swap C1.mcp_swap C1.session_link C2.elf_overlap C3.parallel_admission
+   C3.serial_bounded C3.sessions_bounded C3.disc_log_bounded C3.mcp_request C4.cli_report_file C4.cli_complete_tail
+   C4.cli_end_before_exec C4.bridge_late_end C4.late_report_attached C5.bridge_crc C5.cli_crc C6.runs_bound
+   C6.resetack C6.way_back_inferred C6.docs" \
+  "C1.no_fd_path C7.harness"
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done
