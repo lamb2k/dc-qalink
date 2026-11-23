@@ -353,6 +353,8 @@ class DiscService:
                 self._log(run, pl)
         return True
 
+    LOG_FDS_MAX = 256           # the program's own open files named in its DLOG records (round 3, blocker 3)
+    LOG_NAME_MAX = 256          # bytes of a DLOG file name kept
     HANDLES_MAX = 64            # open disc handles for the bridge's lifetime (virtual listings are held in memory)
     DS_MFILE = -24              # too many open (as the /pc service answers)
 
@@ -380,7 +382,9 @@ class DiscService:
             # a mount starts a program's use of the disc: one console runs one program at a time, so every handle an
             # earlier program left open (reset, crash, a chain-load, a link never seen to drop) is dead. Retired here,
             # so back-to-back programs are each served to the end whatever the previous one left (ql-fix-pc2 r3)
-            for other in {v.get('run') for v in self.handles.values()} - {run}:
+            # (round 3: every run it knows of, from handles, request ids and DLOG names alike)
+            known = {v.get('run') for v in self.handles.values()} | {k[0] for k in self.by_req} | {k[0] for k in self.fds}
+            for other in known - {run}:
                 self.retire(other)
         if len(self.handles) >= self.HANDLES_MAX:
             # at the cap: another run's handles go first (oldest first); only this run's own are never taken
@@ -470,8 +474,11 @@ class DiscService:
             if kind == DL_OPEN and i + 8 <= len(pl):
                 size = struct.unpack_from('<I', pl, i + 4)[0]
                 end = pl.index(b'\0', i + 8) if b'\0' in pl[i + 8:] else len(pl)
-                path = pl[i + 8:end].decode('latin-1', 'replace')
-                self.fds[(run, fd)] = path
+                path = pl[i + 8:end][:self.LOG_NAME_MAX].decode('latin-1', 'replace')
+                if (run, fd) in self.fds or len(self.fds) < self.LOG_FDS_MAX:   # round 3: bounded, like the handles
+                    self.fds[(run, fd)] = path
+                else:
+                    self.stats['log_fds_dropped'] = self.stats.get('log_fds_dropped', 0) + 1
                 self.record({'t': 'disc', 'op': 'open', 'run': '%08x' % run, 'path': path, 'size': size, 'side': sd})
                 i = end + 1
             elif kind == DL_READ and i + 20 <= len(pl):

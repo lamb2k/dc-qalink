@@ -171,13 +171,15 @@ def make_handler(bridge, level='run'):
                     return self.reply(200, {'sessions': self.sessions()})
                 m = re.match(r'^/v0/sessions/([\w.-]+)$', p)
                 if m:
-                    path = os.path.join(bridge.sessions_dir, m[1] + '.jsonl')
-                    if not os.path.isfile(path):
-                        return self.err(404, 'no session %s' % m[1])
                     s = bridge.sessions.get(m[1])
                     if s is not None:
                         s.flush()
-                    return self.reply(200, open(path, 'rb').read(), 'application/x-ndjson')
+                    try:   # round 3, blocker 1: opened, then checked on the descriptor (a linked file is refused)
+                        with qlsafe.open_confined(bridge.sessions_dir, m[1] + '.jsonl') as f:
+                            data = f.read()
+                    except qlsafe.Refused:
+                        return self.err(404, 'no session %s' % m[1])
+                    return self.reply(200, data, 'application/x-ndjson')
                 s = bridge.current
                 if p == '/v0/summary':
                     if s is None:
@@ -258,6 +260,24 @@ def make_handler(bridge, level='run'):
                     pass
 
         def do_POST(self):
+            # round 3, blocker 3: a push reserves its place in the run queue (one run, its declared bytes) before its
+            # body is read, so parallel pushes cannot all hold a body; a full queue is 429 with the body unread (the
+            # connection closed); the place is released on every path that does not queue the run
+            self._ticket = None
+            if urlparse(self.path).path.rstrip('/') == '/v0/runs':
+                cl_ = (self.headers.get('Content-Length') or '0').strip()
+                try:
+                    self._ticket = bridge.reserve(int(cl_) if cl_.isdigit() and int(cl_) <= MAX_BODY else 0)
+                except qlsafe.Refused as e:
+                    self.close_connection = True
+                    return self.err(429, str(e))
+            try:
+                return self._do_post()
+            finally:
+                if self._ticket is not None:
+                    bridge.release(self._ticket)
+
+        def _do_post(self):
             self._body = None
             try:
                 self.body()
@@ -344,6 +364,12 @@ def make_handler(bridge, level='run'):
 
         # ------------------------------------------------------------ pieces
         def push(self, who):
+            ticket = getattr(self, '_ticket', None)   # reserved in do_POST before the body was read
+            if ticket is None:
+                ticket = self._ticket = bridge.reserve(len(self.body()))
+            return self._push(who, ticket)
+
+        def _push(self, who, ticket):
             ctype = self.headers.get('Content-Type') or ''
             body = self.body()
             if ctype.startswith('multipart/form-data'):
@@ -379,8 +405,12 @@ def make_handler(bridge, level='run'):
             if commit and not re.match(r'^[0-9a-fA-F]{7,40}$', commit):
                 self.err(400, 'commit: a git commit id (7 to 40 hex digits)')
                 return None
+            with bridge.submit_lock:   # the body's place becomes the program's place (never larger)
+                if ticket[0] is not None and len(raw) <= ticket[0]:
+                    bridge.reserved[1] -= ticket[0] - len(raw)
+                    ticket[0] = len(raw)
             return bridge.submit(name, raw, args, int(float(deadline or 0)), files,
-                                 float(reset_after) if reset_after else None, who, commit)
+                                 float(reset_after) if reset_after else None, who, commit, ticket=ticket)
 
         def sessions(self):
             out = []

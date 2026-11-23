@@ -74,14 +74,33 @@ def mcp_root():
     return os.environ.get('QALINK_MCP_ROOT') or os.getcwd()
 
 
+
+def json_capped(body, limit):
+    """`body` as JSON bytes, or None once the encoding passes `limit` bytes: the encoder is stopped there, so a large
+    name, path or base64 field never builds a whole oversized request (round 3, blocker 3)."""
+    out, n = [], 0
+    for chunk in json.JSONEncoder().iterencode(body):
+        n += len(chunk)
+        if n > limit:
+            return None
+        out.append(chunk)
+    return ''.join(out).encode()
+
 class BridgeClient:
     def __init__(self, base, who, root=None):
         self.base = base.rstrip('/')
         self.who = who
         self.root = root or mcp_root()
 
+    REQUEST_MAX = 16 << 20   # the bridge's body limit: a JSON request is bounded while it is built (round 3)
+
     def call(self, method, path, body=None, ctype='application/json', raw=False, timeout=60):
-        data = json.dumps(body).encode() if (body is not None and ctype == 'application/json') else body
+        if body is not None and ctype == 'application/json':
+            data = json_capped(body, self.REQUEST_MAX)
+            if data is None:
+                return 413, {'error': 'the request is over the %d bytes a bridge request may carry' % self.REQUEST_MAX}
+        else:
+            data = body
         r = urllib.request.Request(self.base + path, data=data, method=method,
                                    headers={'Content-Type': ctype, 'X-By': self.who, 'X-Contract': '1'})
         try:
@@ -103,10 +122,10 @@ class BridgeClient:
             real = qlsafe.inside(self.root, p if os.path.isabs(p) else os.path.join(self.root, p))
             if real is None:
                 return 403, {'error': '%s is not a file below the MCP\'s root %s (QALINK_MCP_ROOT)' % (p, self.root)}
-            try:
-                raw = qlsafe.read_capped(real, PROGRAM_MAX)
+            try:   # round 3: read through the descriptor that was checked
+                raw = qlsafe.read_inside(self.root, real, PROGRAM_MAX)
             except qlsafe.Refused as e:
-                return 413, {'error': str(e)}
+                return (413 if 'limit' in str(e) else 403), {'error': str(e)}
             name = args.get('name') or os.path.basename(real)
         elif args.get('base64'):
             try:
