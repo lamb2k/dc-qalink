@@ -40,8 +40,8 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
 - **The way back is a full restart** (the default, `LINK.TXT` `return reboot`): every ending (normal exit,
   deadline, exception, `abort`/`assert`, RESET) first sends the run's END (its state and the tail of its report) to
   the PC, then selects the loader's GDEMU image and reboots through the BIOS, so the console comes back to the loader
-  without a power cycle. A PC that has gone away delays the restart by at most 4 s (host and code reading; the
-  Flycast row is in `docs/RELEASE_0.2.md`). A copy of the run's record is also kept for the loader to read after the
+  without a power cycle. A PC that has gone away delays the restart by at most 4 s, and a link that is down not at
+  all (code reading and Flycast; `docs/RELEASE_0.2.md`). A copy of the run's record is also kept for the loader to read after the
   reboot. The quick in-RAM return stub (`return stub`) is **optional and experimental**: on the console (2026-11-22)
   it froze after its jump, and it is not the default until a console run brings it back.
 - **The SH-4 watchdog is opt-in** (`wdt=1` in the run's arguments): reset mode, fed by TMU1 every 1 ms. On the
@@ -54,7 +54,9 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
   the adapter, either changed files over the GDEMU disc or a whole disc (Flycast and host).
 - **One PC tool**: `python pc/dc_qalink.py loop status|push|run|report|serve|tail|stills|reset|power|relay-local`
   (`pc/dcql_loop.py`). The protocol and the hand-off area are one versioned header (`include/dcql_loop.h`,
-  protocol 2); the loader and the PC tool refuse each other's other versions.
+  protocol 2); the loader and the PC tool refuse each other's other versions. `--udp <console>` binds every address
+  of this PC: naming a console on the network is the opt-in. The bridge (`pc/qalink_bridge.py`) binds 127.0.0.1 and
+  talks only to Flycast unless started with `--allow-lan` (`docs/BRIDGE_API.md`).
 
 ```
 Dreamcast --broadband adapter/UDP 52060--> PC (dc_qalink.py loop ...)      or, on the modem, via the DreamPi relay
@@ -167,7 +169,8 @@ start marker) and checks `pi_setup.py`'s discovery parsing, ssh config writing a
 PC) against the PC tool over a simulated bad line: loss, corruption, a dead line, a restarted sender, damaged images
 that must be refused, the protocol-version refusal both ways, the file service and stills. The checks that guard a
 fault come with a control that must fail (a damaged image, an old implementation); not every positive case has one.
-`sh lib/test/run.sh` checks the console library's directory-entry and ring-ownership rules with AddressSanitizer, and
+The gate runs the full `test_loop` (with its modem-rate transfer), `test_assets` with its four controls and
+`test_safety` (20 tests, 5 control rows) as rows of their own. `sh lib/test/run.sh` checks the console library's directory-entry and ring-ownership rules with AddressSanitizer, and
 its control (the code before the fix) must fail. No game and no console needed.
 
 The PC side is Python 3.10 or newer, standard library only, except: the MCP server needs the Python MCP SDK

@@ -43,8 +43,10 @@ files over the GDEMU disc or a whole disc (folder, `.gdi`, `.iso`), with a build
 - `pc/qalink_bridge.py`: one local service on 127.0.0.1 (Python standard library, except the MCP server, which needs
   the MCP SDK, and the asset routes, which need numpy and, for formats other than PNG, Pillow), contract 1
   (`docs/BRIDGE_API.md`): devices and discovery, push and run, reports, stills, the reset ladder, sessions recorded to
-  files, live events as Server-Sent Events. Only-local by default (it links only a loader at this PC's own address,
-  that is Flycast, until a person allows the LAN). Autoconnect keyed by the adapter's MAC from HELLO.
+  files, live events as Server-Sent Events. Only-local by default (it binds the loader's UDP port on 127.0.0.1 and
+  links only a loader at this PC's own address, that is Flycast, until a person allows the LAN with `--allow-lan`;
+  ql-fix-pc). The CLI (`pc/dcql_loop.py --udp <console>`) still binds every address: naming a console on the network
+  is its opt-in. File reads stay below named roots (`--files`, `--asset-root`, `QALINK_MCP_ROOT`). Autoconnect keyed by the adapter's MAC from HELLO.
 - Live data (`lib/dcql_live.c`): a record per picture (phases, counters, guards, room, position), a numbered trace
   ring, the game's log, channel subscriptions; copies on the game's thread, sends on the link thread.
 - The local MCP (`docs/MCP.md`): 23 tools over stdio and local HTTP, each with a level (read, control, run), every
@@ -58,7 +60,10 @@ gate, it is never resolved there), then:
    build of the protocol core, the example in four forms (0.1's modem build, both, adapter with the way back, link
    off), and any other program folder;
 2. runs every host test (`tests/test_*.py`, a new one too), the syntax of every Python file, and the controls (for
-   example, the 0.2 work-in-progress PC tool must take its own echo);
+   example, the 0.2 work-in-progress PC tool must take its own echo). Since ql-fix-pc each of these is its own gate
+   row: the full `test_loop` (with the modem-rate transfer, no `--quick`), `test_assets` with its four
+   broken-implementation controls, and `test_safety` (20 tests, 5 control rows: the PC's binding, file roots and
+   limits against the 1990fb9 code, which must fail);
 3. measures the size rows below from the link map and checks what the head adds to the repository (no blob over
    300 KB, no build outputs, no game data, no dot-folders but `.github`);
 4. runs one Flycast suite (`tools/gate/flysuite.py`, `suite.json`): it first listens and refuses to start if a loader
@@ -106,6 +111,19 @@ swap, the read-ahead hold) and 20 B of fixed memory.
 | Network or disc access inside a picture | none | copies into rings only (code reading) | inside |
 | Screen grab | in pieces by the link thread | the program pauses, the link thread sends in pieces (Flycast) | inside |
 | Graphics memory | none | none | inside |
+
+## Console-side fixes after the 2026-11-23 audit (lane ql-fix-dc)
+
+| audit finding | fix | check (tier) | its control |
+|---|---|---|---|
+| a /cd directory entry advanced past the listing | `lib/dcql_dirent.h`: a truncated entry is rejected and ends the listing | `lib/test/run.sh` (host, ASan) | the 1990fb9 rule accepts the truncated entry and leaves the position past the size |
+| built-in rings: one kept when its partner failed; owned rings stranded by a later `dcql_net_config` | `lib/dcql_ring.h`: owned vs borrowed, both or neither, a swap frees the owned rings it replaces | `lib/test/run.sh` (host, ASan leaks) | the 1990fb9 code leaks in both cases |
+| the /pc read-ahead not freed when a program ends with files open | held by each read, freed at the last close or on the way out | Flycast f-01 (read and closed: "none held at exit"), f-02 (left open: "freed at exit") | the lines do not exist at 1990fb9 |
+| END enqueue retries had no total time bound | `END_LINK_MS` 4 s for the whole END path; at once on a link that is down | Flycast f-03 (30 KB report, link stopped before exit): loader back 7.42 s after EXEC, report DONE from the kept copy | CONTROL_F03 |
+
+Measured on the code commit c0bc0db (`gates\ql-fix-dc-c0bc0db23`, Flycast function tier, one run each). The f-01 heap
+line reads 309,724 B before the open and 310,244 B after the close: the 8 KiB block is gone; the 520 B left is most
+likely the C library's file records, allocated once at the first `fopen` (not read further).
 
 ## Still open before 0.2.0
 

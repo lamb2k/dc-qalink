@@ -10,14 +10,16 @@ one package, the Python MCP SDK (`pip install mcp`, 2.x).
 
 ```
 python pc/qalink_bridge.py [--port 52080] [--data DIR] [--udp-port 52060] [--console auto|IP] [--device flycast|console]
-                           [--files ROOT] [--selftest testprog.elf] [--loader-disc DIR] [--level read|control|run]
-                           [--mcp-http PORT]
+                           [--files ROOT] [--asset-root DIR] [--selftest testprog.elf] [--loader-disc DIR]
+                           [--level read|control|run] [--udp-host ADDR] [--allow-lan] [--mcp-http PORT]
 python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-level read|control|run]
 ```
 
 ## Shape
 - HTTP/1.1 with JSON bodies on **127.0.0.1:52080** only (the bridge refuses any other address). The hosted relay
   (QA Link Cloud, L3b) carries the same paths with a token.
+- A request body's `Content-Length` must be digits only and at most 16 MiB; anything else is answered **413** before
+  the body is read.
 - Paths under **`/v0/`**. Every JSON answer carries **`contract: 1`**. A client sends `X-Contract: 1` (or
   `?contract=1`); another major is answered **409** with `theirs` and `ours`.
 - The bridge speaks the **loader's words** (link `searching` / `up` / `lost` / `refused`; run states below); the app maps
@@ -29,11 +31,15 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 - **Levels:** `read` (state, sessions, stills, summary, trace, log), `control` (commands, reset, grab, link), `run`
   (push and run code). A bridge started at a level answers 403 above it. Every control and run call is written to
   `calls.log` in the data folder with who made it (`X-By`, else the client address) and its level.
-- The UDP port of the loader (52060) stays bound while the bridge runs; discovery records every loader that beacons.
-  The console is learnt only from a loader's HELLO; a PC-to-console datagram (our own broadcast looped back) is dropped.
+- The UDP port of the loader (52060) stays bound while the bridge runs. **It is bound on 127.0.0.1 by default**
+  (ql-fix-pc, after the 2026-11-23 audit); on the address `--console` names when that is this PC's own (Flycast); on
+  every address (0.0.0.0) only with `--allow-lan`; a typed `--udp-host` is used as typed. Whatever is bound, without
+  `--allow-lan` only datagrams from this PC's own addresses are read. `status.udp_bind` says what is bound
+  (`address:port`). The console is learnt only from a loader's HELLO; a PC-to-console datagram (our own broadcast
+  looped back) is dropped.
 - **Only local by default.** The bridge talks only to a loader at this PC's own addresses (Flycast, the simulated
-  console): a console on the network is listed in discovery and never linked or sent anything, `POST /v0/link` to it is
-  403, and `--console <LAN address>` refuses to start. `--allow-lan` lifts it; QA Link Cloud passes it when a person
+  console): a console on the network is not listed in discovery, never linked or sent anything, `POST /v0/link` to it
+  is 403, and `--console <LAN address>` refuses to start. `--allow-lan` lifts it; QA Link Cloud passes it when a person
   turns on "Dreamcast on the network". Tests, scripts and agents leave it off (ruling 2026-11-22: no lane run sends
   anything to a real console).
 - **Autoconnect** (on unless `--no-autoconnect` or `POST /v0/settings {"autoconnect": false}`): when a loader beacons,
@@ -52,7 +58,7 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 ## Resources
 | Method and path | Level | What |
 |---|---|---|
-| `GET /v0/status` | read | `bridge`, `link`, `device` (below), `session` (being recorded, or null), `rate_bps`, `mode` (`full` adapter / `summary` modem), `paused`, `n` (newest picture), `level`, `tier`, `queue`, `active_run`, `autoconnect`, `remembered`, `only_local`, `remote_refused` |
+| `GET /v0/status` | read | `bridge`, `link`, `device` (below), `session` (being recorded, or null), `rate_bps`, `mode` (`full` adapter / `summary` modem), `paused`, `n` (newest picture), `level`, `tier`, `queue`, `active_run`, `autoconnect`, `remembered`, `only_local`, `remote_refused`, `udp_bind` |
 | `POST /v0/settings` | control | `{autoconnect: true|false}`; answers the status |
 | `GET /v0/device` | read | `id`, `kind` (`flycast`/`console`), `tier`, `name`, `transport` (`adapter`/`modem`), `address`, `console_ip`, `link`, `state` (the loader's: `idle`/`receiving`/`verified`/`failed`/`exec`, or the run's), `loader` {`build`, `sha8`, `protocol`, `stub_bytes`, `boot_count`, `pushed`}, `ident`, `mac`, `gdemu_slot`, `gdemu_version`, `stub`, `stub_text`, `program` {`run`, `linked`}, `last_run` |
 | `GET /v0/devices` | read | `{devices: [device]}` (one device per bridge) |
@@ -81,8 +87,10 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 A **run**: `id`, `program` {`name`, `sha256`, `bytes`}, `args`, `state` (`queued` / `sending` / `running` / `done` /
 `crashed` / `timeout` / `reset` / `lost` / `refused`), `times` {`push_s`, `run_s`, `report_s`, `total_s`}, `way_back`
 (`stub` / `watchdog` / `power`), `by`, `queued_at`, `ended_at`, `device`, `tier`, `deadline_s`, `files` (the file
-service's totals), `stills`, `serial_lines`, `error`, `transfer` (the push's numbers), `crash` {`event`, `pc`, `pr`, `sp`}
-and the parsed **`summary`**: `exit`, `state`, `seconds`, `pictures`, `numbers[]` {`label`, `value`, `unit`, `tier`}
+service's totals), `stills`, `serial_lines`, `error`, `transfer` (the push's numbers), `crash` {`event`, `pc`, `pr`, `sp`},
+**`ending`** when the result came by END before the console's restart (ql-fix-pc: `bytes`, `tail`, `complete`,
+`whole`, `crc_ok`; the run is kept even when the loader's saved report is empty afterwards) and the parsed
+**`summary`**: `exit`, `state`, `seconds`, `pictures`, `numbers[]` {`label`, `value`, `unit`, `tier`}
 (report lines of the form `@ label = value unit`, and each phase's mean and worst when the program sent records),
 `notes`, `crash`, `tier`. Crash symbols and source lines (from an ELF with symbols) are for later.
 
