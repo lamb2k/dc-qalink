@@ -5,13 +5,15 @@ Linux; Python 3.10+, standard library.
   python tests/test_bridge021.py [--out DIR] [--pc DIR] [--controls]
 
 Rows (pinned in PINNED, see tests/ctlrows.py):
-  E1 hand-played runs: a run with no deadline is not capped at 900 s while the console streams; it is lost only
-     after the link-loss timeout of silence
+  E1 hand-played runs: a run with no deadline is not capped at 900 s while the console streams; any traffic from the
+     console counts as heard (disc requests alone keep a 30 s room load running); lost only after RUN_SILENT_S (60 s)
+     of silence
   E2 printed lines: GET /v0/log (MCP read_log) includes the program's lines as level "serial"; level=serial filters
   E3 docs: a real console needs --allow-lan, and the Windows Firewall rule for the bridge's python.exe
   E4 the control harness itself
 
---controls with --pc naming v0.2.0's pc/ (88d9379): each row with an expected discrepancy must fail with exactly it."""
+--controls with --pc naming v0.2.0's pc/ (88d9379): each row with an expected discrepancy must fail with exactly it,
+but E1.disc_only_30s, whose control is fb6b344 (the 8 s rule: --control-rev fb6b344)."""
 import argparse, os, shutil, socket, sys, tempfile, time, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,6 +23,7 @@ import ctlrows   # noqa: E402
 PINNED = {
     'E1.no_deadline_cap': 'lost at the 900 s cap while streaming',
     'E1.silence_lost': None,
+    'E1.disc_only_30s': 'lost while disc requests flowed',
     'E2.log_lines': 'serial lines missing',
     'E3.docs': 'docs stale',
     'E4.harness': None,
@@ -60,10 +63,10 @@ def e1(R, ctx):
     core, root = ctx['core'], ctx['root']
     from simconsole import SimConsole
 
-    def bridge(name):
+    def bridge(name, **kw):
         udp, lport = free_udp(), free_udp()
         b = core.Bridge(os.path.join(root, name), ('127.0.0.1', udp), '127.0.0.1:%d' % lport, 'mock',
-                        autoconnect=False)
+                        autoconnect=False, **kw)
         con = SimConsole(('127.0.0.1', udp), lport)
         wait_for(lambda: b.loop.hello is not None, 8)
         return b, con
@@ -89,6 +92,7 @@ def e1(R, ctx):
 
     def silence():
         b, con = bridge('e1-sil')
+        b.RUN_SILENT_S = 5.0   # the 60 s rule, shortened for the test (the mechanism, not the figure)
         try:
             r = b.submit('quiet.bin', b'\x00\x09' * 4000, 'report secs=120', 0)
             wait_for(lambda: r.state == 'running' and con.prog is not None, 20)
@@ -100,11 +104,45 @@ def e1(R, ctx):
         finally:
             con.close()
             b.close()
-        ok = r.state == 'lost' and 'silent' in (r.error or '') and secs < 15
+        ok = r.state == 'lost' and 'silent for 5 s' in (r.error or '') and secs < 12
         return ok, 'lost after silence' if ok else 'state %s' % r.state, {'state': r.state, 'error': r.error,
                                                                           'seconds': round(secs, 1)}
-    R.row('E1.silence_lost', 'positive: a silent console (8 s, no rows or beacon) makes a no-deadline run lost',
-          silence)
+    R.row('E1.silence_lost', 'positive: a console silent past RUN_SILENT_S (set to 5 s here) makes a no-deadline '
+          'run lost', silence)
+
+    def disc_only():
+        import struct, threading
+        import dcql_loop as cl
+        import dcql_disc
+        ov = os.path.join(root, 'e1-ov')
+        os.makedirs(ov, exist_ok=True)
+        open(os.path.join(ov, 'ROOM.BIN'), 'wb').write(b'r' * 4096)
+        b, con = bridge('e1-disc', overlay=ov)
+        stop = []
+        try:
+            r = b.submit('room.bin', b'\x00\x09' * 4000, 'report secs=120', 0)
+            wait_for(lambda: r.state == 'running' and con.prog is not None, 20)
+            time.sleep(1.0)
+            real = con.send
+            con.send = lambda *a, **k: None   # the program goes quiet but for its disc requests (a room load)
+
+            def disc():
+                req = 1
+                while not stop:
+                    real(dcql_disc.DOPEN, r.sid, req, 0, struct.pack('<I', 0) + b'ROOM.BIN')
+                    req += 1
+                    time.sleep(12.0)   # one disc request every 12 s (a slow room load: one request took 12.45 s)
+            threading.Thread(target=disc, daemon=True).start()
+            time.sleep(30.0)
+            state = r.state
+        finally:
+            stop.append(1)
+            con.close()
+            b.close()
+        ok = state == 'running'
+        return ok, 'lost while disc requests flowed' if state == 'lost' else 'running' if ok else 'state %s' % state, {
+            'state_at_30s': state, 'error': r.error}
+    R.row('E1.disc_only_30s', 'a no-deadline run silent for 30 s but for a disc request every 12 s stays running', disc_only)
 
 
 def e2(R, ctx):
@@ -157,6 +195,7 @@ def main():
     ap.add_argument('--out')
     ap.add_argument('--pc', default=os.path.join(HERE, '..', 'pc'))
     ap.add_argument('--controls', action='store_true')
+    ap.add_argument('--control-rev', choices=('88d9379', 'fb6b344'), default='88d9379')
     a = ap.parse_args()
     pcdir = os.path.abspath(a.pc)
     sys.path.insert(0, pcdir)
@@ -164,7 +203,12 @@ def main():
     import simconsole   # noqa: F401
     sys.path.insert(0, pcdir)
     root = tempfile.mkdtemp(prefix='ql-021-')
-    R = ctlrows.Rows(PINNED, a.controls)
+    if a.controls and a.control_rev == 'fb6b344':   # the 8 s rule: only the disc row's control runs there
+        pinned = {k: None for k in PINNED}
+        pinned['E1.disc_only_30s'] = PINNED['E1.disc_only_30s']
+    else:
+        pinned = dict(PINNED, **{'E1.disc_only_30s': None})   # v0.2.0 waited 900 s: the 8 s rule is its control
+    R = ctlrows.Rows(pinned, a.controls)
     ctx = {'core': core, 'live': live, 'pcdir': pcdir, 'root': root}
     try:
         for part in (e1, e2, e3):

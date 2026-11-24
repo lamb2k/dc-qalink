@@ -104,8 +104,9 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `POST /v0/memory/read`, `POST /v0/assets` | - | **501** in this loader (memory reads: plan L5; live assets: plan L5b) |
 
 A run with `deadline_s` 0 (hand-played) has no time cap (0.2.1; 0.2.0 marked it lost after 900 s while the console
-still streamed): it stays `running` while anything is heard from the console (rows, lines, logs, beacons) and is
-`lost` only after 8 s of silence (the bridge's link-loss timeout). A run with a deadline waits for it plus 60 s.
+still streamed): it stays `running` while anything is heard from the console and is
+`lost` only after 60 s in which nothing at all came from the console (any datagram counts: rows, lines, logs,
+disc and `/pc` requests, still pieces, menu and pad answers, keep-alives). A run with a deadline waits for it plus 60 s.
 
 
 A **run**: `id`, `program` {`name`, `sha256`, `bytes`} (a finished run keeps the count, not the program's bytes; at

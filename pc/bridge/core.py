@@ -960,7 +960,9 @@ class Bridge:
                 finally:
                     self.link_lock.release()
 
-    LINK_LOST_S = 8.0   # the link-loss timeout: a loader (or a no-deadline run's console) silent this long is lost
+    LINK_LOST_S = 8.0    # the link-loss timeout: a linked loader silent this long is lost
+    RUN_SILENT_S = 60.0  # a no-deadline run whose console is silent this long is lost (a network-disc room load
+                         # took up to 29 s, one request 12.45 s; waitreset is silent; the link may come up 6 s late)
 
     def _ticker(self):
         last_ping = 0
@@ -1118,14 +1120,16 @@ class Bridge:
                     return loop.hello
                 return None
             # 0.2.1: a run with a deadline waits for it (+60 s); a run with none (hand-played) has no cap: it runs while
-            # the console is heard (rows, lines, logs, any datagram) and is lost only after LINK_LOST_S of silence
+            # the console is heard (any datagram from it: rows, lines, logs, disc and /pc requests and acks, still
+            # pieces, menu and pad answers, keep-alives, beacons) and is lost only after RUN_SILENT_S of silence
             wait_s = (run.deadline_s + 60) if run.deadline_s else None
             reset_at = t_exec + run.reset_after_s if run.reset_after_s else None
             lost_why = None
             heard0 = time.monotonic()
             while hb is None and (wait_s is None or time.time() - t_exec < wait_s):
-                if wait_s is None and time.monotonic() - max(self.rx_mono, heard0) > self.LINK_LOST_S:
-                    lost_why = 'the console was silent for %.0f s (no beacon, rows or lines)' % self.LINK_LOST_S
+                if wait_s is None and time.monotonic() - max(self.rx_mono, heard0) > self.RUN_SILENT_S:
+                    lost_why = 'the console was silent for %.0f s (nothing from the program or the loader)' % \
+                        self.RUN_SILENT_S
                     break
                 if run.reset_flag.is_set() or (reset_at and time.time() >= reset_at):
                     rung, secs, hb, ack = cl.ladder(loop, run.sid, 20.0, self.log, b0)

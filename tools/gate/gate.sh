@@ -341,7 +341,18 @@ safety_rows test_safety4 df476a2 \
    D3.mcp_field_memory D3.session_stream D4.cli_end_during_fetch D4.whole_bad_crc D5.serial_window D5.docs" \
   "D6.harness"
 # 0.2.1 bridge fixes (the first real-console session): controls on v0.2.0 (88d9379)
-safety_rows test_bridge021 88d9379 "E1.no_deadline_cap E2.log_lines E3.docs" "E1.silence_lost E4.harness"
+safety_rows test_bridge021 88d9379 "E1.no_deadline_cap E2.log_lines E3.docs" "E1.silence_lost E1.disc_only_30s E4.harness"
+# E1.disc_only_30s's control is fb6b344 (the first 0.2.1 head: lost after 8 s of silence, disc requests or not)
+if [ -f "$S/tests/test_bridge021.py" ] && rm -rf "$W/old-fb6b344" && mkdir -p "$W/old-fb6b344" \
+   && git -C "$S" archive fb6b344 pc tools docs | tar -x -C "$W/old-fb6b344"; then
+  test_row control-test_bridge021-fb6b344 0 python3 tests/test_bridge021.py --pc "$W/old-fb6b344/pc" --controls \
+    --control-rev fb6b344 --out "$H/test_bridge021-oldfb"
+  grep -qE '^control E1\.disc_only_30s \(.*\) PASS$' "$H/control-test_bridge021-fb6b344.log" \
+    && row "control fb6b344 E1.disc_only_30s" PASS "fails on fb6b344 with its expected discrepancy" \
+    || row "control fb6b344 E1.disc_only_30s" FAIL "did not fail as expected on fb6b344 (host/control-test_bridge021-fb6b344.log)"
+else
+  row "control fb6b344 E1.disc_only_30s" FAIL "fb6b344's pc/ or tests/test_bridge021.py not available"
+fi
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
   case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3|test_safety4|test_bridge021) continue ;; esac
