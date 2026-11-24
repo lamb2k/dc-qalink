@@ -155,7 +155,13 @@ These runs used earlier heads; they do not establish recovery or timing at the t
 
 ### Exact-head console checklist (after the tag, run with the owner)
 
-From the pre-tag audit (2026-11-23, "What a console run should still check"), with the tag's loader and PC tool:
+From the pre-tag audit (2026-11-23, "What a console run should still check"), with the tag's loader and PC tool.
+Before anything else, a real console needs the bridge started with `--allow-lan`
+(`python pc/qalink_bridge.py --allow-lan`): without it the bridge binds 127.0.0.1 only and hears nothing from the
+network (the first console session's run sheet lacked it, 2026-11-23). On Windows also allow the `python.exe` that
+runs the bridge through Windows Firewall (inbound UDP on the loader port; no prompt appears, the traffic is dropped
+silently): for example `netsh advfirewall firewall add rule name="dc-qalink bridge" dir=in action=allow
+program="<path to python.exe>" protocol=UDP`.
 - Normal exit, RESET, deadline and exception, each through the CLI and through the bridge. Record the run ID, END
   state, tail coverage, whole-report CRC when there is one, ENDACK, the saved copy that survives, the GDEMU slot, the
   next beacon and that the next run is accepted.

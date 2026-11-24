@@ -552,6 +552,7 @@ class Bridge:
         self.listeners_lock = threading.Lock()
         self.link_state = 'searching'
         self.rx_hist = []
+        self.rx_mono = 0.0
         self.stop_flag = threading.Event()
         self.audit = open(os.path.join(self.data_dir, 'calls.log'), 'a', encoding='utf-8')
         # builds (lane ql-disc): the workspace's anchor; one record per distinct program + disc + loader + args + tier
@@ -739,6 +740,7 @@ class Bridge:
     def tap(self, m):
         typ, run, a, b, pl = m
         self.rx_hist.append((time.time(), len(pl) + 20))
+        self.rx_mono = time.monotonic()   # 0.2.1: when the console was last heard (a no-deadline run's silence)
         if len(self.rx_hist) > 4000:
             del self.rx_hist[:2000]
         tier = self.tier()
@@ -958,12 +960,14 @@ class Bridge:
                 finally:
                     self.link_lock.release()
 
+    LINK_LOST_S = 8.0   # the link-loss timeout: a loader (or a no-deadline run's console) silent this long is lost
+
     def _ticker(self):
         last_ping = 0
         while not self.stop_flag.is_set():
             time.sleep(1.0)
             h = self.loop.hello
-            if h and time.time() - h.get('at', 0) > 8 and self.link_state == 'up' and self.active is None and \
+            if h and time.time() - h.get('at', 0) > self.LINK_LOST_S and self.link_state == 'up' and self.active is None and \
                     self.client is None:
                 self.link_state = 'lost'
                 self.record({'t': 'link', 'state': 'lost', 'role': 'loader'})
@@ -1113,10 +1117,16 @@ class Bridge:
                         (loop.hello['boot_count'] != b0 or loop.hello['uptime_ms'] < 1000 * (time.time() - t_exec)):
                     return loop.hello
                 return None
-            wait_s = (run.deadline_s + 60) if run.deadline_s else 900
+            # 0.2.1: a run with a deadline waits for it (+60 s); a run with none (hand-played) has no cap: it runs while
+            # the console is heard (rows, lines, logs, any datagram) and is lost only after LINK_LOST_S of silence
+            wait_s = (run.deadline_s + 60) if run.deadline_s else None
             reset_at = t_exec + run.reset_after_s if run.reset_after_s else None
             lost_why = None
-            while hb is None and time.time() - t_exec < wait_s:
+            heard0 = time.monotonic()
+            while hb is None and (wait_s is None or time.time() - t_exec < wait_s):
+                if wait_s is None and time.monotonic() - max(self.rx_mono, heard0) > self.LINK_LOST_S:
+                    lost_why = 'the console was silent for %.0f s (no beacon, rows or lines)' % self.LINK_LOST_S
+                    break
                 if run.reset_flag.is_set() or (reset_at and time.time() >= reset_at):
                     rung, secs, hb, ack = cl.ladder(loop, run.sid, 20.0, self.log, b0)
                     # the rung is what was tried; how the console came back is read from the loader's HELLO below
@@ -1139,7 +1149,7 @@ class Bridge:
             run.way_back = cl.way_back_of(hb)
             run.evidence = {'end': cl.ending_state(er), 'loader_back': hb is not None, 'loader_report': 'none'}
             if hb is None:
-                why = lost_why or 'the loader did not come back within %d s' % wait_s
+                why = lost_why or 'the loader did not come back within %d s' % (wait_s or 0)
                 if er is not None:   # the END is in hand: the run's result, though the loader is not back
                     return self._end_result(run, er, session, t_start, why)
                 run.state, run.error = 'lost', why

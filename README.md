@@ -45,6 +45,10 @@ only), **host** (tests on a PC), **link map** (exact bytes). The full list with 
 - **The first run on a console:** `python tools/first_console.py --program build/testprog.elf` waits for the beacon,
   pushes the test program, reads its report, grabs the console's screen 3 times, sends RESET and prints a pass/fail
   table. The PC tool learns the console's address from its beacon (`--udp auto`).
+- **A real console with the bridge:** start it as `python pc/qalink_bridge.py --allow-lan` (without `--allow-lan`
+  it binds 127.0.0.1 and hears only Flycast on this PC). On Windows, allow the `python.exe` that runs it through
+  Windows Firewall for inbound UDP; Windows shows no prompt and drops the console's packets silently
+  (`docs/RELEASE_0.2.md`, console checklist).
 - **The client library** (`loader/client.mk`) in each pushed program: its report and exit code back to the PC, its
   serial lines live, stills (RGB565 frame buffers as PNG on the PC), the PC's files as `/pc/...` (load time; a
   program that wants reads in play counted does it itself), and RESET from the PC.

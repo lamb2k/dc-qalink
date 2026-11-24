@@ -340,9 +340,11 @@ safety_rows test_safety4 df476a2 \
   "D1.grab_exhausted D1.failed_bounded D2.cached_owner D2.link_change D2.hello_during_run D2.session_listing
    D3.mcp_field_memory D3.session_stream D4.cli_end_during_fetch D4.whole_bad_crc D5.serial_window D5.docs" \
   "D6.harness"
+# 0.2.1 bridge fixes (the first real-console session): controls on v0.2.0 (88d9379)
+safety_rows test_bridge021 88d9379 "E1.no_deadline_cap E2.log_lines E3.docs" "E1.silence_lost E4.harness"
 for t in "$S"/tests/test_*.py; do
   n=$(basename "$t" .py)
-  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3|test_safety4) continue ;; esac
+  case $n in test_loop|test_bridge|test_autoconnect|test_echo|test_link|test_mcp|test_safety|test_safety2|test_safety3|test_safety4|test_bridge021) continue ;; esac
   if grep -q -- "'--out'" "$t"; then test_row "$n (new)" 0 python3 "tests/$n.py" --out "$H/$n"
   else test_row "$n (new)" 0 python3 "tests/$n.py"; fi
 done

@@ -28,6 +28,7 @@ class Session:
         self.ctr_recs = []
         self.trace = []
         self.logs = []
+        self.lines = []            # printed lines {n, text} (n: the latest row's picture when the line arrived)
         self.grabs = []
         self.max_n = 0
         self.trace_seq = None
@@ -73,6 +74,8 @@ class Session:
                 self.trace.append(r)
             elif t == 'log':
                 self.logs.append(r)
+            elif t == 'line':   # 0.2.1: kept for query_log, at the latest row's picture
+                self.lines.append({'n': self.max_n, 'text': r.get('text', '')})
             elif t == 'grab':
                 self.grabs.append(r)
             elif t == 'end':
@@ -86,7 +89,7 @@ class Session:
     def _trim(self):
         """Each in-memory list and the row table held at KEEP, the oldest half dropped past it (amortised O(1))."""
         k = self.KEEP
-        for lst in (self.records, self.ctr_recs, self.trace, self.logs, self.grabs):
+        for lst in (self.records, self.ctr_recs, self.trace, self.logs, self.grabs, self.lines):
             if len(lst) > k:
                 del lst[:len(lst) - k // 2]
                 self.dropped = getattr(self, 'dropped', 0) + 1
@@ -171,6 +174,10 @@ class Session:
             ls = [{'n': r['n'], 'lv': r['lv'], 'msg': r['msg']} for r in self.logs
                   if frm <= (r['n'] or 0) <= to and (not level or r['lv'] == level or (level == 'warn' and r['lv'] == 'err'))
                   and (not q or q in r['msg'].lower())]
+            # 0.2.1: the program's printed lines too, as level "serial" at the picture they arrived at
+            ls = sorted(ls + [{'n': r['n'], 'lv': 'serial', 'msg': r['text']} for r in self.lines
+                              if frm <= r['n'] <= to and level in (None, '', 'serial')
+                              and (not q or q in r['text'].lower())], key=lambda x: x['n'] or 0)
             return {'from': frm, 'to': to, 'lines': ls[-limit:], 'truncated': len(ls) > limit}
 
     def info(self):

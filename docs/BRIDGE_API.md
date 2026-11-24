@@ -96,12 +96,17 @@ python pc/qalink_bridge.py --mcp stdio [--bridge http://127.0.0.1:52080] [--mcp-
 | `POST /v0/reset`, `POST /v0/power` | control | Aliases: the ladder (`rung`: the rung tried, `reset` / `watchdog wait` / `power` / `none`; `way_back`: how the loader came back, below; `seconds`); the last rung (`done`, `say`) |
 | `GET /v0/summary?slowest=k` | read | The current session: `session`, `label`, `device`, `tier`, `pictures`, `measured`, `missing` (pictures never received), `window`, `phases[]` {`key`, `label`, `budget`, `mean`, `p95`, `p99`, `worst`, `worstAt`, `over`, `tier`}, `guards[]` {`key`, `name`, `value`, `tier`}, `slowest[]` {`n`, `total` (busy: the phases that are not the total), `phases`}, `trace_lost` |
 | `GET /v0/trace?from&to&lane&limit` | read | `from`, `to`, `events[]` {`lane`, `n`, `d`, `label`}, `truncated`, `lost` |
-| `GET /v0/log?from&to&level&q&limit` | read | `from`, `to`, `lines[]` {`n`, `lv`, `msg`}, `truncated` (the newest when over the limit; `warn` includes `err`) |
+| `GET /v0/log?from&to&level&q&limit` | read | `from`, `to`, `lines[]` {`n`, `lv`, `msg`}, `truncated` (the newest when over the limit; `warn` includes `err`). The program's printed lines are included as `lv: serial` at the picture of the latest row when they arrived (0.2.1); `level=serial` returns only them |
 | `GET /v0/presets` | read | What the running program declared: `program`, `presets[]` {`id`, `group`, `label`}, `options[]` {`name`, `type` bool/int/enum, `min`, `max`, `values`, `value`, `label`}, `scripts` (none yet), `linked` |
 | `GET /v0/sessions` | read | `{sessions: [{id, label, device, started, recorded, ended, pictures, tier, bytes}]}` |
 | `GET /v0/sessions/{id}` | read | The session file, `application/x-ndjson` (below) |
 | `GET /v0/loader` | read | The loader disc folder (`--loader-disc`) as one zip (`Content-Disposition` names it); only files that open inside the folder; **413** over 64 MiB; 501 if none |
 | `POST /v0/memory/read`, `POST /v0/assets` | - | **501** in this loader (memory reads: plan L5; live assets: plan L5b) |
+
+A run with `deadline_s` 0 (hand-played) has no time cap (0.2.1; 0.2.0 marked it lost after 900 s while the console
+still streamed): it stays `running` while anything is heard from the console (rows, lines, logs, beacons) and is
+`lost` only after 8 s of silence (the bridge's link-loss timeout). A run with a deadline waits for it plus 60 s.
+
 
 A **run**: `id`, `program` {`name`, `sha256`, `bytes`} (a finished run keeps the count, not the program's bytes; at
 most 512 runs are kept in memory, counted over every run after insertion (each one): the oldest finished runs go first; a

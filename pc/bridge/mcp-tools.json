@@ -1091,7 +1091,7 @@
    "title": "Read the log",
    "level": "read",
    "bridge": "GET /v0/log",
-   "description": "The program's log lines in a picture range, filtered by level or text; the newest lines when over the limit.",
+   "description": "The program's log lines and printed (serial) lines in a picture range, filtered by level or text; the newest lines when over the limit.",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1113,12 +1113,13 @@
      },
      "level": {
       "type": "string",
-      "description": "only this level (\"warn\" includes errors)",
+      "description": "only this level (\"warn\" includes errors; \"serial\": the program's printed lines)",
       "enum": [
        "info",
        "warn",
        "err",
-       "stub"
+       "stub",
+       "serial"
       ]
      },
      "q": {
